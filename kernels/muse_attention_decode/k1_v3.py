@@ -122,6 +122,7 @@ void k1_forward(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_l
                 int64_t page_shift, int64_t Gx, int64_t min_chunk, int64_t use_rope, double qk_sm, int64_t fold,
                 int64_t nsg, int64_t stages);
 int64_t k1_occupancy(int64_t L, int64_t ST);
+torch::Tensor k1_prof_read();
 """
 
 CUDA_SRC = r"""
@@ -652,6 +653,21 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
 #ifndef K1_DIAG
 #define K1_DIAG 0
 #endif
+#ifndef K1_PROF
+#define K1_PROF 0                                    // 1: per-CTA %globaltimer phase stamps into k1_prof (lab only)
+#endif
+#if K1_PROF
+__device__ unsigned long long k1_prof[4096 * 8];
+__device__ __forceinline__ unsigned long long gtime() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+#define K1P(slot) do { if (threadIdx.x == 0 && blockIdx.y * gridDim.x + blockIdx.x < 4096) \
+    k1_prof[(blockIdx.y * gridDim.x + blockIdx.x) * 8 + (slot)] = gtime(); } while (0)
+#else
+#define K1P(slot) do {} while (0)
+#endif
 template <int L, int ST>
 __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {
 #if K1_ARCH_OK
@@ -669,6 +685,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int c = blockIdx.x, hp = blockIdx.y;
   const int HP = gridDim.y;
+  K1P(0);
 
   reinterpret_cast<uint4*>(newk)[tid] = make_uint4(0u, 0u, 0u, 0u);   // zero newk + newv
   if (warp == 0) {
@@ -680,6 +697,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     }
   }
   __syncthreads();
+  K1P(1);
   const int b = plan_s[0];
   if (b < 0) return;                                  // idle CTA (uniform)
   const int s_idx = plan_s[1], S_b = plan_s[2], nt_b = plan_s[3], off_b = plan_s[4];
@@ -802,6 +820,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     }
   }
   __syncthreads();
+  K1P(2);
 
   const int g = lane >> 2, t = lane & 3;
   const float cl2 = p.qk_sm * __ldg(p.k_scale) * LOG2E;
@@ -844,6 +863,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     }
     cp_async_wait<0>();
     __syncthreads();
+    K1P(3);
     if (last && q4 == 0) tile_compute1<2>(newk, newv, 0, h, g, t, qf, o, mA, lA, cl2, true, seq, seq + 1, seq, W);
     lA += __shfl_xor_sync(FULL, lA, 1);
     lA += __shfl_xor_sync(FULL, lA, 2);
@@ -921,6 +941,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     }
     cp_async_wait<0>();
     __syncthreads();
+    K1P(3);
     if (last) {                                       // CTA-uniform
       if (tid < NEWK * 4) conv_v(newv, vh, tid >> 2, tid & 3);
       __syncthreads();
@@ -944,10 +965,12 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     }
   }
   __syncthreads();
+  K1P(4);
 
   // ---- output: fold (merge in the last-arriving CTA, or straight from smem when S_b == 1) or partials only
   if (p.fold && S_b == 1) {
     merge_finalize<L>(p, ost, lse_s, 1, b, hp, false);
+    K1P(5);
     return;
   }
   {
@@ -963,13 +986,17 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     int* cnt = p.counters + (size_t)b * HP + hp;
     if (tid == 0) plan_s[5] = (atomicAdd(cnt, 1) == S_b - 1) ? 1 : 0;
     __syncthreads();
+    K1P(5);
     if (plan_s[5]) {                                  // last CTA of (b, hp): every partial is written
       __threadfence();
       const size_t base = (size_t)hp * p.Gx + off_b;
       merge_finalize<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp, true);
       __syncthreads();
       if (tid == 0) *cnt = 0;                         // self-reset for the next call (after all reads)
+      K1P(6);
     }
+  } else {
+    K1P(5);
   }
 #endif
 }
@@ -1088,6 +1115,20 @@ int64_t k1_occupancy(int64_t L, int64_t ST) {
   return (int64_t)(ST == 3 ? occ_of<8, 3>() : occ_of<8, 4>());
 }
 
+// lab only (K1_PROF builds): read and clear the per-CTA phase stamps; empty tensor otherwise
+torch::Tensor k1_prof_read() {
+#if K1_PROF
+  auto t = torch::empty({4096 * 8}, torch::dtype(torch::kInt64));
+  C10_CUDA_CHECK(cudaDeviceSynchronize());
+  C10_CUDA_CHECK(cudaMemcpyFromSymbol(t.data_ptr<int64_t>(), k1::k1_prof, sizeof(unsigned long long) * 4096 * 8));
+  static unsigned long long zeros[4096 * 8];
+  C10_CUDA_CHECK(cudaMemcpyToSymbol(k1::k1_prof, zeros, sizeof(zeros)));
+  return t;
+#else
+  return torch::empty({0}, torch::dtype(torch::kInt64));
+#endif
+}
+
 void k1_forward(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor page_table,
                 torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
                 torch::Tensor inv_freq, torch::Tensor part_o, torch::Tensor part_lse, torch::Tensor out,
@@ -1159,7 +1200,7 @@ def _build():
         name=f"k1_v3_{tag}",
         cpp_sources=CPP_SRC,
         cuda_sources=CUDA_SRC,
-        functions=["k1_forward", "k1_occupancy"],
+        functions=["k1_forward", "k1_occupancy", "k1_prof_read"],
         # pinning the arch also stops cpp_extension from following the image's TORCH_CUDA_ARCH_LIST
         # (any user flag containing "arch" disables its own arch flags): one sm_90 compile, sm_90 ptxas lines
         extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90,code=sm_90"],

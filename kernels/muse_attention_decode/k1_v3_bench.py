@@ -25,6 +25,7 @@ ap.add_argument("--shapes", default="")
 ap.add_argument("--variants", default="def=;r1=r1")
 ap.add_argument("--reps", type=int, default=40)
 ap.add_argument("--no-check", action="store_true")
+ap.add_argument("--prof", action="store_true", help="K1_PROF build: print per-phase CTA timestamps (one cold call)")
 args = ap.parse_args()
 
 spec = importlib.util.spec_from_file_location("k1sub", args.file)
@@ -86,6 +87,23 @@ for i in idx:
             if not args.no_check:
                 ok, msg = reference.check_implementation(data, reference.collect(data, out))
                 ok_s = "" if ok else " FAIL(" + msg[:80] + ")"
+            if args.prof and vkw is not None:
+                for _ in range(3):
+                    fn(data)
+                mod._MOD.k1_prof_read()
+                torch.sum(flush_buf, dim=0, out=sink)
+                fn(data)
+                pr = mod._MOD.k1_prof_read().view(4096, 8).double()
+                v = pr[pr[:, 0] > 0]
+                t0 = v[:, 0].min()
+                parts = []
+                for sl in range(7):
+                    col = v[:, sl]
+                    col = col[col > 0]
+                    if len(col):
+                        d = (col - t0) / 1000.0
+                        parts.append(f"s{sl} med {d.median():.2f} max {d.max():.2f} (n{len(col)})")
+                print(f"PROF {label} {name} ctas={len(v)}: " + "; ".join(parts), flush=True)
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
