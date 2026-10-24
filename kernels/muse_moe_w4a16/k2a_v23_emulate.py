@@ -1,4 +1,6 @@
-"""CPU emulation of K2a v2 (k2a_v2.py): repacked layout, routing, unit decomposition, staging, dequant, MMA
+"""CPU emulation of K2a v2.3 (k2a_v23.py; v2 emulator + the WG path: X slice scattered into wgmma's no-swizzle
+K-major core-matrix layout, B read through the matrix descriptor as the PTX canonical layout defines it, A / D
+fragments cross-checked against CuTe's SM90 RS layouts). Original v2 description: repacked layout, routing, unit decomposition, staging, dequant, MMA
 fragment wiring, flush, finalize.
 
 Shared with the submission vs independent:
@@ -37,7 +39,7 @@ sys.path.insert(0, PROB)
 from checks import compare  # noqa: E402
 from nvfp4 import dequantize, random_weights  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("k2a_v2", os.path.join(HERE, "k2a_v2.py"))
+spec = importlib.util.spec_from_file_location("k2a_v23", os.path.join(HERE, "k2a_v23.py"))
 K = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(K)
 
@@ -179,6 +181,19 @@ def cute_C(lane, v):   # ((4,8),(2,2)) : ((32,1),(16,8)) -> (m, n) in 16x8 colum
     return off % 16, off // 16
 
 
+# CuTe SM90 GMMA layouts (warpgroup = 128 threads): RS A 64x16 and C 64xN (cute/atom/mma_traits_sm90_gmma.hpp)
+def cute_A90(tid, v):  # ((4,8,4),(2,2,2)) : ((128,1,16),(64,8,512)) -> (m, k) in 64x16 column-major
+    t0, t1, t2 = tid % 4, (tid // 4) % 8, tid // 32
+    off = 128 * t0 + t1 + 16 * t2 + 64 * (v % 2) + 8 * ((v // 2) % 2) + 512 * (v // 4)
+    return off % 64, off // 64
+
+
+def cute_C90(tid, v):  # ((4,8,4),(2,2,N/8)) : ((128,1,16),(64,8,512)) -> (m, n) in 64xN column-major
+    t0, t1, t2 = tid % 4, (tid // 4) % 8, tid // 32
+    off = 128 * t0 + t1 + 16 * t2 + 64 * (v % 2) + 8 * ((v // 2) % 2) + 512 * (v // 4)
+    return off % 64, off // 64
+
+
 A_MK = torch.tensor([[cute_A(l, v) for v in range(8)] for l in range(32)])    # [32, 8, 2] (m, k)
 B_NK = torch.tensor([[cute_B(l, v) for v in range(4)] for l in range(32)])    # [32, 4, 2] (n, k)
 C_MN = torch.tensor([[cute_C(l, v) for v in range(4)] for l in range(32)])    # [32, 4, 2] (m, n)
@@ -191,17 +206,19 @@ LG, LT = LANE >> 2, LANE & 3       # kernel's g = lane >> 2, t = lane & 3
 # ---------------------------------------------------------------------------------------------
 
 class Cfg:
-    def __init__(self, nc, u=4, pf=0, tw=1, xe=8192, minb=4):
-        self.NC, self.U, self.PF, self.TW, self.XE, self.MINB = nc, u, pf, tw, xe, minb
+    def __init__(self, nc, u=4, pf=0, tw=1, xe=8192, minb=4, wg=0):
+        self.NC, self.U, self.PF, self.TW, self.XE, self.MINB, self.WG = nc, u, pf, tw, xe, minb, wg
+        assert not wg or (tw == 1 and pf == 0 and nc in (2, 4, 8))
         self.TPW = 8 * nc
         self.TPP = tw * self.TPW
         self.RW = 8 // tw
         self.KSW = xe // self.TPP
         self.XSTR = self.KSW + 8
+        self.XS = xe if wg else self.TPP * self.XSTR
         assert self.KSW >= 64 * u and self.KSW % (64 * u) == 0
 
     def __repr__(self):
-        return f"NC{self.NC} U{self.U} PF{self.PF} TW{self.TW} XE{self.XE} MINB{self.MINB}"
+        return f"NC{self.NC} U{self.U} PF{self.PF} TW{self.TW} XE{self.XE} MINB{self.MINB}" + (" WG" if self.WG else "")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -451,6 +468,45 @@ def stage_x(C, mode, src_rows, ntok, k0, kw):
     return xs
 
 
+def stage_x_wg(C, src_rows, ntok, k0, kw):
+    """WG stage_x, literally: idx -> t = idx & 3, nr = (idx >> 2) & 7, rest = idx >> 5, n8 = rest >> lni,
+    i = rest & (NI - 1); row n = 8 n8 + nr (skipped if >= ntok); u32 q of src[n][k0 + 64 i + 16 t ..+16] (bf16 pair
+    2q, 2q+1) -> xs32[n8 * 4 kw + 256 i + 32 q + 4 nr + t]. Returns the flat bf16-element smem image (NaN = stale)."""
+    xs = torch.full((C.XS,), NAN, dtype=torch.float32)
+    NI = kw >> 6
+    lni = NI.bit_length() - 1
+    assert (1 << lni) == NI
+    tot = ((ntok + 7) >> 3) << (lni + 5)
+    idx = torch.arange(tot)
+    t, nr, rest = idx & 3, (idx >> 2) & 7, idx >> 5
+    n8, i = rest >> lni, rest & (NI - 1)
+    n = 8 * n8 + nr
+    ok = n < ntok
+    t, nr, n8, i, n = t[ok], nr[ok], n8[ok], i[ok], n[ok]
+    for q in range(8):
+        qq = (q ^ 1) if MUTATE == "wgperm" else q
+        u32 = n8 * (4 * kw) + 256 * i + 32 * qq + 4 * nr + t
+        assert int(u32.max()) * 2 + 1 < C.XS
+        for hv in range(2):
+            xs[2 * u32 + hv] = src_rows[n, k0 + 64 * i + 16 * t + 2 * q + hv]
+    return xs
+
+
+def b_logical_wg(xs, kw, nkb, TPP):
+    """B [nkb*64 (k_log), TPP] as wgmma reads it: item i, step s -> descriptor start (8 i + 2 s) * 128 B, LBO 128 B,
+    SBO 16 kw B; PTX canonical no-swizzle K-major layout ((8, n), 2) : ((1, SBO), LBO) in 16 B units, element k % 8
+    inside a unit: smem element = start + 8 (n % 8) + (SBO / 2) (n / 8) + 64 (kk / 8) + kk % 8 for k-slot kk of the step."""
+    B = torch.full((nkb * 64, TPP), NAN, dtype=torch.float32)
+    n = torch.arange(TPP).view(1, -1)
+    kk = torch.arange(16).view(-1, 1)
+    for i in range(nkb):
+        for s in range(4):
+            start = (8 * i + 2 * s) * 64
+            addr = start + 8 * (n % 8) + 8 * kw * (n // 8) + 64 * (kk // 8) + kk % 8
+            B[i * 64 + s * 16: i * 64 + s * 16 + 16, :] = xs[addr]
+    return B
+
+
 def emu_gemm(mode, C, rt, wq, sq, gsc, X_rows_for, bufs, e_list):
     """Runs every (pass, k-split) of every touched expert. X_rows_for(e, c0, ntok) -> [ntok, 4096] source rows
     (bf16-valued floats), as stage_x reads them."""
@@ -474,8 +530,12 @@ def emu_gemm(mode, C, rt, wq, sq, gsc, X_rows_for, bufs, e_list):
                 for sl in range(NSL):
                     k0 = ks * KR + sl * KSWe
                     kb0 = k0 >> 6
-                    xs = stage_x(C, mode, src, ntok, k0, KSWe)
-                    B = b_logical(xs, C, kb0, KSWe // 64, ntok)
+                    if C.WG:
+                        xs = stage_x_wg(C, src, ntok, k0, KSWe)
+                        B = b_logical_wg(xs, KSWe, KSWe // 64, C.TPP)
+                    else:
+                        xs = stage_x(C, mode, src, ntok, k0, KSWe)
+                        B = b_logical(xs, C, kb0, KSWe // 64, ntok)
                     Cacc += torch.matmul(A[:, :, kb0 * 64:(kb0 + KSWe // 64) * 64], B)
                 # flush: per lane (g, t), chunk q of warp-group tw, accumulator i placed by CuTe's C layout
                 for tw in range(C.TW):
@@ -591,7 +651,26 @@ def e4m3_value(b):
     return -v if s else v
 
 
+def test_sm90_layouts():
+    """WG path assumptions: per warp w of the warpgroup, CuTe's SM90 RS A fragment (64x16) is rows 16w + the SM80
+    m16n8k16 A fragment (so consume_item's (ag, a8) registers are the wgmma A operand), and the SM90 64xN
+    accumulator value 4j + v is rows 16w + / columns 8j + the SM80 C fragment value v (so flush() is unchanged)."""
+    for w in range(4):
+        for lane in range(32):
+            for v in range(8):
+                m, k = cute_A90(32 * w + lane, v)
+                m80, k80 = cute_A(lane, v)
+                assert (m, k) == (16 * w + m80, k80), (w, lane, v)
+            for j in range(8):
+                for v in range(4):
+                    m, n = cute_C90(32 * w + lane, 4 * j + v)
+                    m80, n80 = cute_C(lane, v)
+                    assert (m, n) == (16 * w + m80, 8 * j + n80), (w, lane, j, v)
+    print("SM90 RS A / 64xN C layouts == per-warp SM80 fragments: OK", flush=True)
+
+
 def test_primitives():
+    test_sm90_layouts()
     bits = sorted(b for tup in K.BITPOS for b in tup)
     assert bits == list(range(32))
     for pos in range(8):
@@ -744,6 +823,7 @@ def main():
             "y": torch.empty((8 * K.M_MAX, D))}
     c1, c2, c4 = Cfg(1, 4, 0, 1, 8192, 4), Cfg(2, 4, 0, 1, 16384, 4), Cfg(4, 4, 0, 1, 16384, 3)
     c2t2 = Cfg(2, 4, 0, 2, 16384, 4)
+    w4, w8, w2 = Cfg(4, 4, 0, 1, 16384, 3, 1), Cfg(8, 4, 0, 1, 16384, 2, 1), Cfg(2, 4, 0, 1, 16384, 4, 1)
     cases = [  # (bs, seed, dist, cfg, G, ks_target, asg, force_atom)
         (1, 401, "normal", c1, 528, 2, 0, 0),
         (4, 3, "normal", c1, 528, 2, 1, 0),
@@ -754,11 +834,20 @@ def main():
         (128, 7, "skewed", c4, 396, 2, 0, 0),
         (128, 7, "skewed", c2t2, 528, 2, 1, 0),
         (257, 9, "normal", c4, 396, 2, 0, 0),
+        # v2.3 WG path (wgmma, 16/32/64 tokens per pass)
+        (5, 12, "normal", w2, 528, 2, 0, 0),          # KS > 1: atomics + SwiGLU(h) staging
+        (33, 5, "normal", w4, 396, 4, 0, 0),          # KS1 > 1 -> W2 stages SwiGLU(h)
+        (128, 7, "skewed", w8, 264, 2, 0, 0),         # hot experts 128/118: 2 passes each at 64 tokens
+        (257, 9, "normal", w8, 264, 2, 0, 0),
     ]
     if quick:
-        cases = [cases[0], cases[4]]
+        cases = [cases[0], cases[4], cases[10]]
+    if os.environ.get("K2A2_WGONLY"):
+        cases = cases[9:]
     if MUTATE:
         cases = [(4, 3, "normal", c1, 528, 2, 0, 0)] if MUTATE not in ("flushrow", "leader") else [(33, 5, "normal", c2, 528, 2, 0, 0)]
+        if MUTATE == "wgperm":
+            cases = [(33, 5, "normal", w4, 396, 4, 0, 0)]
     ok_all = True
     for bs, seed, dist, C, G, kst, asg, fa in cases:
         t0 = time.time()

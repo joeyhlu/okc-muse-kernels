@@ -106,17 +106,22 @@ W_SHIFT = 256.0         # dequantized weights are w_true * 2^-8; the FP32 global
 #   TW   token-group warps per row tile (they share one weight fetch through L1); RW = 8 / TW row tiles per unit
 #   XE   bf16 elements of the staged X slice (k per slice = XE / (TW * 8 * NC))
 #   MINB __launch_bounds__ min CTAs per SM (4 -> <= 64 regs, 3 -> <= 80)
-VKEYS = ("nc", "u", "pf", "tw", "xe", "minb")
+VKEYS = ("nc", "u", "pf", "tw", "xe", "minb", "wg")
 
 
-def variant(nc, u=4, pf=0, tw=1, xe=8192, minb=4):
-    return {"nc": nc, "u": u, "pf": pf, "tw": tw, "xe": xe, "minb": minb}
+def variant(nc, u=4, pf=0, tw=1, xe=8192, minb=4, wg=0):
+    return {"nc": nc, "u": u, "pf": pf, "tw": tw, "xe": xe, "minb": minb, "wg": wg}
 
 
 V2_VARIANTS = [
-    variant(1, 4, 0, 1, 8192, 4),     # 0: 8 tokens / pass, 4 CTAs/SM (<= 64 regs), synchronous X staging
-    variant(2, 4, 0, 1, 16384, 4),    # 1: 16 tokens / pass, cp.async X staging
-    variant(4, 4, 0, 1, 16384, 3),    # 2: 32 tokens / pass, 3 CTAs/SM (<= 80 regs)
+    variant(1, 4, 0, 1, 8192, 4),         # 0: 8 tokens / pass, 4 CTAs/SM (<= 64 regs), synchronous X staging
+    variant(2, 4, 0, 1, 16384, 4),        # 1: 16 tokens / pass, cp.async X staging
+    variant(4, 4, 0, 1, 16384, 3, 1),     # 2: WG 32 tokens / pass, 3 CTAs/SM
+    variant(8, 4, 0, 1, 16384, 2, 1),     # 3: WG 64 tokens / pass, 2 CTAs/SM
+    variant(8, 2, 0, 1, 16384, 3, 1),     # 4: WG 64 tokens / pass, U 2, 3 CTAs/SM
+    variant(4, 2, 0, 1, 16384, 4, 1),     # 5: WG 32 tokens / pass, U 2, 4 CTAs/SM
+    variant(8, 4, 0, 1, 16384, 3, 1),     # 6: WG 64 tokens / pass, U 4, 3 CTAs/SM
+    variant(2, 4, 0, 1, 16384, 4, 1),     # 7: WG 16 tokens / pass, 4 CTAs/SM
 ]
 # Per bucket: (lo, hi, representative scored bs). Decisions are taken per bucket (nearby shapes route alike).
 BUCKETS = ((1, 4, 1), (5, 12, 8), (13, 24, 16), (25, 48, 32), (49, 192, 128), (193, M_MAX, 256))
@@ -854,6 +859,8 @@ __device__ void gemm_phase(const Params& P, Route& S, const int16_t* s_list, __n
   const float* gsc = (MODE == 1) ? P.gsc13 : P.gsc2;
   const int t0w = tw * C::TPW;
   const __nv_bfloat16* xrow = xs + (t0w + g) * C::XSTR;
+  uint64_t desc0 = 0;
+  if constexpr (C::WG) desc0 = wg_desc(xs, 16u * (uint32_t)KSWe);
   uint32_t sink = 0u;
   // bar_before (G2 in the same launch as G1): the first unit's first weight group is issued before the grid barrier,
   // so the W2 ramp overlaps the barrier wait.
@@ -890,6 +897,7 @@ __device__ void gemm_phase(const Params& P, Route& S, const int16_t* s_list, __n
     const int c0 = S.off[e] + j * C::TPP;
     const int tile = rg * C::RW + rw;
     const int nch = max(0, min(C::NC, (ntok - t0w + 7) >> 3));
+    const int ncase = (nch <= 1) ? 1 : (nch <= 2) ? 2 : (nch <= 4) ? 4 : 8;   // WG: N = 8 * ncase
     const size_t tb = (size_t)e * RT + tile;
     const uint4* wt = wq + tb * (NKB * 32) + lane;
     const uint32_t* st = sq + tb * ((NKB / 2) * 32) + lane;
@@ -921,6 +929,11 @@ __device__ void gemm_phase(const Params& P, Route& S, const int16_t* s_list, __n
             for (int i = 0; i < U; ++i) wa[i] = wb[i];
 #pragma unroll
             for (int i = 0; i < U / 2; ++i) sa[i] = sb[i];
+          } else if constexpr (C::WG) {
+#pragma unroll
+            for (int i = 0; i < U; ++i)
+              consume_item_wg<C>(wa[i], sa[i >> 1], i & 1, desc0, gi * U + i, ncase, &acc[0][0], P.probe, sink);
+            if (gi + 1 < NGRP) load_group<C>(wt, st, kb0 + (gi + 1) * U, wa, sa);
           } else {
 #pragma unroll
             for (int i = 0; i < U; ++i)
@@ -928,6 +941,7 @@ __device__ void gemm_phase(const Params& P, Route& S, const int16_t* s_list, __n
             if (gi + 1 < NGRP) load_group<C>(wt, st, kb0 + (gi + 1) * U, wa, sa);
           }
         }
+        if constexpr (C::WG) wg_wait<0>();   // xs is restaged / acc flushed next: retire every wgmma of the slice
       }
     }
     if (nch > 0 && P.probe == 0) flush<C, MODE>(P, acc, nch, ntok, t0w, c0, tile, g, t, gs, atom);
@@ -1083,7 +1097,7 @@ __device__ void convert_hot(const Params& P, const Route& S) {
 
 template <class C>
 __global__ void __launch_bounds__(256, C::MINB) k2a2_kernel(const Params P) {
-  __shared__ __align__(16) __nv_bfloat16 xs[C::XS];
+  __shared__ __align__(128) __nv_bfloat16 xs[C::XS];
   __shared__ int8_t s_ide[P_MAX];
   __shared__ int16_t s_list[P_MAX];
   __shared__ Route S;
@@ -1219,7 +1233,7 @@ std::vector<int64_t> attrs(int64_t vid);
 
 
 def cfg_str(v):
-    return "k2a2::Cfg<%d, %d, %d, %d, %d, %d>" % tuple(v[k] for k in VKEYS)
+    return "k2a2::Cfg<%d, %d, %d, %d, %d, %d, %d>" % tuple(v.get(k, 0) for k in VKEYS)
 
 
 def gen_host(variants):
@@ -1240,7 +1254,8 @@ def build_ext(name, variants, verbose=False):
         cpp_sources=CPP_SRC,
         cuda_sources=src,
         functions=["run", "attrs"],
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-Xptxas=-warn-spills"],
+        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-Xptxas=-warn-spills",
+                           "-gencode=arch=compute_90a,code=sm_90a"],   # wgmma is sm_90a-only
         verbose=verbose,
     )
     return mod, time.time() - t0
