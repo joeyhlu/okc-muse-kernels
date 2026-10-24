@@ -42,7 +42,7 @@ R1_QK_FUSED_FP8_STAGE = True   # fallback = rung-1 path with L2 (GPU-verified 1.
 
 # Kernel constants (mirrored in CUDA_SRC and k1_emulate.py)
 K1_TILE = 64
-K1_STAGES = 4
+K1_STAGES = 4                  # default ring depth (per-shape: K1_STAGES_T)
 K1_NEWK = 16
 
 # Host tables, keyed by (layer kind, q_len). Expected wins (re-measure): K1 everywhere.
@@ -55,6 +55,8 @@ K1_FOLD_MIN_BATCH = {("sliding", 1): 1, ("sliding", 8): 1, ("full", 1): 8, ("ful
 K1_MIN_CHUNK_T = {("sliding", 1): 2, ("sliding", 8): 4, ("full", 1): 2, ("full", 8): 2}
 #   target CTAs per SM when sizing Gx (capped by the measured occupancy of k1_main<L>).
 K1_CPS_T = {("sliding", 1): 1, ("sliding", 8): 2, ("full", 1): 2, ("full", 8): 2}  # lab: sliding L=1 1 CTA/SM -1.3/-0.6 us at B16/B32
+#   cp.async ring depth (instantiated: L=1 {4, 6}, L=8 {3, 4}).
+K1_STAGES_T = {("sliding", 1): 4, ("sliding", 8): 4, ("full", 1): 4, ("full", 8): 4}
 K1_COUNTERS = 1 << 16          # fold arrival counters (B * Hkv/2 must fit)
 
 
@@ -531,8 +533,13 @@ __device__ __forceinline__ void tile_compute8(const uint8_t* __restrict__ Kbuf, 
 #pragma unroll
       for (int hf = 0; hf < 2; ++hf) {
         const int jn = 2 * kk + hf;
+#if K1_DIAG == 2
+        const float p0 = fmaf(sc[jn][2 * rb], cl2, -bo) * 1e-3f;
+        const float p1 = fmaf(sc[jn][2 * rb + 1], cl2, -bo) * 1e-3f;
+#else
         const float p0 = ex2(fmaf(sc[jn][2 * rb], cl2, -bo));
         const float p1 = ex2(fmaf(sc[jn][2 * rb + 1], cl2, -bo));
+#endif
         ps += p0 + p1;
         pa[kk][2 * hf + rb] = pack_h2(p0, p1);   // a0 row g keys 2t, a1 row g+8, a2/a3: keys 8+2t
       }
@@ -554,8 +561,12 @@ __device__ __forceinline__ void tile_compute8(const uint8_t* __restrict__ Kbuf, 
     for (int jp = 0; jp < 4; ++jp) {
       uint32_t bv[4];
       ldsm_x4_t(bv, Vh + vh_off(16 * kk + lx, h, 2 * jp + lc));
+#if K1_DIAG == 1
+      o[2 * jp][0] += __uint_as_float(bv[0] ^ pa[kk][0]); o[2 * jp + 1][0] += __uint_as_float(bv[2] ^ pa[kk][3]);
+#else
       mma16816(o[2 * jp], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], bv[0], bv[1]);
       mma16816(o[2 * jp + 1], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], bv[2], bv[3]);
+#endif
     }
   }
 }
@@ -565,30 +576,52 @@ __device__ __forceinline__ void tile_compute8(const uint8_t* __restrict__ Kbuf, 
 // finalize_rows). Items (row r, quad u = dims 4u..4u+3); the 16 quads of a row are one half-warp.
 // po: [S][16L][64], pl: [S][16L] (global partials with cg = true, or the CTA's own smem staging, S = 1).
 // ---------------------------------------------------------------------------------------------
+// v3: a thread's K = ITEMS/NTHR items (rows r_k = tid/16 + 16k, quad u = tid%16) are merged together, with the split
+// loop unrolled, so the partial reads of all items and several splits are in flight at once (v1 looped item by item
+// with one dependent L2 read per split: ~2 x S x K round trips, ~18 us for L=8 at S=8).
 template <int L>
 __device__ __forceinline__ void merge_finalize(const Params& p, const float* po, const float* pl, const int S, const int b,
                                const int hp, const bool cg) {
-  constexpr int ROWS = 16 * L, R8 = 8 * L, ITEMS = ROWS * 16;
+  constexpr int ROWS = 16 * L, R8 = 8 * L, ITEMS = ROWS * 16, K = ITEMS / NTHR;
   static_assert(ITEMS % NTHR == 0, "uniform item loop (half-warp shuffles)");
   const float vsc = __ldg(p.v_scale);
   const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
-  for (int it = threadIdx.x; it < ITEMS; it += NTHR) {
-    const int r = it >> 4, u = it & 15;
-    float M = neg_inf();
-    for (int s = 0; s < S; ++s) M = fmaxf(M, ldf(pl + (size_t)s * ROWS + r, cg));
-    const float Mu = (M == neg_inf()) ? 0.f : M;
-    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    float ws = 0.f;
-    for (int s = 0; s < S; ++s) {
-      const float w = ex2(ldf(pl + (size_t)s * ROWS + r, cg) - Mu);
+  const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
+  float M[K];
+#pragma unroll
+  for (int k = 0; k < K; ++k) M[k] = neg_inf();
+#pragma unroll 4
+  for (int s = 0; s < S; ++s) {
+#pragma unroll
+    for (int k = 0; k < K; ++k) M[k] = fmaxf(M[k], ldf(pl + (size_t)s * ROWS + r0 + 16 * k, cg));
+  }
+  float4 acc[K];
+  float ws[K];
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    M[k] = (M[k] == neg_inf()) ? 0.f : M[k];
+    acc[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+    ws[k] = 0.f;
+  }
+#pragma unroll 2
+  for (int s = 0; s < S; ++s) {
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      const int r = r0 + 16 * k;
+      const float w = ex2(ldf(pl + (size_t)s * ROWS + r, cg) - M[k]);
       const float4 v = ldf4(po + ((size_t)s * ROWS + r) * 64 + 4 * u, cg);
-      ws += w;
-      acc.x = fmaf(w, v.x, acc.x); acc.y = fmaf(w, v.y, acc.y);
-      acc.z = fmaf(w, v.z, acc.z); acc.w = fmaf(w, v.w, acc.w);
+      ws[k] += w;
+      acc[k].x = fmaf(w, v.x, acc[k].x); acc[k].y = fmaf(w, v.y, acc[k].y);
+      acc[k].z = fmaf(w, v.z, acc[k].z); acc[k].w = fmaf(w, v.w, acc[k].w);
     }
-    const float sc = (ws > 0.f) ? vsc / ws : 0.f;
-    acc.x *= sc; acc.y *= sc; acc.z *= sc; acc.w *= sc;
-    float ss = acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w;
+  }
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    const int r = r0 + 16 * k;
+    float4 a4 = acc[k];
+    const float sc = (ws[k] > 0.f) ? vsc / ws[k] : 0.f;
+    a4.x *= sc; a4.y *= sc; a4.z *= sc; a4.w *= sc;
+    float ss = a4.x * a4.x + a4.y * a4.y + a4.z * a4.z + a4.w * a4.w;
     ss += __shfl_xor_sync(FULL, ss, 8);
     ss += __shfl_xor_sync(FULL, ss, 4);
     ss += __shfl_xor_sync(FULL, ss, 2);
@@ -601,8 +634,8 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
                                                        (size_t)qh * 64 + 4 * u);
     const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
     const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
-    const __nv_bfloat162 o01 = __floats2bfloat162_rn(acc.x * rs * sigmoidf_(g01.x), acc.y * rs * sigmoidf_(g01.y));
-    const __nv_bfloat162 o23 = __floats2bfloat162_rn(acc.z * rs * sigmoidf_(g23.x), acc.w * rs * sigmoidf_(g23.y));
+    const __nv_bfloat162 o01 = __floats2bfloat162_rn(a4.x * rs * sigmoidf_(g01.x), a4.y * rs * sigmoidf_(g01.y));
+    const __nv_bfloat162 o23 = __floats2bfloat162_rn(a4.z * rs * sigmoidf_(g23.x), a4.w * rs * sigmoidf_(g23.y));
     uint2 ow;
     ow.x = *reinterpret_cast<const uint32_t*>(&o01);
     ow.y = *reinterpret_cast<const uint32_t*>(&o23);
@@ -615,6 +648,9 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
 // ---------------------------------------------------------------------------------------------
 #ifndef K1_L8_MINB
 #define K1_L8_MINB 2
+#endif
+#ifndef K1_DIAG
+#define K1_DIAG 0
 #endif
 template <int L, int ST>
 __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {
@@ -1113,7 +1149,7 @@ def _build():
     tag = hashlib.sha1((CPP_SRC + CUDA_SRC).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(
-        name=f"k1_v1_{tag}",
+        name=f"k1_v3_{tag}",
         cpp_sources=CPP_SRC,
         cuda_sources=CUDA_SRC,
         functions=["k1_forward", "k1_occupancy"],
@@ -1151,12 +1187,12 @@ def _sms(dev):
     return _SMS[key]
 
 
-def _occupancy(L, dev):
-    """resident k1_main<L> CTAs per SM; queried once per (L, device), eagerly."""
-    key = (L, str(dev))
+def _occupancy(L, st, dev):
+    """resident k1_main<L, st> CTAs per SM; queried once per (L, st, device), eagerly."""
+    key = (L, st, str(dev))
     if key not in _OCC:
-        _OCC[key] = max(1, int(_MOD.k1_occupancy(L)))
-        print(f"[k1] k1_main<{L}> occupancy {_OCC[key]} CTAs/SM", flush=True)
+        _OCC[key] = max(1, int(_MOD.k1_occupancy(L, st)))
+        print(f"[k1] k1_main<{L},{st}> occupancy {_OCC[key]} CTAs/SM", flush=True)
     return _OCC[key]
 
 
@@ -1209,8 +1245,8 @@ def _routed(cfg):
     return cfg["batch"] >= K1_ROUTE_MIN_BATCH.get((_kind(cfg), cfg["q_len"]), 1 << 30)
 
 
-def _k1(data, fold=None, min_chunk=None, cps=None, nsg=None):
-    """One K1 call. Overrides (lab / self-test): fold (bool), min_chunk, cps (target CTAs/SM), nsg."""
+def _k1(data, fold=None, min_chunk=None, cps=None, nsg=None, stages=None):
+    """One K1 call. Overrides (lab / self-test): fold (bool), min_chunk, cps (target CTAs/SM), nsg, stages."""
     cfg = data["config"]
     B, L = cfg["batch"], cfg["q_len"]
     hq, hkv = cfg["num_q_heads"], cfg["num_kv_heads"]
@@ -1226,6 +1262,8 @@ def _k1(data, fold=None, min_chunk=None, cps=None, nsg=None):
         cps = K1_CPS_T.get(key, 2)
     if nsg is None:
         nsg = _nsg(B)
+    if stages is None:
+        stages = K1_STAGES_T.get(key, K1_STAGES)
     cnt = _counters(dev) if fold else None
     if fold and (cnt is None or B * hp > cnt.numel()):
         fold = False
@@ -1233,7 +1271,7 @@ def _k1(data, fold=None, min_chunk=None, cps=None, nsg=None):
         cnt = _CNT.get(str(dev))
         if cnt is None:
             cnt = torch.zeros(1, dtype=torch.int32, device=dev)   # unused when fold == 0
-    cps_eff = max(1, min(int(cps), _occupancy(L, dev)))
+    cps_eff = max(1, min(int(cps), _occupancy(L, int(stages), dev)))
     gx = max(max(1, (_sms(dev) * cps_eff) // hp), B + 1)
     part_o = torch.empty((hp, gx, 16 * L, 64), dtype=torch.float32, device=dev)
     part_lse = torch.empty((hp, gx, 16 * L), dtype=torch.float32, device=dev)
@@ -1243,7 +1281,7 @@ def _k1(data, fold=None, min_chunk=None, cps=None, nsg=None):
                     data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], _inv_freq(theta, dev),
                     part_o, part_lse, out, cnt, B, L, hq, hkv, cfg["window"], cfg["page_size"].bit_length() - 1, gx,
                     int(min_chunk), 1 if theta else 0, float(cfg["qk_scale_factor"] * cfg["sm_scale"]),
-                    1 if fold else 0, int(nsg))
+                    1 if fold else 0, int(nsg), int(stages))
     return out
 
 
