@@ -1,6 +1,6 @@
 # K2b v3: hybrid of v1m's tile and load path with register-fed weights (stage A: design + emulation)
 
-Status (2026-10-24, laptop only; the pod stays stopped):
+Status (2026-10-24): **stage B ran; stopped by the leak gate** (§8). Stage A status as written:
 - This doc.
 - `k2b_v3_emulate.py`: ALL PASS, 10/10 negative controls fail as required.
 - No CUDA has been written.
@@ -173,3 +173,31 @@ Negative controls; each FAILS as required:
    - Leak ≥ 0.21 µs/stage (pessimistic) → stop.
 4. Same-process bench against v1m and Marlin on both routings, then judge clone ×1, the t05b harness and memcheck.
 5. Lock estimate: ≈ 45 min.
+
+## 8. Stage B result (H200 box, 2026-10-24): **stopped at the leak gate**
+
+**Built and correct.**
+- `k2b_v3.py` (nonce k2b-v3-1) compiled first try: 6 variants in 44.4 s cold, 0 spills, no "wgmma serialized" line
+  (setmaxnreg 56/216).
+- `k2b_v3_unit.py` drives the real `consumer_block` through the per-block group protocol for both m64 blocks against
+  v1-geometry staging: UNIT PASS, rel ≤ 1.5e-7 at N = 16/48/128, err 0.
+- Every config passes the FP32 self-test at rel 5.17e-3 (v1m/stock numerics, as v1m).
+
+**Same-process bench** (k2b_v3_bench.py; box_out/k2b_v3_bench1.log), µs:
+
+
+**Gate:**
+- v3 full (s6) 7,462 against dequant-off 6,082 at judge 16K gives a consumer leak of
+  (7,462 − 6,082) / 5,632 = **0.245 µs/stage**, above the 0.21 stop line. **Stop**, with no tuning round per the gate.
+- The final kill condition (< +15% over v1m at judge 16K) holds as well: 0.98×.
+
+**Why the model missed:**
+- The model's base was v1m's coupled no-dequant pipeline (p1 4,476 µs).
+- v3's own no-dequant pipeline is **6,082 µs**: the register-fed MW 2 main loop is 1.6 ms slower than v1m's SS main
+  loop before any dequant.
+- It issues twice the wgmma instructions per stage (8 × m64n128 against 4 × m64n256 per WG) and waits twice per stage
+  (one group retirement before each block's A rewrite).
+- The consumer dequant then leaks a further 0.245 µs/stage on top, ~4.6× v2's per-item rate.
+- So both of the model's terms were optimistic. The base term was the larger miss and was never measured for this
+  structure.
+
