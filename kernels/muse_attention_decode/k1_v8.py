@@ -799,7 +799,25 @@ __device__ __forceinline__ float ex2_poly(float x) {
 }
 // v6 software pipeline pieces (QK issue / softmax+pack / PV issue), used with PV(i) left in flight across the
 // next barrier and the V^T transpose of tile i+1 overlapped with the QK(i) wgmma.
+// first k-step with write-only accumulators ("=f", scale-d 0): S of the previous tile is not an input of the wgmma
+#define K1_W32(d) "=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3]),"=f"(d[4]),"=f"(d[5]),"=f"(d[6]),"=f"(d[7]),"=f"(d[8]),"=f"(d[9]),"=f"(d[10]),"=f"(d[11]),"=f"(d[12]),"=f"(d[13]),"=f"(d[14]),"=f"(d[15]),"=f"(d[16]),"=f"(d[17]),"=f"(d[18]),"=f"(d[19]),"=f"(d[20]),"=f"(d[21]),"=f"(d[22]),"=f"(d[23]),"=f"(d[24]),"=f"(d[25]),"=f"(d[26]),"=f"(d[27]),"=f"(d[28]),"=f"(d[29]),"=f"(d[30]),"=f"(d[31])
+__device__ __forceinline__ void wg_ss_first(float (&d)[32], uint64_t da, uint64_t db) {
+#if K1_ARCH_OK
+  asm volatile("wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 " K1_R32 ", %32, %33, 0, 1, 1;\n"
+               : K1_W32(d) : "l"(da), "l"(db));
+#endif
+}
+#ifndef K1_QK_WO
+#define K1_QK_WO 1
+#endif
 __device__ __forceinline__ void qk_issue(float (&S)[32], const uint64_t dq, const uint64_t dk) {
+#if K1_QK_WO
+  wg_fence();
+  wg_ss_first(S, dq, dk);
+  wg_ss(S, dq + 16, dk + 16, 1);
+  wg_commit();
+  return;
+#endif
   if (K1_DIAG6 == 3) { S[0] = __uint_as_float((uint32_t)dk & 0x3f0fffffu); return; }
   wg_fence();
   wg_ss(S, dq, dk, 0);

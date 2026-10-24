@@ -138,3 +138,44 @@ At ver16 full (151 tiles/SM) the conservative case gives 122 µs + tail ≈ 145�
    - `empty` waits start only at i ≥ ST;
    - CTAs with ntl = 0 skip the loop on both sides consistently, because the decision is plan-uniform.
 5. **The self-test** reuses the v5–v7 L=8 cases; errors must stay within 1.5× of v7.
+
+## 6. Stage B result (2026-10-24): gate missed, stopped
+
+**Build.** k1_v8.py with `k1_pp<6/7>`, sm_90a, cold build on the fresh pod.
+- `__launch_bounds__(384, 1)` capped ptxas at **168 registers**, 0 B of spills.
+- **Correct on the first run.** The self-test passes in both merge modes with errors identical to v7 (4.174e-3,
+  5.129e-3, 6.805e-3, 9.535e-3, …). The ping-pong build also passes.
+- **ptxas warned, for both `k1_pp` instantiations:**
+  - `(C7513) wgmma.mma_async instructions are serialized due to non wgmma instructions defining input registers of a
+    wgmma between start and end of the pipeline stage`;
+  - plus two injected `warpgroup.arrive` (C7519).
+
+**Same-process bench** (box_out/k1v8_stageB.log), µs:
+
+| shape | pp ST=7 | pp ST=6 | ping-pong ST=7 / 6 | v7 (k1_main, ST=3) | rung-1 | gate |
+|---|---|---|---|---|---|---|
+| ver16 full | 282.1 | 278.7 | 378.6 / 376.5 | 195.7 | 195.7 | ≤ 165 ✗ |
+| ver32 full | 567.9 | 565.0 | 775.4 / 771.5 | 354.0 | 384.5 | ≤ 300 ✗ |
+| ver16 sliding | 39.6 | 39.6 | — | 40.8 | 24.7 | — |
+| ver32 sliding | 44.5 | 44.6 | — | 42.9 | 30.6 | — |
+
+**Diagnosis.** The kernel lands in the model's pessimistic case or worse: about 565 µs, against the predicted ~470
+for "no overlap". ptxas reports that it serialized the wgmmas.
+
+**The intended overlap is exactly what triggers C7513.** QK(i+1) is issued, then softmax(i) defines the PV(i)
+inputs (the P registers and the rescaled O accumulator) while QK(i+1)'s pipeline stage is still open. ptxas then
+inserts waits, so 1 CTA/SM with 2 consumer chains is strictly worse than v7's 2 CTAs × 2 chains.
+
+**A fix tried within the lab:** a write-only ("=f") first QK k-step, so the old S is not a wgmma input. C7513
+remains; the RS-form P/O definitions are the cause.
+
+**What would be needed** (not attempted):
+1. An SS-form PV, with P stored to smem so it is no longer a register input.
+2. O moved out of the in-flight window: FA3's `RescaleOBeforeGemm` / delayed-rescale ordering together with
+   `warpgroup_fence_operand` discipline.
+3. Or building on CUTLASS/CuTe's GMMA atoms, which manage these fences.
+
+Each is a further multi-hour rewrite with an uncertain ptxas outcome.
+
+**Status.** The L=8 route stays on rung-1 (the layer keeps it). v7's k1_main remains the best K1 L=8 kernel: 1.09×
+at ver32 full, a tie at ver16 full. It is unrouted.
