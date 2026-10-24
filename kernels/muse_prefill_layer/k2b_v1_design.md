@@ -1,6 +1,8 @@
 # K2b v1: warp-specialised wgmma grouped NVFP4 × BF16 GEMM for the prefill experts (sm_90a, H200)
 
-Status (2026-10-24, laptop phase): designed, coded and CPU-emulated, not yet compiled.
+Status (2026-10-24, after the first GPU burst): compiled, unit-tested and self-tested on the H200, and faster than
+Marlin in every class in the same-process harness. §10 has the box results; §3 describes v1 as it now stands (the
+GPU phase changed the producer's synchronisation, its activation-load mapping and the load lookahead).
 - `k2b_v1.py` (`# nonce k2b-v1-1`): the scored candidate.
 - `k2b_v1_lab.py` (`# nonce k2b-v1-lab-1`): the check-only lab. It is generated from k2b_v1.py by `sed`; do not edit it by hand.
 - `k2b_v1_emulate.py`: the CPU emulation. ALL PASS, and all 12 negative controls fail as they must (§8).
@@ -102,27 +104,35 @@ Padding, tiles and waves come from prepare()'s synthetic busiest-GPU routing (1.
   skipped identically by all roles.
 
 **WG0, producer (128 threads).**
-1. **Load stage j + D, with D = S − 2.**
+1. **Load stage j + D, with D = S − NB.**
    - Wait `empty[slot]`.
    - cp.async 16 B into ring slot (j+D) % S:
      - activation rows: MODE 1 gathers `x[pair >> 3]`, MODE 2 reads `inter[sorted row]`. Padding rows are
-       zero-filled with src-size 0. BM 128 uses 1 row/thread (8 chunks); BM 64 uses 2 threads/row.
+       zero-filled with src-size 0. **8 consecutive threads cover one 128 B row** (thread p: chunk p&7 of rows
+       (p>>3)+16i, i < BM/16), so a warp instruction reads 4 full lines. The first mapping (one row per thread)
+       used half of every L2 sector and cost 2×: loads-only went from 5.0 to 2.5 ms at 16K.
      - codes: 2·BN items of 16 B, 4 per thread.
      - scales: 16 B chunks of the K2A SQ words; both kb parities ride along, which is +1 KB/stage.
-   - `cp.async.mbarrier.arrive.noinc full[slot]` (count 128).
-   - D = S − 2 means the refilled slot was freed by wgmma(j−2), the same event that frees the B buffer the dequant
-     writes. D = S − 1 deadlocks: the protocol emulation proves it as negative control "lookahead".
+   - `cp.async.commit_group` (one group per stage).
+   - D = S − NB means the refilled slot was freed by wgmma(j−NB), the same event that frees the B buffer the
+     dequant writes. So the producer can run NB−1 stages ahead of the consumers. The first version used D = S − 2,
+     which tied the producer to stage j−2 whatever NB was (lockstep). D = S − NB + 1 deadlocks: the protocol
+     emulation proves it as negative control "lookahead".
 2. **Dequant stage j.**
-   - Wait `full[slot]` and `bempty[b]`.
+   - `cp.async.wait_group D` (this thread's stage-j group has landed), then `bar.sync 1, 128` across the producer
+     warps (everyone's stage-j data has landed; replaces the `full` mbarrier and its 128 per-thread noinc
+     arrivals). Then wait `bempty[b]`.
    - For each of the 4 items per thread: LDS.128 codes + LDS.32 scale word. `__byte_perm` + IMAD build Sg/S8. Then 4 ×
      (`deq4`, 4 × `fma.rn.bf16x2`, STS.128) into the BF16 B tile [BN rows × 64 k] at `K2B_ADDR_*(row, chunk)`.
-   - `fence.proxy.async.shared::cta`, then arrive on `bfull[b]` (count 128).
+   - `fence.proxy.async.shared::cta`, `__syncwarp`, then lane 0 of each producer warp arrives on `bfull[b]` (count
+     4). This also publishes the stage's A data: the arrivals come after the named barrier.
 
 **WG1 and WG2, consumers.**
 - BM 128: WG c owns tokens 64c..64c+63 against all BN weights (m64n256k16, 128 FP32 accumulator registers).
 - BM 64: both WGs own the same 64 tokens and split N (m64n128k16).
 - Per stage:
-  1. Wait `bfull[b]` and `full[slot]`, then `fence.proxy.async`.
+  1. Wait `bfull[b]`. The consumer-side `fence.proxy.async` is dropped (runtime flag 8, the default: CUTLASS omits
+     it; it passed every box self-test).
   2. `wgmma.fence`, then 4 × wgmma (descriptor + k16·KADV, scale-d = 0 on the first k16 of a tile), then commit.
   3. `wgmma.wait_group 1`, which retires stage j−1.
   4. Lane 0 of each warp arrives on `empty[(j−1)%S]` and `bempty[(j−1)%NB]` (count 8).
@@ -141,12 +151,13 @@ Padding, tiles and waves come from prepare()'s synthetic busiest-GPU routing (1.
   - It is a fallback config in the scored set: 4-way bank conflicts on the dequant STS, which is perf only.
 
 **R9 (no hangs).**
-- Every mbarrier wait spins on `try_wait.parity`. After 2^30 clk (about 0.5 s) the first waiter records its code in
-  `err[0]` and returns.
+- Every mbarrier wait spins on `try_wait.parity` in a tight loop, reading clock64 every 4,096 polls. After 2^30 clk
+  (about 0.5 s) the first waiter records its code in `err[0]` and returns. (`test_wait` polling measured slower.)
 - Every later wait returns as soon as it sees `err[0] ≠ 0`, so a broken pipeline ends in bounded time with garbage
   output and the flag set.
 - prepare() reads the flag after each self-test and timing, and rejects the candidate if it is set.
-- There are no named barriers or grid barriers.
+- The only named barrier is producer-internal (`bar.sync 1, 128`, all 4 producer warps always reach it). There are
+  no grid barriers.
 
 **Probes (runtime int, lab only).**
 - 1: no dequant.
@@ -161,14 +172,16 @@ Each probe removes one stage's work in situ, so the lab measures which of L2 fee
 
 **Shared memory (bytes; ≤ 232,448).**
 
-| config | ring S × (A + codes + scales) | B buffers | total incl. barriers + 1 KB align slack |
-|---|---|---|---|
-| sw128x256s4 / il128x256s4 | 4 × (16,384 + 8,192 + 2,048) | 2 × 32,768 | 173,152 |
-| sw64x256s5 | 5 × (8,192 + 8,192 + 2,048) | 2 × 32,768 | 158,832 |
-| sw128x128s6 | 6 × (16,384 + 4,096 + 1,024) | 3 × 16,384 | 179,344 |
-| lab: s3 / s5 / s4 nb3 | | | 146,512 / 199,792 / 205,936 |
+The 1 KB alignment slack is gone: there is no static smem, so the dynamic base is 1024-aligned, and the kernel
+checks this at run time (err 7).
 
-Load lookahead is (S−2) stages ≈ 2 × 0.93 µs at 60% (S = 4), against 0.33 µs of DRAM latency (lessons §5). Enough.
+| config | ring S × (A + codes + scales) | B buffers | total incl. barriers |
+|---|---|---|---|
+| **sw128x256s5b3r** (scored) | 5 × (16,384 + 8,192 + 2,048) | 3 × 32,768 | 231,552 |
+| **sw128x256s4b3r** (scored) | 4 × 26,624 | 3 × 32,768 | 204,912 |
+| sw128x256s4(r) / il128x256s4 | 4 × 26,624 | 2 × 32,768 | 172,128 |
+| sw64x256s5 | 5 × (8,192 + 8,192 + 2,048) | 2 × 32,768 | 157,808 |
+| sw128x128s6 | 6 × (16,384 + 4,096 + 1,024) | 3 × 16,384 | 178,320 |
 
 **Registers.**
 - `__launch_bounds__(384, 1)` gives 168 per thread.
@@ -376,3 +389,69 @@ pod CPU with `box.sh run`. The index maps are size-generic, and the only size-sp
 5. **Small class.** Per-tile wgmma N by valid count (64/128/256), and a split-K-free 2-tile-per-CTA ordering for the
    W2 tail (2.4 waves, 0.81).
 6. **Epilogue bubble.** Ping-pong consumers (one WG's epilogue under the other's MMA) or an stmatrix-staged epilogue.
+
+## 10. GPU phase results (H200 box, 2026-10-24)
+
+**Unit test** (`k2b_v1_unit.py`, box_out/k2b_v1_unit.log): **UNIT PASS on the first run.**
+- SW128 and IL descriptors are exact at N = 128 and 256 (2 WGs, 2 slots, 3 stages).
+- The negative control (SW data, IL descriptor) mismatches 16,370/16,384, as it should.
+- The kernel's own cp.async + `arrive.noinc` + bounded-wait path is exact, with the zero-fill row and err = 0.
+
+**Build.**
+- Cold builds (ccache off): 36.4 s for the 4-config scored set at the time (8 variants), 38.8 s for the final
+  2-config set (4 variants), and 41 s for the 16-variant lab. Host headers dominate.
+- ptxas: 0 spills in every variant and no wgmma-serialisation warnings. Consumer MODE 2 sits at the 168-register
+  cap (154 for MODE 1); BN 128 variants use 96–118.
+
+**Correctness.** Every config passes the self-test.
+- rel 3.38e-3 (worst row 3.6e-3) against FP32. Marlin is 5.17e-3 (worst row 6.1e-3).
+- err = 0.
+- The judge clone's 5 tests pass with the lab file.
+
+**Lab, v1 as written (judge clone, box_out/k2b_v1_lab.log).** µs (TF/s on real route FLOP); Marlin from the same
+process and the same routing.
+
+| config | T = 753 | T = 3,012 | T = 16,384 |
+|---|---|---|---|
+| Marlin | 745 (187) | 2,292 (243) | 11,689 (258) |
+| sw128x256s4 | 858 (162) | 2,390 (233) | 10,814 (279) |
+| il128x256s4 | 1,103 (126) | 3,010 (185) | 13,151 (229) |
+| sw64x256s5 | 1,057 (132) | 3,101 (179) | 14,995 (201) |
+| sw128x128s6 | 1,172 (119) | 3,550 (157) | 16,517 (183) |
+| sw128x256s3 / s5 | 860 / 854 | 2,432 / 2,414 | 10,636 / 10,576 |
+| sw128x256s4r | 810 (172) | 2,294 (243) | 9,974 (302) |
+| sw128x256s4b3 | 874 | 2,475 | 10,825 |
+
+Probes at T = 16,384 (sw128x256s4, full 10,814 µs): no dequant 8,928; no MMA 7,757; loads only 5,383; handshakes
+only 1,973. These are nearly additive, so the stages were not overlapping.
+
+**Fixes, each measured (bench = `k2b_v1_bench.py`: prepare() in one process, same routing as Marlin).**
+
+| step | change | sw128x256s4r at 16K | best at 753 / 3,012 / 16,384 |
+|---|---|---|---|
+| 0 | as written | 10,227 | — |
+| 1 | tight try_wait loop (the err global load had been read every 32 polls) | no change | — |
+| 2 | test_wait polling instead of try_wait | slower (+0.4 ms) | rejected |
+| 3 | producer sync: cp.async.wait_group + `bar.sync` + per-warp `bfull` arrival (no 128-thread arrivals); flag 8 (no consumer fence) | 9,113 | — |
+| 4 | **coalesced activation loads** (8 threads per 128 B row) | **7,375** | 657 / 1,681 / 7,375 |
+| 5 | **load lookahead D = S − NB** (producer NB−1 stages ahead), no smem slack, NB = 3 | 7,081 (s4b3r) | **626 / 1,584 / 7,006** |
+
+**Current best (sw128x256s5b3r / sw128x256s4b3r, the scored set), from the same process and routing as Marlin:**
+
+
+**Probe table for the current best** (sw128x256s5b3r, T = 16,384, µs; includes ~0.2–0.3 ms of align + finalize):
+
+| full | p1: no dequant | p2: no MMA | p3: loads only | p7: handshakes only |
+|---|---|---|---|---|
+| 7,006 | 5,452 | 4,448 | 2,340 | 1,542 |
+
+What the probes say:
+- **The consumer chain binds.** With no dequant at all (p1), a stage takes 0.97 µs, against ≈ 0.52 µs of ideal tensor
+  time (wgmma at about 55–60% of peak even alone). Dequant adds 0.27 µs/stage on top.
+- **Loads and handshakes are no longer the limit.** p3 is 0.42 µs/stage, and p7 is about 0.27 µs/stage of serial
+  producer overhead, which is hidden by the producer's slack.
+- **The leading suspect is shared-memory bandwidth.**
+  - Per stage: the 2 WGs' SS wgmma reads (80 KB, B read twice) + dequant STS (32 KB) + LDS (10 KB) + cp.async writes
+    (26 KB) = 148 KB, which at 128 B/clk is ≥ 0.58 µs.
+  - Without the dequant traffic it is 106 KB (0.42 µs).
+  - This is what ncu should confirm (§11).

@@ -37,6 +37,7 @@ MIN_CHUNK = 2      # minimum tiles per split
 LOG2E = 1.4426950408889634
 P_OFFSET = 8.0     # p = exp2(s2 - m + 8) in (0, 256]
 RMS_EPS = 1e-5
+L8_Q_FP16 = False  # k1_v4: L=8 queries in fp16 (as L=1); False = v1-v3 E4M3 queries (set by k1_v4_emulate.py)
 
 
 def ceil_div(a, b):
@@ -642,10 +643,11 @@ def check_implementation(data, out, k_cache_after, v_cache_after):
     # Tight self-consistency check (not the judge's). L=1 (FP16 Q/P, exact K/V) sits at ~0.5% vs the BF16-query
     # reference; L=8 (v1: E4M3 Q, FP16 P) is checked against the reference with E4M3 queries (the same rounding
     # point: normalized, roped, before x5.473). Masking/indexing slips the loose judge bound tolerates still fail.
-    tref = ref if cfg["q_len"] == 1 else ref_kernel(data, torch.float8_e4m3fn, new_kv=(k, v))[0].to(torch.bfloat16)
+    q16 = cfg["q_len"] == 1 or L8_Q_FP16
+    tref = ref if q16 else ref_kernel(data, torch.float8_e4m3fn, new_kv=(k, v))[0].to(torch.bfloat16)
     tight = compare(out, tref, TIGHT_TOL)
     ok = ok and tight[0]
-    return ok, (f"{msg} [bound {tol:.3f}; e4m3-query ref err {e4m3:.4f}; tight vs {'bf16' if cfg['q_len'] == 1 else 'e4m3'}"
+    return ok, (f"{msg} [bound {tol:.3f}; e4m3-query ref err {e4m3:.4f}; tight vs {'bf16' if q16 else 'e4m3'}"
                 f"-query ref {tight[1].split(' (')[0].replace('relative L2 error ', '')}: {'ok' if tight[0] else 'FAIL'}]")
 
 
@@ -790,7 +792,7 @@ def emulate_k1(data, n_sm=132, cps=CPS, min_chunk=MIN_CHUNK, stats=None, visits=
             x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + RMS_EPS)
             if theta:
                 x = rope_rows(x, seq + j_idx)
-            if L == 1:
+            if L == 1 or L8_Q_FP16:
                 Qs = x.half().float().view(2, R8, 64)
             else:
                 Qs = dec(x.clamp(-448.0, 448.0).to(FP8).view(torch.uint8)).view(2, R8, 64)

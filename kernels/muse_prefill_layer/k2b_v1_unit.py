@@ -133,9 +133,13 @@ CPP = ("#include <torch/extension.h>\nvoid unit(torch::Tensor A, torch::Tensor B
 
 
 def main():
-    mod = load_inline("k2b_v1_unit", CPP, cuda_sources=PREFIX + UNIT, functions=["unit"], verbose=False,
+    import sys
+    mod = load_inline("k2b_v1_unit", CPP, cuda_sources=PREFIX + UNIT, functions=["unit"], verbose="--build-only" in sys.argv,
                       extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_90a,code=sm_90a",
                                          "-Xptxas=-v"])
+    if "--build-only" in sys.argv:   # CPU-only warm-up of the build cache (box.sh run, outside the GPU lock)
+        print("[unit] built", flush=True)
+        return
     torch.manual_seed(0)
     kst = 3
     ok = True

@@ -1,4 +1,4 @@
-"""compute-sanitizer driver for k1_v3 (two small shapes, both K1 kernels called directly + the routed kernel_fn).
+"""compute-sanitizer driver for k1_v3 (or --file k1_v4.py) (two small shapes, both K1 kernels called directly + the routed kernel_fn).
   compute-sanitizer --tool memcheck python3 kernels/muse_attention_decode/k1_v3_san.py"""
 import importlib.util
 import sys
@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "problems" / "muse_attention_decode"))
 import reference  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("k1v3", str(Path(__file__).with_name("k1_v3.py")))
+FILE = sys.argv[sys.argv.index("--file") + 1] if "--file" in sys.argv else "k1_v3.py"
+spec = importlib.util.spec_from_file_location("k1san", str(Path(__file__).with_name(FILE)))
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 for kw in (dict(batch=3, ctx=2047, heads="tp8", layer="sliding", seed=5, page=1),

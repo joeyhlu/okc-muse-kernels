@@ -76,6 +76,9 @@ K2B_DEADLINE_S = 200.0         # since prepare() started: no new candidate is bu
 K2B_TIMING_DEADLINE_S = 265.0  # since prepare() started: no further candidate is timed after this (limit 300)
 K2B_MIN_GAIN = 0.97            # a candidate replaces Marlin for a class only if t_cand < K2B_MIN_GAIN * t_marlin
 K2B_TIMING_REPS = 5
+K2B_RUNTIME_FLAGS = 8          # OR'ed into every launch: 8 = no consumer-side fence.proxy.async (as CUTLASS; passed
+                               # every box self-test), 16 = test_wait polling (slower)
+K2B_PROBES = (1, 2, 3, 7) if K2B_LAB else ()   # in-situ stage probes at T = 16384 (lab only)
 
 K2B_E = 32                     # local experts
 K2B_K = 4096                   # K of both GEMMs
@@ -90,15 +93,16 @@ K2B_TOPK = 8
 #   LAYOUT 0: K-major 128B swizzle (CUTLASS Layout_K_SW128), 1: K-major no-swizzle core matrices (the layout
 #          tools/box/wgmma_unit.py validated on the H200; fallback)
 #   REG    0: no setmaxnreg; 1: producer 88 / consumers 208 registers
-K2B_CONFIGS = {                # scored file: tried in this order
+K2B_CONFIGS = {                # scored file: the box lab's winners (2026-10-24, k2b_v1_bench5: T=753/3012/16384
+                               # 627/1584/7006 us vs Marlin 740/2275/11399 us, same process and routing)
+    "sw128x256s5b3r": (128, 256, 5, 3, 0, 1),
+    "sw128x256s4b3r": (128, 256, 4, 3, 0, 1),
+}
+K2B_LAB_CONFIGS = {            # k2b_v1_lab.py adds these (tile/stage/register/layout sweep)
     "sw128x256s4": (128, 256, 4, 2, 0, 0),
     "il128x256s4": (128, 256, 4, 2, 1, 0),
     "sw64x256s5": (64, 256, 5, 2, 0, 0),
     "sw128x128s6": (128, 128, 6, 3, 0, 0),
-}
-K2B_LAB_CONFIGS = {            # k2b_v1_lab.py adds these (tile/stage/register sweep)
-    "sw128x256s3": (128, 256, 3, 2, 0, 0),
-    "sw128x256s5": (128, 256, 5, 2, 0, 0),
     "sw128x256s4r": (128, 256, 4, 2, 0, 1),
     "sw128x256s4b3": (128, 256, 4, 3, 0, 0),
 }
@@ -125,7 +129,7 @@ def k2b_all_configs(lab):
 def k2b_smem_bytes(cfg):
     """Dynamic smem of one config (must equal Cfg::SMEM in the CUDA source; the emulator checks both)."""
     bm, bn, s, nb, _, _ = cfg
-    return s * bm * 128 + nb * bn * 128 + s * bn * 32 + s * bn * 8 + (2 * s + 2 * nb) * 8 + 1024
+    return s * bm * 128 + nb * bn * 128 + s * bn * 32 + s * bn * 8 + (2 * s + 2 * nb) * 8
 
 
 # ---- K2A v2.2 repack, VERBATIM from kernels/muse_moe_w4a16/k2a_v22.py (one layout per layer; the emulator
@@ -302,9 +306,10 @@ K2B_KERNEL_SRC = r"""
 // nkb = 64-k blocks per row (64 for K = 4096)
 #define K2B_WQ_IDX(e, rt, tile, kb, lane, nkb) ((((((e) * (rt)) + (tile)) * (nkb) + (kb)) * 32) + (lane))
 #define K2B_SQ_IDX(e, rt, tile, kb, lane, nkb) ((((((e) * (rt)) + (tile)) * ((nkb) >> 1) + ((kb) >> 1)) * 32) + (lane))
-// producer: thread p -> activation row and first chunk (tprl = log2 threads per row, cpt = chunks per thread)
-#define K2B_A_ROW(p, tprl) ((p) >> (tprl))
-#define K2B_A_C0(p, tprl, cpt) (((p) & ((1 << (tprl)) - 1)) * (cpt))
+// producer: thread p copies 16 B chunk K2B_A_CHUNK(p) of activation rows K2B_A_ROW(p, i), i < BM/16: 8 consecutive
+// threads cover one 128 B row (coalesced, full sectors), a warp instruction covers 4 rows
+#define K2B_A_ROW(p, i) (((p) >> 3) + ((i) * 16))
+#define K2B_A_CHUNK(p) ((p) & 7)
 // tile t -> (m-block, n-tile), n-tile fastest (ntl = log2 n-tiles)
 #define K2B_TILE_MB(t, ntl) ((t) >> (ntl))
 #define K2B_TILE_NT(t, ntl) ((t) & ((1 << (ntl)) - 1))
@@ -338,8 +343,11 @@ struct Cfg {
   static constexpr int OFF_C = OFF_B + NB * B_BYTES;
   static constexpr int OFF_SC = OFF_C + S * C_BYTES;
   static constexpr int OFF_BAR = OFF_SC + S * SC_BYTES;
-  static constexpr int SMEM = OFF_BAR + (2 * S + 2 * NB) * 8 + 1024;   // + slack for the 1024 B base alignment
-  static constexpr int TPR = 128 / BM, TPRL = TPR == 2 ? 1 : 0, CPT = 8 / TPR;   // producer: activation chunks
+  static constexpr int SMEM = OFF_BAR + (2 * S + 2 * NB) * 8;   // dynamic smem base is 1024-aligned (no static smem;
+                                                                // checked at run time -> err 7)
+  static constexpr int D = S - NB;   // load lookahead: the slot load(j + D) refills was freed by wgmma(j - NB), the same
+                                     // event that frees the B buffer dequant(j) writes -> producer runs NB-1 stages ahead
+  static constexpr int RPT = BM / 16;                            // producer: activation rows per thread
   static constexpr int ITEMS = BN * 2 / 128;                     // dequant items (and code chunks) per thread
   static constexpr int SCH = BN / 2;                             // 16 B scale chunks per stage
   static constexpr int KADV = LAYOUT == 0 ? K2B_KADV_SW : K2B_KADV_IL;
@@ -348,7 +356,7 @@ struct Cfg {
   static_assert(BM == 64 || BM == 128, "BM");
   static_assert(BN == 128 || BN == 256, "BN");
   static_assert(NTL > 0, "NT must be 16, 32 or 64");
-  static_assert(S >= 3 && NB >= 2, "pipeline depth");
+  static_assert(S >= 3 && NB >= 2 && S - NB >= 1, "pipeline depth");
   static_assert(SMEM <= 232448, "smem");
   static_assert(SCH <= 128, "scale chunks");
 };
@@ -384,21 +392,36 @@ __device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity) {
 }
 // Bounded wait (R9): after SPIN_BUDGET cycles the first waiter records `code` in err[0] and returns; every later
 // wait returns as soon as it sees err[0] != 0, so a broken pipeline ends the kernel quickly with garbage + flag.
-__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity, int* err, int code) {
-  if (mbar_try(bar, parity)) return;
+// The common path is a tight try_wait loop (try_wait suspends in hardware until the phase completes or a short
+// time limit); clock64 is read every 4096 polls and err (a global load) only then, so the slow path never delays
+// noticing a completed phase.
+__device__ __forceinline__ bool mbar_test(uint32_t bar, uint32_t parity) {
+  uint32_t ok;
+  asm volatile("{\n.reg .pred P1;\nmbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2;\nselp.b32 %0, 1, 0, P1;\n}\n"
+               : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
+  return ok != 0;
+}
+// poll: 0 = try_wait (may suspend), 1 = test_wait (pure polling; runtime flag 16)
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity, int* err, int code, int poll = 0) {
+  if (poll ? mbar_test(bar, parity) : mbar_try(bar, parity)) return;
   const long long t0 = clock64();
-  while (true) {
 #pragma unroll 1
-    for (int i = 0; i < 32; ++i)
-      if (mbar_try(bar, parity)) return;
-    if (*(volatile int*)err != 0) return;
-    if (clock64() - t0 > SPIN_BUDGET) { atomicCAS(err, 0, code); return; }
+  for (uint32_t n = 1;; ++n) {
+    if (poll ? mbar_test(bar, parity) : mbar_try(bar, parity)) return;
+    if ((n & 4095u) == 0u) {
+      if (*(volatile int*)err != 0) return;
+      if (clock64() - t0 > SPIN_BUDGET) { atomicCAS(err, 0, code); return; }
+    }
   }
 }
 __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int src_bytes) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes) : "memory");
 }
 __device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
+__device__ __forceinline__ void producer_bar() { asm volatile("bar.sync 1, 128;\n" ::: "memory"); }   // WG0 only
 __device__ __forceinline__ uint4 lds128(uint32_t a) {
   uint4 v;
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(a));
@@ -464,8 +487,8 @@ __device__ __forceinline__ bool pair_ok(const Params& P, int srow) {
 template <class C>
 struct LoadCur {
   int t, kb, e, nt;
-  const __nv_bfloat16* src;   // this thread's activation row (k = 0)
-  int src_bytes;              // 16, or 0 (zero-fill: padding row)
+  const __nv_bfloat16* src[C::RPT];   // this thread's activation rows (k = 0, its chunk)
+  uint32_t okmask;                    // bit i: row i is a real pair (else zero-fill, src-size 0)
 };
 
 template <class C>
@@ -474,29 +497,32 @@ __device__ __forceinline__ void load_tile_setup(const Params& P, LoadCur<C>& L, 
   L.nt = K2B_TILE_NT(L.t, C::NTL);
   L.e = __ldg(P.bexp + mb);
   L.kb = 0;
-  const int srow = mb * C::BM + K2B_A_ROW(p, C::TPRL);
-  const int sid = srow < P.n_sorted ? __ldg(P.sorted + srow) : -1;
-  const bool ok = sid >= 0 && sid < P.n_pairs;
-  long long row = C::MODE == 1 ? (long long)(sid >> 3) : (long long)srow;
-  if (!ok) row = 0;
-  L.src = P.x + row * KDIM;
-  L.src_bytes = ok ? 16 : 0;
+  L.okmask = 0;
+#pragma unroll
+  for (int i = 0; i < C::RPT; ++i) {
+    const int srow = mb * C::BM + K2B_A_ROW(p, i);
+    const int sid = srow < P.n_sorted ? __ldg(P.sorted + srow) : -1;
+    const bool ok = sid >= 0 && sid < P.n_pairs;
+    long long row = C::MODE == 1 ? (long long)(sid >> 3) : (long long)srow;
+    if (!ok) row = 0;
+    L.src[i] = P.x + row * KDIM + K2B_A_CHUNK(p) * 8;
+    L.okmask |= (ok ? 1u : 0u) << i;
+  }
 }
 
 template <class C>
 __device__ __forceinline__ void producer_load(const Params& P, uint32_t sbase, uint32_t j, const LoadCur<C>& L, int p) {
   const int slot = j % C::S;
-  const uint32_t bar_full = sbase + C::OFF_BAR + 8 * slot;
   const uint32_t bar_empty = sbase + C::OFF_BAR + 8 * (C::S + slot);
-  mbar_wait(bar_empty, ((j / C::S) & 1) ^ 1, P.err, 1);
+  mbar_wait(bar_empty, ((j / C::S) & 1) ^ 1, P.err, 1, (P.probe >> 4) & 1);
   if (!(P.probe & 4)) {
     const uint32_t a_dst = sbase + C::OFF_A + slot * C::A_BYTES;
-    const int arow = K2B_A_ROW(p, C::TPRL), c0 = K2B_A_C0(p, C::TPRL, C::CPT);
+    const int c = K2B_A_CHUNK(p);
 #pragma unroll
-    for (int i = 0; i < C::CPT; ++i) {
-      const int c = c0 + i;
-      const uint32_t off = C::LAYOUT == 0 ? K2B_ADDR_SW(arow, c) : K2B_ADDR_IL(arow, c);
-      cp_async16(a_dst + off, L.src + L.kb * 64 + c * 8, L.src_bytes);
+    for (int i = 0; i < C::RPT; ++i) {
+      const int r = K2B_A_ROW(p, i);
+      const uint32_t off = C::LAYOUT == 0 ? K2B_ADDR_SW(r, c) : K2B_ADDR_IL(r, c);
+      cp_async16(a_dst + off, L.src[i] + L.kb * 64, ((L.okmask >> i) & 1u) ? 16 : 0);
     }
     const int tile0 = L.nt * (C::BN / 16);
     const uint32_t c_dst = sbase + C::OFF_C + slot * C::C_BYTES;
@@ -511,14 +537,16 @@ __device__ __forceinline__ void producer_load(const Params& P, uint32_t sbase, u
       cp_async16(sbase + C::OFF_SC + slot * C::SC_BYTES + p * 16, P.sq + gi, 16);
     }
   }
-  cpasync_arrive_noinc(bar_full);
+  cp_async_commit();   // one group per stage; the dequant waits with cp.async.wait_group (no per-thread mbarrier arrivals)
 }
 
 template <class C>
-__device__ __forceinline__ void producer_dequant(const Params& P, uint32_t sbase, uint32_t j, int kb, int p) {
+__device__ __forceinline__ void producer_dequant(const Params& P, uint32_t sbase, uint32_t j, int kb, int p, bool more) {
   const int slot = j % C::S, b = j % C::NB;
-  mbar_wait(sbase + C::OFF_BAR + 8 * slot, (j / C::S) & 1, P.err, 2);                       // stage landed
-  mbar_wait(sbase + C::OFF_BAR + 8 * (2 * C::S + C::NB + b), ((j / C::NB) & 1) ^ 1, P.err, 3);  // B buffer free
+  if (more) cp_async_wait<C::D>();       // this thread's group for stage j is complete (D younger groups may fly)
+  else cp_async_wait<0>();               // tail: fewer younger groups
+  producer_bar();                        // every producer thread's stage-j data (A, codes, scales) has landed
+  mbar_wait(sbase + C::OFF_BAR + 8 * (2 * C::S + C::NB + b), ((j / C::NB) & 1) ^ 1, P.err, 3, (P.probe >> 4) & 1);  // B buffer free
   if (!(P.probe & 1)) {
     const uint32_t c_src = sbase + C::OFF_C + slot * C::C_BYTES;
     const uint32_t s_src = sbase + C::OFF_SC + slot * C::SC_BYTES;
@@ -543,15 +571,15 @@ __device__ __forceinline__ void producer_dequant(const Params& P, uint32_t sbase
         sts128(b_dst + off, bmul2(o[0], S), bmul2(o[1], S), bmul2(o[2], S), bmul2(o[3], S));
       }
     }
-    fence_proxy_async();   // generic-proxy STS -> visible to wgmma (async proxy) after the consumers' wait
   }
-  mbar_arrive(sbase + C::OFF_BAR + 8 * (2 * C::S + b));
+  fence_proxy_async();     // generic-proxy STS and cp.async data -> visible to wgmma (async proxy) after the consumers' wait
+  __syncwarp();
+  if ((p & 31) == 0) mbar_arrive(sbase + C::OFF_BAR + 8 * (2 * C::S + b));   // one arrival per producer warp (count 4)
 }
 
 template <class C>
 __device__ void producer(const Params& P, uint32_t sbase, int n_tiles, int p) {
-  constexpr int D = C::S - 2;   // loads run D stages ahead of the dequant (the slot they refill was freed by
-                                // wgmma(j - 2), the same event that frees the B buffer the dequant writes)
+  constexpr int D = C::D;
   LoadCur<C> L;
   L.t = next_valid<C>(blockIdx.x, n_tiles, P.bexp);
   if (L.t < n_tiles) load_tile_setup<C>(P, L, p);
@@ -567,8 +595,9 @@ __device__ void producer(const Params& P, uint32_t sbase, int n_tiles, int p) {
        t = next_valid<C>(t + gridDim.x, n_tiles, P.bexp)) {
 #pragma unroll 1
     for (int kb = 0; kb < KS; ++kb) {
-      if (L.t < n_tiles) { producer_load<C>(P, sbase, jl++, L, p); advance(); }
-      producer_dequant<C>(P, sbase, jd++, kb, p);
+      const bool more = L.t < n_tiles;
+      if (more) { producer_load<C>(P, sbase, jl++, L, p); advance(); }
+      producer_dequant<C>(P, sbase, jd++, kb, p, more);
     }
   }
 }
@@ -593,10 +622,10 @@ __device__ void consumer(const Params& P, uint32_t sbase, int n_tiles, int c, in
 #pragma unroll 1
     for (int kb = 0; kb < KS; ++kb, ++j) {
       const int slot = j % C::S, b = j % C::NB;
-      mbar_wait(sbase + C::OFF_BAR + 8 * (2 * C::S + b), (j / C::NB) & 1, P.err, 4);   // B tile dequantised
-      mbar_wait(sbase + C::OFF_BAR + 8 * slot, (j / C::S) & 1, P.err, 5);              // A stage landed
+      // B tile dequantised; also implies A stage landed (the producers passed wait_group + bar.sync before arriving)
+      mbar_wait(sbase + C::OFF_BAR + 8 * (2 * C::S + b), (j / C::NB) & 1, P.err, 4, (P.probe >> 4) & 1);
       if (active) {
-        fence_proxy_async();              // cp.async (A) / STS (B) data -> async-proxy reads (insurance; CUTLASS omits it)
+        if (!(P.probe & 8)) fence_proxy_async();   // flag 8 drops this consumer-side insurance fence (CUTLASS omits it)
         const uint64_t da = make_desc(sbase + C::OFF_A + slot * C::A_BYTES + cm * 8192, C::LBO, K2B_SBO, C::LT);
         const uint64_t db = make_desc(sbase + C::OFF_B + b * C::B_BYTES + cn * C::NW * 128, C::LBO, K2B_SBO, C::LT);
         fence_acc<NR>(acc);
@@ -655,16 +684,20 @@ __device__ void consumer(const Params& P, uint32_t sbase, int n_tiles, int c, in
 
 template <class C>
 __global__ void __launch_bounds__(384, 1) k2b1_gemm(const Params P) {
-  extern __shared__ uint8_t smem_raw[];
-  const uint32_t sbase = (smem_u32(smem_raw) + 1023u) & ~1023u;
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+  const uint32_t sbase = smem_u32(smem_raw);
   const int tid = threadIdx.x, wg = tid >> 7, tw = tid & 127;
+  if (sbase & 1023u) {   // the SW128 atoms need 1024 B alignment; never seen, but fail loudly instead of silently
+    if (tid == 0) atomicCAS(P.err, 0, 7);
+    return;
+  }
   if (tid == 0) {
     for (int s = 0; s < C::S; ++s) {
-      mbar_init(sbase + C::OFF_BAR + 8 * s, 128);              // full: 128 producer cp.async arrivals (noinc)
+      mbar_init(sbase + C::OFF_BAR + 8 * s, 1);                // (unused since v1.1: cp.async.wait_group + bar.sync)
       mbar_init(sbase + C::OFF_BAR + 8 * (C::S + s), 8);       // empty: one lane per consumer warp
     }
     for (int b = 0; b < C::NB; ++b) {
-      mbar_init(sbase + C::OFF_BAR + 8 * (2 * C::S + b), 128);          // B full: every producer thread
+      mbar_init(sbase + C::OFF_BAR + 8 * (2 * C::S + b), 4);            // B full: one lane per producer warp
       mbar_init(sbase + C::OFF_BAR + 8 * (2 * C::S + C::NB + b), 8);    // B empty: one lane per consumer warp
     }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -989,7 +1022,7 @@ def _k2b1_launch(k, name, mode, x, wq, sq, gs, out, sorted_ids, block_experts, n
     max_tiles = max(1, (sorted_ids.numel() // bm) * (n // bn))
     grid = min(k["sms"], max_tiles)
     k["mod"].run(k["vid"][(name, mode)], x, wq, sq, gs, out, sorted_ids, block_experts, ntp, k["err"],
-                 n_pairs, grid, probe)
+                 n_pairs, grid, probe | K2B_RUNTIME_FLAGS)
 
 
 def _k2b1_align(local_ids, bm, ignore):
@@ -1228,14 +1261,14 @@ def _k2b1_prepare(weights, state, t_start):
             k["plan"][cls] = best
             print(f"[k2b] time {cls} T={tokens} routes={routes}: " + " | ".join(line) + f" -> {best or 'marlin'}",
                   flush=True)
-            if K2B_LAB and cls == "large":
+            if K2B_PROBES and cls == "large":
                 # In-situ stage probes (results are garbage, timing only): 1 = no dequant, 2 = no wgmma,
                 # 3 = loads only, 7 = pipeline handshakes only. Each probe removes one stage's work.
                 for name in passed[:4]:
                     if time.time() - t_start > K2B_TIMING_DEADLINE_S:
                         break
                     pl = []
-                    for probe in (1, 2, 3, 7):
+                    for probe in K2B_PROBES:
                         try:
                             t_p = _k2b1_graph_time(lambda: _k2b1_experts(x, wts, ids, sub, name, probe), flush)
                             _k2b1_err(k)
