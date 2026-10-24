@@ -1,6 +1,14 @@
 # okc: problem=muse_attention_decode
-# nonce k1-v2-1 (k1_v1 kernel for L=1 at every B; L=8 -> rung-1 path with L2; sliding L=1 1 CTA/SM; from jobs d857095aa064476f, f7843f722b124e77, 01be153c3cdb4b1d)
-"""K1 v1: fused gated-attention decode/verify for Muse Spark Open (sm_90, mma.sync; one main kernel per call, plus
+# nonce k1-v3-1 (route: K1 for L=1 at every B, rung-1 FA3 path for L=8; box sweeps box_out/k1v3_sweep*.log)
+"""K1 v3 (from k1_v2): L=1 routes and tables unchanged (re-measured on the box), L=8 routed to the rung-1 FA3 path.
+v3 adds, measured on the box H200 (kernels/muse_attention_decode/k1_v3.md):
+  * L=8 kernel rewritten (warp = KV head x 16-row m-tile, all keys; V converted ONCE per tile into an fp16 smem tile by
+    the loader threads, PV B fragments via ldmatrix.x4.trans; 2 CTAs/SM). Correct (self-test, judge checks, CPU
+    emulator k1_v3_emulate.py) but slower than rung-1 at every L=8 shape, so it is not routed (kill criterion).
+  * ring depth as a template parameter (K1_STAGES_T), staged fold merge (merge_global), gate L2 prefetch, Q loads
+    hoisted ahead of the KV chain, K1_PROF phase stamps (lab builds only), K1_DIAG isolation switches (lab only).
+
+K1 v1 notes (kept): fused gated-attention decode/verify for Muse Spark Open (sm_90, mma.sync; one main kernel per call, plus
 a split-combine kernel only where the host table asks for it; fixed grids, per-request lengths read on device).
 
 Changes from v0 (measured on the judge, job ded828a1027f427a: v0 1.081x, L=8 compute-bound, B=1 full combine 19.5 us):
@@ -48,7 +56,7 @@ K1_NEWK = 16
 # Host tables, keyed by (layer kind, q_len). Expected wins (re-measure): K1 everywhere.
 #   route: smallest batch that takes K1 (others: FA3). v0 measured L=1 wins at every B except B=1 full (combine,
 #   fixed in v1); L=8 is predicted to win after the v1 redesign. Set an entry to 1 << 30 to send it to FA3.
-K1_ROUTE_MIN_BATCH = {("sliding", 1): 1, ("full", 1): 1}  # measured: K1 v1 L=8 loses to FA3 at every shape (0.53-0.92x)
+K1_ROUTE_MIN_BATCH = {("sliding", 1): 1, ("full", 1): 1}  # L=8: v1 0.53-0.92x, v3 0.45-0.91x of rung-1 (box) -> FA3
 #   fold (last-CTA merge, no combine launch) when batch >= this; else the separate k1_combine.
 K1_FOLD_MIN_BATCH = {("sliding", 1): 1, ("sliding", 8): 1, ("full", 1): 8, ("full", 8): 8}
 #   minimum tiles (64 keys) per split.
@@ -56,7 +64,7 @@ K1_MIN_CHUNK_T = {("sliding", 1): 2, ("sliding", 8): 4, ("full", 1): 2, ("full",
 #   target CTAs per SM when sizing Gx (capped by the measured occupancy of k1_main<L>).
 K1_CPS_T = {("sliding", 1): 1, ("sliding", 8): 2, ("full", 1): 2, ("full", 8): 2}  # lab: sliding L=1 1 CTA/SM -1.3/-0.6 us at B16/B32
 #   cp.async ring depth (instantiated: L=1 {4, 6}, L=8 {3, 4}).
-K1_STAGES_T = {("sliding", 1): 4, ("sliding", 8): 4, ("full", 1): 4, ("full", 8): 4}
+K1_STAGES_T = {("sliding", 1): 4, ("sliding", 8): 4, ("full", 1): 4, ("full", 8): 4}  # box: L=1 6 stages +0-1%
 K1_COUNTERS = 1 << 16          # fold arrival counters (B * Hkv/2 must fit)
 
 
@@ -510,8 +518,13 @@ __device__ __forceinline__ void tile_compute8(const uint8_t* __restrict__ Kbuf, 
     const int key = 8 * jn + g;
     const uint4 kv = *reinterpret_cast<const uint4*>(Kbuf + key * ROWB + 16 * ((4 * h + t) ^ (4 * (key & 1))));
     sc[jn][0] = 0.f; sc[jn][1] = 0.f; sc[jn][2] = 0.f; sc[jn][3] = 0.f;
+#if K1_DIAG == 5
+    sc[jn][0] = __uint_as_float((kv.x ^ qf[0][0]) & 0x3f7fffffu); sc[jn][1] = __uint_as_float((kv.y ^ qf[0][1]) & 0x3f7fffffu);
+    sc[jn][2] = __uint_as_float((kv.z ^ qf[1][0]) & 0x3f7fffffu); sc[jn][3] = __uint_as_float((kv.w ^ qf[1][1]) & 0x3f7fffffu);
+#else
     mma16832_e4m3(sc[jn], qf[0][0], qf[0][1], qf[0][2], qf[0][3], kv.x, kv.y);
     mma16832_e4m3(sc[jn], qf[1][0], qf[1][1], qf[1][2], qf[1][3], kv.z, kv.w);
+#endif
   }
   if (need) {
 #pragma unroll
@@ -604,6 +617,13 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
   const float vsc = __ldg(p.v_scale);
   const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
   const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
+  uint2 graw[K];                                      // gates of this thread's items, loaded up front (v3)
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    const int r = r0 + 16 * k, hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
+    graw[k] = *reinterpret_cast<const uint2*>(p.qkv + ((size_t)b * L + j) * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 +
+                                              (size_t)((2 * hp + hh) * 8 + gi) * 64 + 4 * u);
+  }
   float M[K];
 #pragma unroll
   for (int k = 0; k < K; ++k) M[k] = neg_inf();
@@ -647,10 +667,8 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
     const int hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
     const int qh = (2 * hp + hh) * 8 + gi;
     const size_t tok = (size_t)b * L + j;
-    const uint2 graw = *reinterpret_cast<const uint2*>(p.qkv + tok * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 +
-                                                       (size_t)qh * 64 + 4 * u);
-    const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
-    const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
+    const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw[k].x));
+    const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw[k].y));
     const __nv_bfloat162 o01 = __floats2bfloat162_rn(a4.x * rs * sigmoidf_(g01.x), a4.y * rs * sigmoidf_(g01.y));
     const __nv_bfloat162 o23 = __floats2bfloat162_rn(a4.z * rs * sigmoidf_(g23.x), a4.w * rs * sigmoidf_(g23.y));
     uint2 ow;
@@ -668,6 +686,15 @@ template <int L>
 __device__ __forceinline__ void merge_global(const Params& p, const float* po, const float* pl, const int S, const int b,
                                              const int hp, float* sm) {
   constexpr int ROWS = 16 * L, R8 = 8 * L, ITEMS = ROWS * 16, K = ITEMS / NTHR;
+  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
+  const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
+  uint2 graw[K];                                      // gates of this thread's items, loaded up front (v3)
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    const int r = r0 + 16 * k, hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
+    graw[k] = *reinterpret_cast<const uint2*>(p.qkv + ((size_t)b * L + j) * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 +
+                                              (size_t)((2 * hp + hh) * 8 + gi) * 64 + 4 * u);
+  }
   const int n = S * ROWS;
   for (int i = threadIdx.x; i < n; i += NTHR) sm[i] = __ldcg(pl + i);
   __syncthreads();
@@ -688,8 +715,6 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
   __syncthreads();
   K1P(9);
   const float vsc = __ldg(p.v_scale);
-  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
-  const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
   float4 acc[K];
 #pragma unroll
   for (int k = 0; k < K; ++k) acc[k] = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -721,12 +746,56 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
     const int hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
     const int qh = (2 * hp + hh) * 8 + gi;
     const size_t tok = (size_t)b * L + j;
+    const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw[k].x));
+    const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw[k].y));
+    const __nv_bfloat162 o01 = __floats2bfloat162_rn(a4.x * rs * sigmoidf_(g01.x), a4.y * rs * sigmoidf_(g01.y));
+    const __nv_bfloat162 o23 = __floats2bfloat162_rn(a4.z * rs * sigmoidf_(g23.x), a4.w * rs * sigmoidf_(g23.y));
+    uint2 ow;
+    ow.x = *reinterpret_cast<const uint32_t*>(&o01);
+    ow.y = *reinterpret_cast<const uint32_t*>(&o23);
+    *reinterpret_cast<uint2*>(p.out + tok * (size_t)p.Hq * 64 + (size_t)qh * 64 + 4 * u) = ow;
+  }
+}
+
+// k1_v2's merge, kept verbatim for L=1 (so every routed L=1 shape runs exactly the k1_v2 code path).
+template <int L>
+__device__ __forceinline__ void merge_finalize_v2(const Params& p, const float* po, const float* pl, const int S, const int b,
+                               const int hp, const bool cg) {
+  constexpr int ROWS = 16 * L, R8 = 8 * L, ITEMS = ROWS * 16;
+  static_assert(ITEMS % NTHR == 0, "uniform item loop (half-warp shuffles)");
+  const float vsc = __ldg(p.v_scale);
+  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
+  for (int it = threadIdx.x; it < ITEMS; it += NTHR) {
+    const int r = it >> 4, u = it & 15;
+    float M = neg_inf();
+    for (int s = 0; s < S; ++s) M = fmaxf(M, ldf(pl + (size_t)s * ROWS + r, cg));
+    const float Mu = (M == neg_inf()) ? 0.f : M;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    float ws = 0.f;
+    for (int s = 0; s < S; ++s) {
+      const float w = ex2(ldf(pl + (size_t)s * ROWS + r, cg) - Mu);
+      const float4 v = ldf4(po + ((size_t)s * ROWS + r) * 64 + 4 * u, cg);
+      ws += w;
+      acc.x = fmaf(w, v.x, acc.x); acc.y = fmaf(w, v.y, acc.y);
+      acc.z = fmaf(w, v.z, acc.z); acc.w = fmaf(w, v.w, acc.w);
+    }
+    const float sc = (ws > 0.f) ? vsc / ws : 0.f;
+    acc.x *= sc; acc.y *= sc; acc.z *= sc; acc.w *= sc;
+    float ss = acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w;
+    ss += __shfl_xor_sync(FULL, ss, 8);
+    ss += __shfl_xor_sync(FULL, ss, 4);
+    ss += __shfl_xor_sync(FULL, ss, 2);
+    ss += __shfl_xor_sync(FULL, ss, 1);
+    const float rs = rsqrtf(ss * (1.f / 64.f) + 1e-5f);
+    const int hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
+    const int qh = (2 * hp + hh) * 8 + gi;
+    const size_t tok = (size_t)b * L + j;
     const uint2 graw = *reinterpret_cast<const uint2*>(p.qkv + tok * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 +
                                                        (size_t)qh * 64 + 4 * u);
     const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
     const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
-    const __nv_bfloat162 o01 = __floats2bfloat162_rn(a4.x * rs * sigmoidf_(g01.x), a4.y * rs * sigmoidf_(g01.y));
-    const __nv_bfloat162 o23 = __floats2bfloat162_rn(a4.z * rs * sigmoidf_(g23.x), a4.w * rs * sigmoidf_(g23.y));
+    const __nv_bfloat162 o01 = __floats2bfloat162_rn(acc.x * rs * sigmoidf_(g01.x), acc.y * rs * sigmoidf_(g01.y));
+    const __nv_bfloat162 o23 = __floats2bfloat162_rn(acc.z * rs * sigmoidf_(g23.x), acc.w * rs * sigmoidf_(g23.y));
     uint2 ow;
     ow.x = *reinterpret_cast<const uint32_t*>(&o01);
     ow.y = *reinterpret_cast<const uint32_t*>(&o23);
@@ -783,6 +852,11 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
   const bool last = (s_idx == S_b - 1);
   const int seq = __ldg(p.seq_lens + b);
   const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
+  if (L == 8 && s_idx == 0 && tid < L * 16) {        // warm L2 with the gate rows the merge will read (1 line each)
+    const int j = tid >> 4, qh = 16 * hp + (tid & 15);
+    const __nv_bfloat16* ga = p.qkv + ((size_t)b * L + j) * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 + (size_t)qh * 64;
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(ga));
+  }
   float2 xv[RPW];                                     // Q rows, loaded first (independent of the KV chain)
 #pragma unroll
   for (int k = 0; k < RPW; ++k) {
@@ -1045,7 +1119,8 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
 
   // ---- output: fold (merge in the last-arriving CTA, or straight from smem when S_b == 1) or partials only
   if (p.fold && S_b == 1) {
-    merge_finalize<L>(p, ost, lse_s, 1, b, hp, false);
+    if constexpr (L == 1) merge_finalize_v2<L>(p, ost, lse_s, 1, b, hp, false);
+    else merge_finalize<L>(p, ost, lse_s, 1, b, hp, false);
     K1P(5);
     return;
   }
@@ -1067,7 +1142,9 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
       __threadfence();
       K1P(7);
       const size_t base = (size_t)hp * p.Gx + off_b;
-      if ((S_b + 1) * ROWS <= ring_bytes<L, ST>() / 4)  // staged merge in the drained ring
+      if constexpr (L == 1)
+        merge_finalize_v2<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp, true);
+      else if ((S_b + 1) * ROWS <= ring_bytes<L, ST>() / 4)  // staged merge in the drained ring
         merge_global<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp,
                         reinterpret_cast<float*>(ring));
       else
@@ -1299,7 +1376,7 @@ if not FALLBACK:
         print("[k1] CUDA build FAILED, using the fallback path. Compiler output tail:\n" + str(_ex)[-12000:],
               flush=True)
         _MOD = None
-print(f"[k1] v1 FALLBACK={FALLBACK} SELF_TEST={SELF_TEST} built={_MOD is not None} route={K1_ROUTE_MIN_BATCH}"
+print(f"[k1] v3 FALLBACK={FALLBACK} SELF_TEST={SELF_TEST} built={_MOD is not None} route={K1_ROUTE_MIN_BATCH}"
       f" fold={K1_FOLD_MIN_BATCH} min_chunk={K1_MIN_CHUNK_T} cps={K1_CPS_T}", flush=True)
 
 _STATE = {"tested": False, "ok": False}
