@@ -53,13 +53,13 @@ FIELDS = {"decode 1": {"router_load": 2.57, "router_distinct": 2.50},
           "verify 32": {"router_load": 409.5, "router_distinct": 21.35}}
 
 OPS = ["qkv", "qknorm_kv", "attention", "combine", "o_norm_gate", "o_proj", "attn_boundary", "router", "pooler",
-       "pre_expert_norm", "moe_align", "w13", "swiglu", "w2", "finalize", "experts_fused", "unpooler",
+       "pre_expert_norm", "v8_tail", "moe_align", "w13", "swiglu", "w2", "finalize", "experts_fused", "unpooler",
        "ffn_boundary", "gaps"]
 OP_DESC = {
     "qkv": "qkv_gate GEMM", "qknorm_kv": "QK-norm (+RoPE), q->FP8, K/V FP8 store", "attention": "attention main",
     "combine": "split-KV combine", "o_norm_gate": "per-head RMSNorm x sigmoid(gate)", "o_proj": "o GEMM",
     "attn_boundary": "post-attn norm + residual + pre-FFN norm", "router": "router GEMM(s) + top-8 (side stream, exposed part)",
-    "pooler": "pooler GEMM", "pre_expert_norm": "pre-expert RMSNorm", "moe_align": "local ids + moe_align/sort",
+    "pooler": "pooler GEMM", "pre_expert_norm": "pre-expert RMSNorm", "v8_tail": "V8 tail: routing + pre-expert norm + local ids", "moe_align": "local ids + moe_align/sort",
     "w13": "Marlin W13", "swiglu": "silu_and_mul", "w2": "Marlin W2", "finalize": "post-expert norm weighted sum",
     "experts_fused": "K2A v2.2 (route+W13+SwiGLU+W2+finalize)", "unpooler": "unpooler GEMM (+pad/zeros)",
     "ffn_boundary": "post-FFN norm + residual + next pre-attn norm", "gaps": "idle GPU inside the graph"}
@@ -123,7 +123,9 @@ def instrument(mod, state):
     for name, lab in (("_gemm", gemm_label), ("store_cache", "store_cache"), ("flash_attn_with_kvcache", "fa3"),
                       ("moe_align_block_size", "moe_align"), ("moe_wna16_marlin_gemm", marlin_label),
                       ("silu_and_mul", "swiglu"), ("fused_post_expert_norm_weighted_sum", "finalize"),
-                      ("_post_expert_norm_weighted_sum", "finalize"), ("_k1_run", "k1"), ("_k2a_experts", "k2a")):
+                      ("_post_expert_norm_weighted_sum", "finalize"), ("_k1_run", "k1"), ("_k2a_experts", "k2a"),
+                      ("_v8_gemm", lambda x, layer, *a, **k: {"qkv_gate": "qkv", "pooler": "pooler"}.get(layer, "unpooler")),
+                      ("_v8_logits", "router_logits"), ("_v8_tail", "v8_tail")):
         if name in g and callable(g[name]):
             g[name] = wrap(lab, g[name])
     for key, lab in (("qk_norm", "qk_norm"), ("o_norm_gate", "o_norm_gate"), ("attn_boundary", "attn_boundary"),
@@ -349,7 +351,9 @@ def bucket(label, name, role):
         return "experts_fused"
     if label in ("qk_norm", "store_cache"):
         return "qknorm_kv"
-    if label == "routing" or role == "side":
+    if label == "v8_tail":
+        return "v8_tail"
+    if label in ("routing", "router_logits") or role == "side":
         return "router"
     direct = {"qkv": "qkv", "o_proj": "o_proj", "o_norm_gate": "o_norm_gate", "attn_boundary": "attn_boundary",
               "pooler": "pooler", "pre_expert_norm": "pre_expert_norm", "moe_align": "moe_align", "w13": "w13",
@@ -365,6 +369,8 @@ def bucket(label, name, role):
             return "qknorm_kv"                      # k/v/q casts to FP8
         if a == "fa3":
             return "attention"                      # FA3 output cast to BF16
+        if b == "v8_tail" and a == "attn_boundary":
+            return "pooler"                         # V8 "cat": [pooler; router hi; lo] GEMM
         if b in ("pre_expert_norm", "moe_align") or a == "pooler":
             return "moe_align"                      # local ids (expert_map / table)
         return bucket(b, name, role) if b in direct or b in ("k1", "fa3", "k2a", "routing", "qk_norm") else "unknown:" + label
@@ -415,6 +421,7 @@ def floors(info):
     rows["router"] = (256 * HIDDEN * 4 + T * HIDDEN * 2, 2.0 * T * 256 * HIDDEN * (1 if T <= 8 else 2))
     rows["pooler"] = gemm(DEXP, HIDDEN)
     rows["pre_expert_norm"] = (T * DEXP * 4, 0)
+    rows["v8_tail"] = (0, 0)
     rows["moe_align"] = (T * 8 * 8, 0)
     rows["w13"] = (d * EXPERT_BYTES * 2 / 3, 2.0 * info["routes_mean"] * 2 * DEXP * DEXP)
     rows["swiglu"] = (info["routes_mean"] * DEXP * 2 * 3, 0)
@@ -514,7 +521,7 @@ N_DEP = 7   # grid-wide dependencies in one layer (attn<-qkv, o<-attn, norm<-o, 
             # experts<-routing+pooler norm, W2<-W13, unpooler<-experts; the last norm folds into the unpooler pass)
 GROUPS = {"qkv": ["qkv"], "attn_block": ["qknorm_kv", "attention", "combine", "o_norm_gate"], "o_proj": ["o_proj"],
           "attn_boundary": ["attn_boundary"], "router": ["router"], "pooler": ["pooler"],
-          "pre_expert_norm": ["pre_expert_norm"], "experts": ["moe_align", "w13", "swiglu", "w2", "finalize", "experts_fused"],
+          "pre_expert_norm": ["pre_expert_norm", "v8_tail"], "experts": ["moe_align", "w13", "swiglu", "w2", "finalize", "experts_fused"],
           "unpooler": ["unpooler"], "ffn_boundary": ["ffn_boundary"], "gaps": ["gaps"]}
 GROUP_ORDER = list(GROUPS)
 K2A_LEVERS = {1: 34, 8: 86, 16: 116, 32: 152, 128: 260, 256: 352}   # k2a_gap_analysis.md §3, all four levers
@@ -697,8 +704,10 @@ def report(res, meta, detail):
         gf = group_floors(f)
         P(f"| **total** | **{tb:.1f}** | **{ts:.1f}** | {sum(v[0] for v in gf.values()):.1f} (groups standalone) |"
           f" {fused_ideal(gf):.1f} (fused-ideal) | | | | |\n")
-        cb, cs = j["stock"] / tb, j["ours"] / ts
+        j_ours = j["ours"] if meta["sub"].endswith("k3_v07.py") else info["sub_time"] * j["stock"] / info["base_med"]
+        cb, cs = j["stock"] / tb, j_ours / ts
         grp = lambda d, c: {g: c * sum(d.get(o, 0.0) for o in ops) for g, ops in GROUPS.items()}  # noqa: E731
+        j = dict(j, ours=j_ours)
         shapes.append({"idx": idx, "load": info["load"], "weight": info["weight"], "stock": j["stock"], "tokens": info["tokens"],
                        "ours": grp(s["excl"], cs), "stock_ops": grp(b["excl"], cb), "floor": gf, "cal": (cb, cs),
                        "name": name})
