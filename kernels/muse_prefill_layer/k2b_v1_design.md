@@ -513,3 +513,38 @@ waits on it.
 2. **Inside v1** (smaller): ping-pong consumers (hide the per-tile epilogue and drain), and REG = 1 everywhere.
    - REG = 1 is consistently 8–12% faster.
    - Per-tile wgmma N by valid row count for T ≈ 753, where the tail tiles are mostly padding.
+
+## 12. Overlap micro-lab on v1m (2026-10-24; box_out/k2b_v1n_lab_*.log, k2b_v1n_probe2.log; vehicle: k2b_v1m_lab.py)
+
+Knobs, compiled per config; defaults reproduce v1m:
+- FENCE: accumulator operand-fence placement;
+- WAITN: wgmma groups in flight;
+- runtime bit 32 ("decoupled"): no cross-role mbarrier waits, timing only.
+
+Same-process µs (Marlin and every config timed in one process on the same routing):
+
+
+
+Probes at judge T = 16,384, v1m (µs; ~0.25 ms is align + finalize):
+
+| full | p1 no dequant | p2 no MMA | p3 loads only | p32 decoupled full | p33 decoupled, no dequant | p34 decoupled loads + dequant | p35 decoupled loads only | p37 decoupled MMA only |
+|---|---|---|---|---|---|---|---|---|
+| 7,258 | 4,476 | 4,577 | 2,443 | 6,477 | 4,347 | 4,199 | 1,965 | 3,895 |
+
+What this says (it corrects §10 finding 4):
+1. **Loads and MMA largely overlap.** Decoupled loads + MMA (4,347) is close to MMA alone (3,895); only ~0.45 ms of
+   the ~1.7 ms load stream leaks.
+2. **The non-overlap is dequant against MMA, and it is hardware contention, not handshake coupling.**
+   - Decoupled full (6,477) is ≈ MMA (3,895) + the dequant's own cost (p34 − p35 ≈ 2,234), not
+     max(3,895, 4,199).
+   - The producer's dequant (32 KB STS + 10 KB LDS per stage) and the two consumer warpgroups' SS wgmma (80 KB of
+     smem reads per stage) fight over shared memory.
+   - The handshakes cost ~0.8 ms (coupled 7,258 against decoupled 6,477).
+3. **Wgmma alone runs at about 81% of peak** (0.64 µs per 128×256×64 stage against 0.52 ideal at 1,980 MHz).
+
+Next lever: take the dequant's smem round trip off the SS wgmma's path.
+- Register-sourced weights (v2's direction) remove it, but v2's own activation loads were 2.7× slower in situ.
+- A hybrid that keeps v1's 128-token × 256-weight tile and load path, with the weights as RS A fragments, would need
+  weights on M (swap-AB), i.e. 256 weight rows = 2 m64 per consumer warpgroup with ≤ 128 tokens: accumulators 2 × 64
+  = 128 registers.
+- Alternatively, shrink the B-tile traffic: one consumer warpgroup per 256-column B read (it is read twice today).
