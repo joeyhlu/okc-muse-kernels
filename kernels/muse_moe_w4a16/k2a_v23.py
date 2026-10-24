@@ -1,6 +1,17 @@
 # okc: problem=muse_moe_w4a16
-# nonce k2a-v22-1
-"""K2a v2.2: custom NVFP4 x BF16 MoE experts for decode/verify (results: k2a_v22.md; design: k2a_v2_design.md).
+# nonce k2a-v23-1
+"""K2a v2.3: custom NVFP4 x BF16 MoE experts for decode/verify (results: k2a_v23.md; v2.2: k2a_v22.md; design:
+k2a_v2_design.md).
+
+v2.3 over v2.2: a WG template path (Cfg WG = 1): wgmma.mma_async m64nNk16 with the dequantized weight fragments as
+the register A operand and the X slice as a descriptor-addressed shared-memory B operand (no-swizzle K-major core
+matrices, filled by a conflict-free scatter that matches v2's in-item k order; repack and numerics unchanged), so a
+pass holds 32/64 tokens and a hot expert's weights are streamed/dequantized 2-4x less often. Unit test:
+tools/box/wgmma_unit.py (exact); emulator: k2a_v23_emulate.py (ALL PASS). Box sweep: the WG path wins on
+hot-expert-heavy routings (V2_PLAN_SKEWED) but loses on the judge's routings at every bucket (ptxas serializes
+wgmma at <= 80 regs; 128 regs = 2 CTAs/SM starves the cold-expert stream), so V2_PLAN / ROUTE = v2.2's.
+
+v2.2 description (unchanged below):
 Judge clone on the rented H200 (judge image): 1.471x [1.449, 1.493] vs SGLang (v2.1: 1.397x).
 
 v2.2 over v2.1 (same repacked layout and numerics; every change measured on the box):
@@ -116,18 +127,23 @@ def variant(nc, u=4, pf=0, tw=1, xe=8192, minb=4, wg=0):
 V2_VARIANTS = [
     variant(1, 4, 0, 1, 8192, 4),         # 0: 8 tokens / pass, 4 CTAs/SM (<= 64 regs), synchronous X staging
     variant(2, 4, 0, 1, 16384, 4),        # 1: 16 tokens / pass, cp.async X staging
-    variant(4, 4, 0, 1, 16384, 3, 1),     # 2: WG 32 tokens / pass, 3 CTAs/SM
-    variant(8, 4, 0, 1, 16384, 2, 1),     # 3: WG 64 tokens / pass, 2 CTAs/SM
-    variant(8, 2, 0, 1, 16384, 3, 1),     # 4: WG 64 tokens / pass, U 2, 3 CTAs/SM
-    variant(4, 2, 0, 1, 16384, 4, 1),     # 5: WG 32 tokens / pass, U 2, 4 CTAs/SM
-    variant(8, 4, 0, 1, 16384, 3, 1),     # 6: WG 64 tokens / pass, U 4, 3 CTAs/SM
-    variant(2, 4, 0, 1, 16384, 4, 1),     # 7: WG 16 tokens / pass, 4 CTAs/SM
+    variant(4, 2, 0, 1, 16384, 4, 1),     # 2: WG (wgmma) 32 tokens / pass, U 2, 4 CTAs/SM (64 regs, ptxas-serialized)
+    variant(8, 4, 0, 1, 16384, 2, 1),     # 3: WG 64 tokens / pass, U 4, 2 CTAs/SM (128 regs, not serialized)
 ]
+# Dev sweep (tools/box/v23_bench.py, box_out/v23_bench.log) also measured WG 32/U4/3 CTAs, 64/U2/3, 64/U4/3 and 16/U4/4:
+# every WG instance at <= 80 regs is ptxas-serialized (C7512) and none beats the variants above on any case.
+DEV_VARIANTS = V2_VARIANTS + [variant(4, 4, 0, 1, 16384, 3, 1), variant(8, 2, 0, 1, 16384, 3, 1),
+                              variant(8, 4, 0, 1, 16384, 3, 1), variant(2, 4, 0, 1, 16384, 4, 1)]
 # Per bucket: (lo, hi, representative scored bs). Decisions are taken per bucket (nearby shapes route alike).
 BUCKETS = ((1, 4, 1), (5, 12, 8), (13, 24, 16), (25, 48, 32), (49, 192, 128), (193, M_MAX, 256))
 # v2 plan per bucket: (variant index, fuse, ks_target, asg). Lab (k2a_lab_v2.py) decides; these are the design
 # defaults: 2 launches, KS chosen so units >= 2 x grid, round-robin units (concurrent passes -> L2 dedup).
 V2_PLAN = {1: (0, 2, 1, 0), 8: (0, 1, 2, 0), 16: (0, 1, 1, 0), 32: (0, 2, 2, 0), 128: (1, 2, 2, 0), 256: (1, 2, 4, 0)}  # box sweep 2026-10-24 (v22_bench)
+# v2.3: the judge's routings (dist "normal") keep v2.2's plan on every bucket: the WG path loses there (v23_bench:
+# bs128 324/289 vs best WG 365/329, bs256 373/439 vs 402/476 raw us). On hot-expert-heavy routings (reference
+# dist "skewed") WG wins: bs32 88/108 vs 101/114 (best mma.sync plan), bs128 232 vs 300. For a layer composer
+# whose router is skewed; NOT validated on the real decode_layer router (measure in situ before routing, R2/R4).
+V2_PLAN_SKEWED = {**V2_PLAN, 32: (2, 2, 1, 0), 128: (3, 2, 1, 0)}
 # Static route table: "inc" (r1_glue_v3 path) or "v2". Default incumbent everywhere until measured (R2).
 ROUTE = {1: "v2", 8: "v2", 16: "v2", 32: "v2", 128: "v2", 256: "v2"}  # judge clone: v2 beats the incumbent on every bucket
 
@@ -1581,13 +1597,15 @@ def prepare(weights: Weights):
     ok = True
     if SELF_TEST:
         try:
-            cases = ((1, 11, "normal"), (5, 12, "normal"), (33, 13, "normal"), (100, 14, "normal"),
-                     (128, 15, "skewed"), (257, 16, "normal"))
-            for bs, seed, dist in cases:
+            cases = ((1, 11, "normal", V2_PLAN), (5, 12, "normal", V2_PLAN), (33, 13, "normal", V2_PLAN),
+                     (100, 14, "normal", V2_PLAN), (128, 15, "skewed", V2_PLAN), (257, 16, "normal", V2_PLAN),
+                     (33, 17, "skewed", V2_PLAN_SKEWED), (128, 15, "skewed", V2_PLAN_SKEWED),
+                     (5, 12, "normal", {8: (2, 2, 2, 0)}))   # WG 32 at KS > 1: atomics + SwiGLU(h) staging
+            for bs, seed, dist, plan in cases:
                 d = synth_inputs(bs, seed, dev, dist)
                 ref = ref_fp32(d, weights)
                 rep = bucket_of(bs)
-                vid, fuse, kst, asg, hv, ht = (tuple(V2_PLAN[rep]) + (-1, 0))[:6]
+                vid, fuse, kst, asg, hv, ht = (tuple(plan[rep]) + (-1, 0))[:6]
                 for fz in sorted({fuse, 0, 2}):
                     got = v2_call(st, d, vid, fz, kst, asg, 0, 0, hv if fz == fuse else -1, ht if fz == fuse else 0)
                     torch.cuda.synchronize()
