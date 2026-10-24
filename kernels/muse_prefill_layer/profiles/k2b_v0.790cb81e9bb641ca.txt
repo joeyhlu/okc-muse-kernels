@@ -1,0 +1,163 @@
+okc run 790cb81e9bb641ca on muse_prefill_layer
+submission  <scratch>/scratch-2026-10-23-2c70b6/kernels/muse_prefill_layer/k2b_v0.py
+status      ok
+passed      true
+speedup     1.0752744041797802
+speedup_ci  [1.0591452881170835 1.0914035202424768]
+score_us    360283.75500625063
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+batch=1 ctx=80000 dist=soft layer=sliding load=turn 1 page=1 q_len=753    1090.18    1006.22   1.083x     256.95  
+batch=1 ctx=80000 dist=soft layer=full load=turn 1 page=1 q_len=753    1509.84    1476.19   1.023x     496.69  
+batch=4 ctx=80000 dist=soft layer=sliding load=turn 4 page=1 q_len=753    3294.93    3040.48   1.084x    1036.28  
+batch=4 ctx=80000 dist=soft layer=full load=turn 4 page=1 q_len=753    4906.21    4627.41   1.060x    1992.42  
+batch=1 ctx=0 dist=soft layer=full load=first turn page=1 q_len=16384   18143.52   16514.42   1.099x    5518.43  
+batch=1 ctx=32768 dist=soft layer=sliding load=first turn page=1 q_len=16384   16770.19   15384.74   1.090x    5663.35  
+batch=1 ctx=32768 dist=soft layer=full load=first turn page=1 q_len=16384   21481.23   19901.97   1.079x    7710.00  
+batch=1 ctx=65536 dist=soft layer=full load=first turn page=1 q_len=16384   25110.34   23432.62   1.072x    9847.68  
+
+profile 0: batch=1 ctx=80000 dist=soft layer=sliding load=turn 1 page=1 q_len=753
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                        678.2 µs  65.9%      2
+nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN                   155.1 µs  15.1%      3
+nvjet_sm90_tst_112x128_64x7_1x2_h_bz_TNN                          38.4 µs   3.7%      1
+nvjet_sm90_tss_64x96_64x10_2x1_v_bz_splitK_NNT                    26.9 µs   2.6%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      25.3 µs   2.5%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      21.6 µs   2.1%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      21.3 µs   2.1%      1
+_post_expert_norm_weighted_sum_kernel                              8.2 µs   0.8%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       6.8 µs   0.7%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       6.7 µs   0.7%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       4.7 µs   0.5%      2
+void moe_align_block_size_kernel<int>(int const*, int*, i...       3.7 µs   0.4%      1
+... 13 more
+total                                                           1028.5 µs
+GPU busy (kernels overlap: PDL or streams)                      1016.7 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 1: batch=1 ctx=80000 dist=soft layer=full load=turn 1 page=1 q_len=753
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                        672.2 µs  46.0%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     414.0 µs  28.3%      1
+nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN                   151.5 µs  10.4%      3
+nvjet_sm90_tss_64x96_64x10_2x1_v_bz_splitK_NNT                    81.5 µs   5.6%      2
+nvjet_sm90_tst_112x128_64x7_1x2_h_bz_TNN                          38.8 µs   2.7%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      21.5 µs   1.5%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      21.4 µs   1.5%      1
+_post_expert_norm_weighted_sum_kernel                              8.0 µs   0.5%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       6.7 µs   0.5%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       6.6 µs   0.5%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       4.7 µs   0.3%      2
+void moe_align_block_size_kernel<int>(int const*, int*, i...       3.7 µs   0.3%      1
+... 13 more
+total                                                           1462.7 µs
+GPU busy (kernels overlap: PDL or streams)                      1396.0 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 2: batch=4 ctx=80000 dist=soft layer=sliding load=turn 4 page=1 q_len=753
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                       1986.5 µs  64.5%      2
+nvjet_sm90_tst_256x152_64x4_1x2_h_bz_coopA_TNT                   323.0 µs  10.5%      2
+nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN                   250.2 µs   8.1%      1
+nvjet_sm90_tst_192x144_64x5_1x2_h_bz_coopB_TNT                   149.6 µs   4.9%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      80.1 µs   2.6%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      77.0 µs   2.5%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      62.0 µs   2.0%      1
+nvjet_sm90_tss_64x104_64x10_4x2_h_bz_NNT                          50.3 µs   1.6%      2
+_post_expert_norm_weighted_sum_kernel                             23.4 µs   0.8%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      17.6 µs   0.6%      1
+_qk_rms_norm_fwd_kernel                                           10.7 µs   0.3%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...       7.5 µs   0.2%      1
+... 13 more
+total                                                           3080.3 µs
+
+profile 3: batch=4 ctx=80000 dist=soft layer=full load=turn 4 page=1 q_len=753
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                       1996.3 µs  41.9%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...    1632.6 µs  34.3%      1
+nvjet_sm90_tst_256x152_64x4_1x2_h_bz_coopA_TNT                   322.2 µs   6.8%      2
+nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN                   276.2 µs   5.8%      1
+nvjet_sm90_tst_192x144_64x5_1x2_h_bz_coopB_TNT                   148.7 µs   3.1%      1
+nvjet_sm90_tss_64x104_64x10_4x2_h_bz_NNT                         135.3 µs   2.8%      2
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      78.0 µs   1.6%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...      75.1 µs   1.6%      1
+_post_expert_norm_weighted_sum_kernel                             23.7 µs   0.5%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      18.0 µs   0.4%      1
+_qk_rms_norm_fwd_kernel                                            7.9 µs   0.2%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...       7.5 µs   0.2%      1
+... 13 more
+total                                                           4766.1 µs
+GPU busy (kernels overlap: PDL or streams)                      4653.7 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 4: batch=1 ctx=0 dist=soft layer=full load=first turn page=1 q_len=16384
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                      10123.6 µs  61.8%      2
+nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                  2519.5 µs  15.4%      3
+nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT                  1374.3 µs   8.4%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     896.7 µs   5.5%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     397.7 µs   2.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     396.6 µs   2.4%      1
+nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_NNN                   277.8 µs   1.7%      2
+_post_expert_norm_weighted_sum_kernel                            125.9 µs   0.8%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      80.3 µs   0.5%      1
+_qk_rms_norm_fwd_kernel                                           30.2 µs   0.2%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...      28.7 µs   0.2%      1
+void sglang::norm_gate_kernel<__nv_bfloat16, 64l, 16, 4, ...      23.5 µs   0.1%      1
+... 12 more
+total                                                          16370.0 µs
+
+profile 5: batch=1 ctx=32768 dist=soft layer=sliding load=first turn page=1 q_len=16384
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                       9485.4 µs  62.2%      2
+nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                  2517.1 µs  16.5%      3
+nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT                  1477.0 µs   9.7%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     399.3 µs   2.6%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     398.3 µs   2.6%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     302.6 µs   2.0%      1
+nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_NNN                   285.5 µs   1.9%      2
+_post_expert_norm_weighted_sum_kernel                            119.6 µs   0.8%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      80.9 µs   0.5%      1
+_qk_rms_norm_fwd_kernel                                           42.2 µs   0.3%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...      28.7 µs   0.2%      1
+void sglang::norm_gate_kernel<__nv_bfloat16, 64l, 16, 4, ...      24.0 µs   0.2%      1
+... 12 more
+total                                                          15254.6 µs
+GPU busy (kernels overlap: PDL or streams)                     15048.2 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 6: batch=1 ctx=32768 dist=soft layer=full load=first turn page=1 q_len=16384
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                       9873.5 µs  50.2%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...    4462.0 µs  22.7%      1
+nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                  2501.7 µs  12.7%      3
+nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT                  1377.8 µs   7.0%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     399.1 µs   2.0%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     396.8 µs   2.0%      1
+nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_NNN                   276.9 µs   1.4%      2
+_post_expert_norm_weighted_sum_kernel                            122.9 µs   0.6%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      79.4 µs   0.4%      1
+_qk_rms_norm_fwd_kernel                                           30.1 µs   0.2%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...      28.8 µs   0.1%      1
+void sglang::norm_gate_kernel<__nv_bfloat16, 64l, 16, 4, ...      22.8 µs   0.1%      1
+... 12 more
+total                                                          19663.3 µs
+
+profile 7: batch=1 ctx=65536 dist=soft layer=full load=first turn page=1 q_len=16384
+kernel                                                           GPU time  share  calls
+_k2b_gemm                                                      10189.5 µs  43.0%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...    8009.9 µs  33.8%      1
+nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                  2521.1 µs  10.7%      3
+nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT                  1480.3 µs   6.3%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     399.7 µs   1.7%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...     398.0 µs   1.7%      1
+nvjet_sm90_tss_128x256_64x4_2x1_v_bz_coopA_NNN                   284.6 µs   1.2%      2
+_post_expert_norm_weighted_sum_kernel                            126.8 µs   0.5%      1
+void at::native::(anonymous namespace)::vectorized_layer_...      80.1 µs   0.3%      1
+_qk_rms_norm_fwd_kernel                                           31.2 µs   0.1%      1
+void moe_align_block_size_kernel<int>(int const*, int*, i...      28.7 µs   0.1%      1
+void sglang::norm_gate_kernel<__nv_bfloat16, 64l, 16, 4, ...      22.6 µs   0.1%      1
+... 12 more
+total                                                          23670.1 µs

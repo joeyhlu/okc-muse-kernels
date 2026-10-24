@@ -1,0 +1,3 @@
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue_v3.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue_v3_rep2.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue_v3_rep3.py

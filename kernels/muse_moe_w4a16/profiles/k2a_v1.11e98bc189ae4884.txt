@@ -1,0 +1,65 @@
+okc run 11e98bc189ae4884 on muse_moe_w4a16
+submission  <scratch>/scratch-2026-10-23-2c70b6/kernels/muse_moe_w4a16/k2a_v1.py
+status      ok
+passed      true
+speedup     0.7160865101998256
+speedup_ci  [0.7053452125468282 0.726827807852823]
+score_us    18780.552081964463
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               76.99      66.91   1.151x      11.42  
+bs=16 load=decode 16 sharding=ep8                            188.88     246.46   0.766x      52.52  
+bs=32 load=decode 32 sharding=ep8                            210.06     413.02   0.509x      70.76  
+bs=8 load=verify 1 sharding=ep8                              151.65     181.35   0.836x      37.32  
+bs=128 load=verify 16 sharding=ep8                           466.78     770.05   0.606x     101.34  
+bs=256 load=verify 32 sharding=ep8                           619.39    1044.43   0.593x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<1, 8, 2, 1, 1, 16, 16, ...      39.3 µs  55.3%      1
+void k2a::gemm_kernel<2, k2a::Cfg<1, 8, 2, 1, 1, 8, 8, 0,...      25.0 µs  35.1%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       4.9 µs   6.8%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)            2.0 µs   2.7%      1
+total                                                             71.1 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<1, 8, 2, 1, 1, 16, 16, ...     176.5 µs  61.9%      1
+void k2a::gemm_kernel<2, k2a::Cfg<1, 8, 2, 1, 1, 8, 8, 0,...     101.3 µs  35.6%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       4.5 µs   1.6%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)            2.6 µs   0.9%      1
+total                                                            284.9 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<2, 6, 2, 1, 1, 16, 16, ...     288.1 µs  64.9%      1
+void k2a::gemm_kernel<2, k2a::Cfg<2, 6, 2, 1, 1, 16, 16, ...     147.4 µs  33.2%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       4.9 µs   1.1%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)            3.3 µs   0.7%      1
+total                                                            443.7 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<1, 8, 2, 1, 1, 16, 16, ...     109.0 µs  60.2%      1
+void k2a::gemm_kernel<2, k2a::Cfg<1, 8, 2, 1, 1, 8, 8, 0,...      65.5 µs  36.2%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       4.4 µs   2.4%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)            2.1 µs   1.2%      1
+total                                                            181.0 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<4, 4, 1, 1, 1, 16, 4, 0...     551.0 µs  58.8%      1
+void k2a::gemm_kernel<2, k2a::Cfg<4, 4, 1, 1, 1, 16, 4, 0...     370.8 µs  39.6%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)            9.1 µs   1.0%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       5.4 µs   0.6%      1
+total                                                            936.4 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a::gemm_kernel<1, k2a::Cfg<4, 4, 1, 1, 1, 16, 4, 0...     590.6 µs  59.7%      1
+void k2a::gemm_kernel<2, k2a::Cfg<4, 4, 1, 1, 1, 16, 4, 0...     372.9 µs  37.7%      1
+k2a::route_kernel(int const*, int*, int, int, int, int)           17.4 µs   1.8%      1
+k2a::final_kernel(float const*, int const*, int const*, f...       8.3 µs   0.8%      1
+total                                                            989.2 µs

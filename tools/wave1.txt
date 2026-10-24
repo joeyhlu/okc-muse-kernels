@@ -1,0 +1,19 @@
+# problem file — wave 1 (all reviewed); measurement first, then the riskiest decode_layer files
+muse_decode_layer kernels/muse_decode_layer/r0_baseline.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/r0_baseline.py
+muse_attention_decode kernels/muse_attention_decode/r0_baseline.py
+muse_bf16_proj kernels/muse_bf16_proj/r0_baseline.py
+muse_prefill_layer kernels/muse_prefill_layer/r0_baseline.py
+muse_decode_layer kernels/muse_decode_layer/k3_v0.py
+muse_decode_layer kernels/muse_decode_layer/r1_glue.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/k2a_v0.py
+muse_attention_decode kernels/muse_attention_decode/k1_v0.py
+muse_decode_layer kernels/muse_decode_layer/k3_v0_k2a_only.py
+muse_decode_layer kernels/muse_decode_layer/k3_v0_k1_only.py
+muse_decode_layer kernels/muse_decode_layer/r1_glue_noL2.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue.py
+muse_attention_decode kernels/muse_attention_decode/r1_glue.py
+muse_attention_decode kernels/muse_attention_decode/k1_v0_fallback.py
+muse_moe_w4a16 kernels/lab/r0b_muse_moe_w4a16.py
+muse_decode_layer kernels/lab/r0b_muse_decode_layer.py
+muse_attention_decode kernels/lab/r0b_muse_attention_decode.py

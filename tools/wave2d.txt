@@ -1,0 +1,2 @@
+muse_attention_decode kernels/muse_attention_decode/k1_v01.py
+muse_decode_layer kernels/muse_decode_layer/k3_v02.py

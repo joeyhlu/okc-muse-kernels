@@ -1,0 +1,2 @@
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue_v2.py
+muse_decode_layer kernels/muse_decode_layer/k3_v04.py
