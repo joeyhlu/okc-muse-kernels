@@ -1,0 +1,2 @@
+muse_attention_decode kernels/muse_attention_decode/k1_v02_scored.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/r1_glue_v3_scored.py
