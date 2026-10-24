@@ -105,8 +105,9 @@ class Proxy:
         return wrap(self._label, self._obj)(*a, **k)
 
     def __getattr__(self, n):
+        import types
         v = getattr(self._obj, n)
-        return wrap(self._label, v) if callable(v) else v
+        return wrap(self._label, v) if isinstance(v, types.MethodType) else v
 
 
 def gemm_label(x, w, *a, **k):
@@ -125,7 +126,9 @@ def instrument(mod, state):
                       ("silu_and_mul", "swiglu"), ("fused_post_expert_norm_weighted_sum", "finalize"),
                       ("_post_expert_norm_weighted_sum", "finalize"), ("_k1_run", "k1"), ("_k2a_experts", "k2a"),
                       ("_v8_gemm", lambda x, layer, *a, **k: {"qkv_gate": "qkv", "pooler": "pooler"}.get(layer, "unpooler")),
-                      ("_v8_logits", "router_logits"), ("_v8_tail", "v8_tail")):
+                      ("_v8_logits", "router_logits"), ("_v8_tail", "v8_tail"),
+                      ("_v9_k2a31_call", "k2a"), ("_v8_k2a3_call", "k2a"), ("_v8_unpool_t1", "unpooler"),
+                      ("_v9_bnd", lambda which, *a, **k: "attn_boundary" if which == "attn" else "ffn_boundary")):
         if name in g and callable(g[name]):
             g[name] = wrap(lab, g[name])
     for key, lab in (("qk_norm", "qk_norm"), ("o_norm_gate", "o_norm_gate"), ("attn_boundary", "attn_boundary"),
