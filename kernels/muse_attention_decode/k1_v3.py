@@ -898,7 +898,9 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
       cp_async_wait<ST - 2>();
       // own V chunks of stage i are complete for this thread: convert them to the fp16 tile (no extra barrier;
       // vh[i&1] was last read in tile i-2, before the previous iteration's barrier)
+#if K1_DIAG != 4
       conv_v(ring + (i % ST) * STAGE_BYTES + TILE * ROWB, vh + (i & 1) * VH_BYTES, lk, part);
+#endif
       __syncthreads();
       {
         const int nx = i + ST - 1;
@@ -910,7 +912,12 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
       const uint8_t* Kb = ring + (i % ST) * STAGE_BYTES;
       const int ts = kstart + (t0 + i) * TILE;
       const bool need = (ts + TILE > seq) || (W > 0 && ts < seq + L - W);
+#if K1_DIAG >= 3
+      o[0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(Kb + lane * 4) ^ *reinterpret_cast<const uint32_t*>(vh + lane * 4));
+      m[0] = 0.f; l[0] = 1.f; m[1] = 0.f; l[1] = 1.f;
+#else
       tile_compute8<8>(Kb, vh + (i & 1) * VH_BYTES, h, g, t, lane, qf, o, m, l, cl2, need, ts, seq, seq, W, j0);
+#endif
     }
     cp_async_wait<0>();
     __syncthreads();
