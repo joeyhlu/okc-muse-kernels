@@ -472,13 +472,18 @@ memcheck (err = 0). See box_out/k2b_v1_san_mem.log.
 
 
 
-At T = 753 on this flatter routing (~32 experts × ~34 routes), the 64-row M granularity pads about 1.9× and K2b
-trails Marlin by 4%. All three absolute targets are met.
+At T = 753 on this flatter routing (25–30 experts, ~35–45 routes each), the 64-row M granularity pads ~1.9× and K2b
+trails Marlin by 4%. The absolute targets are met, but only against the other harness's Marlin. K2b v2 (tokens on
+the wgmma N side, padding +9%; k2b_v2_design.md) is the fix.
 
 **ncu**: not available. The container lacks GPU performance-counter permission (ERR_NVGPUCTRPERM), and enabling it
 is a host setting we do not change. The binder below rests on the probes plus arithmetic.
 
 ## 11. Next lever (from the probe table; ncu is unavailable on the pod)
+
+> Superseded in part (2026-10-24): k2b_v2_design.md §1 shows, from v1's own p1 probe (106 KB/stage at 0.92 µs),
+> that shared-memory bandwidth is **not** the binder. v2's case rests on removing the producer dequant and on padding,
+> and its gain is gated on probe 5.
 
 At 430 TF/s (43%), the consumer chain binds even with the dequant removed (p1: 0.97 µs per 128×256×64 stage, ideal
 ≈ 0.52). Smem traffic per stage is 148 KB:
