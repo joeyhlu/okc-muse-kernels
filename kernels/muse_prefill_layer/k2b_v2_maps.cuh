@@ -24,8 +24,9 @@
 // consumer WG c (0..MW*... see MWG), warp w (0..3), m64 block mb (0..MW-1) -> K2A 16-row tile inside the expert
 // for weight m-tile mt (tile rows = 2 * 64 * MW per CTA)
 #define K2B2_WTILE(mt, mw, c, mb, w) (((mt) * 8 * (mw)) + ((c) * 4 * (mw)) + ((mb) * 4) + (w))
-// token block of up to 256 rows: valid prefix v -> wgmma N (multiple of 8; 8..64 step 8, then 96..256 step 32)
-#define K2B2_NSEL(v) ((((v) + 7) >> 3) * 8 + ((((v) + 7) >> 3) > 8) * (((32 - ((((((v) + 7) >> 3) * 8) & 31))) & 31)))
+// token block of up to 256 rows: valid prefix v -> wgmma N in {16, 32, 48, 64, 96, 128, 192, 256} (one templated
+// mainloop per N, dispatched per tile outside the k loop)
+#define K2B2_NSEL(v) (((((v) + 15) >> 4) << 4) * ((v) <= 64) + (((((v) + 31) >> 5) << 5) * (((v) > 64) & ((v) <= 128))) + (((((v) + 63) >> 6) << 6) * ((v) > 128)))
 // accumulator (thread warp w, lane, reg v) of m64nN: weight row in the m64 block, token in the block (CLayout_64xN)
 #define K2B2_ACC_WROW(w, lane, v) (((w) * 16) + ((lane) >> 2) + ((((v) >> 1) & 1) * 8))
 #define K2B2_ACC_TOK(v, lane) (((((v) >> 2)) * 8) + (((lane) & 3) * 2) + ((v) & 1))

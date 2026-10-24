@@ -1,4 +1,4 @@
-"""k2b_v1_build.py: box helper (CPU only, no GPU work). Builds K2b v1's CUDA extension exactly as prepare() does and
+"""k2b_v1_build.py: box helper (CPU only, no GPU work). Builds K2b v1's (or, with --src k2b_v2.py, v2's) CUDA extension exactly as prepare() does and
 reports the build time and ptxas resource usage per variant (registers, spills, smem, wgmma serialisation notes).
   python3 kernels/muse_prefill_layer/k2b_v1_build.py [--lab] [--cold] [--configs a,b]
 --cold: unique extension name + CCACHE_DISABLE=1 (what a fresh judge sandbox pays for Gate A).
@@ -33,7 +33,8 @@ def main():
     if args.configs:
         cfgs = {k: cfgs[k] for k in args.configs.split(",")}
     variants = g["k2b_variants"](cfgs)
-    cu = g["k2b_gen_source"](variants)
+    v2 = "K2B2_MAPS" in g
+    cu = g["k2b_gen_source"](variants, g["K2B2_MAPS"]) if v2 else g["k2b_gen_source"](variants)
     name = "k2b_v1_build_%d" % (int(time.time() * 1000) % 10 ** 9) if args.cold else "k2b_v1_build_warm"
     if args.cold:
         os.environ["CCACHE_DISABLE"] = "1"
@@ -41,7 +42,7 @@ def main():
              "-Xptxas=-v"]
     if args.exact:   # mirror _k2b1_build
         import hashlib
-        name = "k2b_v1_" + hashlib.sha1((g["K2B_CPP_SRC"] + cu).encode()).hexdigest()[:10]
+        name = ("k2b_v2_" if v2 else "k2b_v1_") + hashlib.sha1((g["K2B_CPP_SRC"] + cu).encode()).hexdigest()[:10]
         flags = flags if args.lab else flags[:-1]
     t0 = time.time()
     import io

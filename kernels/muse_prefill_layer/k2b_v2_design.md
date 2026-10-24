@@ -1,6 +1,5 @@
 # K2b v2: RS wgmma, swap-AB, K2A lane items as the A operand (stage A: design + emulation, no CUDA yet)
 
-Status (2026-10-24):
 - Laptop stage A is complete:
   - this doc;
   - `k2b_v2_maps.cuh` (every v2 index map, Python/C dual syntax);
@@ -262,3 +261,44 @@ Negative controls (`--mutate`); each FAILS as required:
    5.5 TB/s it co-binds only near 570 TF/s.
 3. **But the gain itself is thin after the haircut:** +14% (488 TF/s) and conditional on probe 5. Recommendation:
    run probe 5 (2 minutes) before writing any v2 CUDA.
+
+## 10. Stage B result (H200 box, 2026-10-24): **killed by its own rule**
+
+**Gate: GO.** Probe 5 on v1 at T = 16,384 was 4,860 µs, i.e. 0.82 µs/stage, above the 0.76 threshold (p1 5,475;
+p3 2,354; p7 1,550; full 7,350; Marlin 11,419). The SM clock under sustained load was a median of 1,980 MHz (min
+1,875; 33 samples above 450 W), so the 1.98 GHz assumption holds.
+
+**Built and correct.**
+- k2b_v2.py (nonce k2b-v2-1) compiled first try: 41.5 s cold for 4 variants, 0 spills, no "wgmma serialized" line
+  from ptxas (setmaxnreg 56/224).
+- k2b_v2_unit.py drives the real `consumer_stage` and passes (UNIT PASS: rel ≤ 2.3e-7 at N = 16/48/128/256, err 0).
+- Every config passes the FP32 self-test at rel 3.38e-3. The stock-match numerics config (NUM 1) is at 4.22e-3.
+
+**Same-process bench** (k2b_v2_bench.py; box_out/k2b_v2_bench1.log, bench2.log), µs:
+
+
+
+**v2 probes, T = 16,384, v2s4** (µs): full 9,761; p1 no dequant 9,454; p3 loads only 6,294; p5 MMA + handshakes
+4,782; p7 handshakes 1,689.
+
+What was learned:
+1. **The RS mainloop issues no faster than v1's SS mainloop.** p5 is 4.78 ms against v1's 4.86. The SS → RS switch
+   bought nothing at the MMA-issue level, so v2's whole premise (gain = the removed producer dequant) did not hold.
+2. **v2's load path is 2.7× slower in situ than v1's** (loads only: 6.29 vs 2.35 ms), against a byte ratio of only
+   1.42×. Stage depth (S = 3/4/5) changes nothing, so this is not lookahead depth. The fence is ruled out.
+   Candidates, in order:
+   - the burst size per stage (2,432 cp.async per CTA, against 1,664);
+   - per-SM outstanding-request limits;
+   - poorer L2 locality of the 256-row activation blocks re-read by 64 m-tiles.
+   ncu counters (not permitted in the pod) would separate these.
+4. **In both kernels, loads and MMA add instead of overlap** (p1 ≈ p3 + p5 − p7). That is the common bottleneck,
+   and it is not the dequant.
+
+**Next options** (none started):
+- **(a) A 2-CTA cluster sharing the activation tile** (DSMEM, or multicast after a gather pre-pass). This halves the
+  dominant activation L2 stream per CTA and applies to v1 directly. It is the lever named at the probe-5 gate.
+- **(b) A 20-minute micro-lab on v1's mainloop** before any redesign:
+  - acc-operand fence placement (v1/v2 fence after commit; CUTLASS fences after `warpgroup_wait`);
+  - wait_group depth 1 vs 2;
+  - a single-CTA loads + MMA overlap test with resident data.
+  This should explain why loads and MMA do not overlap.

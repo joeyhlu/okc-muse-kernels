@@ -1,0 +1,47 @@
+okc run 5e31fac35645473f on muse_moe_w4a16
+submission  <home>/Documents/development/okc-muse/kernels/muse_moe_w4a16/k2a_v22_scored.py
+status      ok
+passed      true
+speedup     1.358506646429989
+speedup_ci  [1.3381290467335392 1.3788842461264388]
+score_us    9899.473098156146
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               76.61      50.83   1.507x      11.42  
+bs=16 load=decode 16 sharding=ep8                            185.42     141.59   1.310x      52.52  
+bs=32 load=decode 32 sharding=ep8                            205.36     189.29   1.085x      70.76  
+bs=8 load=verify 1 sharding=ep8                              141.71     102.74   1.379x      37.32  
+bs=128 load=verify 16 sharding=ep8                           468.48     311.69   1.503x     101.34  
+bs=256 load=verify 32 sharding=ep8                           616.21     435.21   1.416x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<1, 4, 0, 1, 8192, 4> >(k...      47.9 µs 100.0%      1
+total                                                             47.9 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<1, 4, 0, 1, 8192, 4> >(k...     117.0 µs 100.0%      2
+total                                                            117.0 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<1, 4, 0, 1, 8192, 4> >(k...     141.7 µs 100.0%      1
+total                                                            141.7 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<1, 4, 0, 1, 8192, 4> >(k...     112.2 µs 100.0%      2
+total                                                            112.2 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<2, 4, 0, 1, 16384, 4> >(...     302.4 µs 100.0%      1
+total                                                            302.4 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k2a2::k2a2_kernel<k2a2::Cfg<2, 4, 0, 1, 16384, 4> >(...     385.5 µs 100.0%      1
+total                                                            385.5 µs
