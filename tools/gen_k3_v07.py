@@ -53,8 +53,12 @@ WANT_PLAN = {1: (0, 2, 1, 0), 8: (0, 1, 2, 0), 16: (0, 1, 1, 0), 32: (0, 2, 2, 0
 WANT_BUCKETS = ((1, 4, 1), (5, 12, 8), (13, 24, 16), (25, 48, 32), (49, 192, 128), (193, 320, 256))
 # Experts route per token bucket (key = bucket representative), decided IN THE LAYER on the box (rule R2):
 # "v2" = K2A v2.2, "marlin" = r1's Marlin path. See kernels/muse_decode_layer/k3_v07.md for the measurements.
-WANT_ROUTE = {1: "v2", 8: "v2", 16: "v2", 32: "v2", 128: "v2", 256: "v2"}
-ROUTE_NOTE = "box judge clone, k3_v07 vs k3_v06 per shape (k3_v07.md)"
+# Box 2026-10-24: in-layer paired A/B (same process, same judge inputs, 30-60 pairs per shape) Marlin/K2A:
+#   T=1 1.023-1.027 sl / 1.005-1.010 fu, T=8 1.033 / 1.046, T=16 1.053 / 1.037, T=32 0.958-0.967 sl / 1.000 fu,
+#   T=128 1.075 / 1.042, T=256 1.067 / 1.042. T=32 (bucket 25-48) loses on the sliding shape, ties on full -> Marlin.
+WANT_ROUTE = {1: "v2", 8: "v2", 16: "v2", 32: "marlin", 128: "v2", 256: "v2"}
+ROUTE_NOTE = ("in-layer A/B on the box: K2A wins T=1/8/16/128/256, T=32 Marlin (sliding 0.96x, full 1.00x);"
+              " k3_v07.md")
 # extra layer self-test cases (bs, seed, dist): every scored bucket at its scored T, skewed where the layer routes skewed
 LAYER_CASES = ((8, 17, "normal"), (16, 18, "skewed"), (256, 19, "skewed"))
 K2A_BUILD_NAME = "k3_k2a_v22"   # load_inline name prefix (distinct from the moe file's k2a_v2_<tag> cache entry)

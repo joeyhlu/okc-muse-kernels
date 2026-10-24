@@ -148,8 +148,8 @@ K1_MIN_CHUNK_T = {("sliding", 1): 2, ("sliding", 8): 4, ("full", 1): 2, ("full",
 K1_CPS_T = {("sliding", 1): 1, ("sliding", 8): 2, ("full", 1): 2, ("full", 8): 2}  # lab: sliding L=1 1 CTA/SM -1.3/-0.6 us at B16/B32
 # Token counts that take K2a once it is up (the self-test covers 1..257); larger blocks use Marlin.
 # Experts per token bucket (key = bucket rep: T 1-4 -> 1, 5-12 -> 8, 13-24 -> 16, 25-48 -> 32, 49-192 -> 128,
-# 193-320 -> 256): "v2" = K2A v2.2, "marlin" = r1's Marlin path. Measured in the layer: box judge clone, k3_v07 vs k3_v06 per shape (k3_v07.md).
-K2A_ROUTE = {1: 'v2', 8: 'v2', 16: 'v2', 32: 'v2', 128: 'v2', 256: 'v2'}
+# 193-320 -> 256): "v2" = K2A v2.2, "marlin" = r1's Marlin path. Measured in the layer: in-layer A/B on the box: K2A wins T=1/8/16/128/256, T=32 Marlin (sliding 0.96x, full 1.00x); k3_v07.md.
+K2A_ROUTE = {1: 'v2', 8: 'v2', 16: 'v2', 32: 'marlin', 128: 'v2', 256: 'v2'}
 K1_SELF_TEST = True          # prepare() checks K1 on synthetic caches before first use
 K2A_SELF_TEST = True         # prepare() checks K2a on synthetic routings (real expert weights) before first use
 # prepare() budget (its limit is 300 s): no K2a self-test starts after this many seconds of prepare.
