@@ -264,7 +264,7 @@ struct Cfg {
   static constexpr int XSTR = KSW + 8;         // padded smem row stride (bf16): 16 B pad -> conflict-free LDS.128
   static constexpr int XS = TPP * XSTR;
   static_assert(TW == 1 || TW == 2 || TW == 4 || TW == 8, "TW");
-  static_assert(U == 2 || U == 4, "U");
+  static_assert(U == 2 || U == 4 || U == 8, "U");
   static_assert(KSW >= 64 * U && KSW % (64 * U) == 0, "a slice holds whole load groups");
 };
 

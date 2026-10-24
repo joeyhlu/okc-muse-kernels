@@ -1,7 +1,21 @@
 # okc: problem=muse_moe_w4a16
 # nonce k2a-v22-1
-"""K2a v2: custom NVFP4 x BF16 MoE experts for decode/verify, designed to the MEASURED H200 constants
-(stream_lab job 8734d93af5f84708 part D; notes/lessons.md section 5-6). Design: k2a_v2_design.md.
+"""K2a v2.2: custom NVFP4 x BF16 MoE experts for decode/verify (results: k2a_v22.md; design: k2a_v2_design.md).
+Judge clone on the rented H200 (judge image): 1.471x [1.449, 1.493] vs SGLang (v2.1: 1.397x).
+
+v2.2 over v2.1 (same repacked layout and numerics; every change measured on the box):
+  * post-expert norm latency-batched: item = (token, column quarter) when 4M <= grid, slot pairs per load batch
+    (v2.1 chained up to 16 dependent L2 round trips per token: 9-11 us at bs <= 8, now ~6 us at bs 1);
+  * 1-launch plan for bs 1/32/128/256 with the first W2 weight group issued before the W13->W2 grid barrier;
+  * X staging via cp.async (all pieces in flight, one wait) for the >= 16-token variants (bs 128/256 -3..4%);
+    the 8-token variant keeps v2.1's loop (cp.async there raised its spills 24 -> 96 B);
+  * warp-parallel phase setup; per-CTA globaltimer trace (probe bit 4) for box profiling;
+  * per-bucket plan from the box sweep (tools/box/v22_bench.py); AUTOTUNE off; ROUTE v2 on every bucket.
+Tried and rejected on the box (kept compiled out / in kernels/dev/): double-buffered step pipeline (slower,
+spills), quantization-aware split-K, U=8 / PF=1, and a separate hot-expert launch at 64 tokens/pass (K2A2_HOT;
+slower: 425 vs 373 us on a 143-token-expert bs256 routing).
+
+v2 description (unchanged below):
 
 What changed vs v0/v1 (which ran 512 threads x 1 CTA/SM at 93-128 regs and streamed ~1.9 / ~1.1 TB/s):
   * occupancy = stream_lab part D's winner: 256-thread CTAs, 3-4 CTAs/SM, __launch_bounds__(256, MINB)
@@ -100,17 +114,17 @@ def variant(nc, u=4, pf=0, tw=1, xe=8192, minb=4):
 
 
 V2_VARIANTS = [
-    variant(1, 4, 0, 1, 8192, 4),     # 0: small T (bs <= 24): 8 tokens / pass
-    variant(2, 4, 0, 1, 16384, 4),    # 1: bs 25-48: 16 tokens / pass
-    variant(4, 4, 0, 1, 16384, 3),    # 2: verify (bs >= 49): 32 tokens / pass, <= 80 regs
+    variant(1, 4, 0, 1, 8192, 4),     # 0: 8 tokens / pass, 4 CTAs/SM (<= 64 regs), synchronous X staging
+    variant(2, 4, 0, 1, 16384, 4),    # 1: 16 tokens / pass, cp.async X staging
+    variant(4, 4, 0, 1, 16384, 3),    # 2: 32 tokens / pass, 3 CTAs/SM (<= 80 regs)
 ]
 # Per bucket: (lo, hi, representative scored bs). Decisions are taken per bucket (nearby shapes route alike).
 BUCKETS = ((1, 4, 1), (5, 12, 8), (13, 24, 16), (25, 48, 32), (49, 192, 128), (193, M_MAX, 256))
 # v2 plan per bucket: (variant index, fuse, ks_target, asg). Lab (k2a_lab_v2.py) decides; these are the design
 # defaults: 2 launches, KS chosen so units >= 2 x grid, round-robin units (concurrent passes -> L2 dedup).
-V2_PLAN = {1: (0, 2, 1, 0), 8: (0, 1, 2, 0), 16: (0, 1, 1, 0), 32: (0, 2, 2, 0), 128: (1, 1, 2, 0), 256: (1, 1, 4, 0)}  # box bench 2026-10-24
+V2_PLAN = {1: (0, 2, 1, 0), 8: (0, 1, 2, 0), 16: (0, 1, 1, 0), 32: (0, 2, 2, 0), 128: (1, 2, 2, 0), 256: (1, 2, 4, 0)}  # box sweep 2026-10-24 (v22_bench)
 # Static route table: "inc" (r1_glue_v3 path) or "v2". Default incumbent everywhere until measured (R2).
-ROUTE = {1: "v2", 8: "v2", 16: "v2", 32: "v2", 128: "v2", 256: "v2"}  # lab: v2 beats the incumbent 1.11-1.26x on every bucket
+ROUTE = {1: "v2", 8: "v2", 16: "v2", 32: "v2", 128: "v2", 256: "v2"}  # judge clone: v2 beats the incumbent on every bucket
 
 
 class Weights(TypedDict):
@@ -228,6 +242,12 @@ KERNEL_SRC = r"""
 #include <stdint.h>
 #include <vector>
 
+// K2A2_HOT: separate hot-expert launch (v2.2 experiment, measured slower on the box; compiled out by default --
+// its extra code raised the 8-token variant's spills from 24 B to 96 B).
+#ifndef K2A2_HOT
+#define K2A2_HOT 0
+#endif
+
 namespace k2a2 {
 
 constexpr int KDIM = 4096;          // K of both GEMMs, N of W2
@@ -247,7 +267,18 @@ struct Params {
   __nv_bfloat16* out;
   long long* trace;     // per-CTA globaltimer marks (probe & 4), else nullptr
   int M, lo, mask, ks_target, asg, force_atom, probe;
+  int hot_t, hot_mode;  // hot_t > 0: experts with >= hot_t tokens are "hot"; hot_mode 0 = cold launch, 1 = hot launch
 };
+
+// Expert inclusion for the current launch (hot-expert split; hot_t <= 0: every expert).
+__device__ __forceinline__ bool incl_expert(const Params& P, int cnt) {
+#if K2A2_HOT
+  if (P.hot_t <= 0) return true;
+  return (P.hot_mode == 1) ? (cnt >= P.hot_t) : (cnt < P.hot_t);
+#else
+  return true;
+#endif
+}
 
 template <int NC_, int U_, int PF_, int TW_, int XE_, int MINB_>
 struct Cfg {
@@ -259,7 +290,7 @@ struct Cfg {
   static constexpr int XSTR = KSW + 8;         // padded smem row stride (bf16): 16 B pad -> conflict-free LDS.128
   static constexpr int XS = TPP * XSTR;
   static_assert(TW == 1 || TW == 2 || TW == 4 || TW == 8, "TW");
-  static_assert(U == 2 || U == 4, "U");
+  static_assert(U == 2 || U == 4 || U == 8, "U");
   static_assert(KSW >= 64 * U && KSW % (64 * U) == 0, "a slice holds whole load groups");
 };
 
@@ -412,7 +443,7 @@ __device__ void route_prologue(const Params& P, Route& S, int8_t* s_ide, int16_t
     for (int d = 1; d < 32; d <<= 1) { const int nb = __shfl_up_sync(FULL, v, d); if (lane >= d) v += nb; }
     const int off = v - c;
     const int np = (c + C::TPP - 1) / C::TPP;
-    int nv = np;
+    int nv = incl_expert(P, c) ? np : 0;
 #pragma unroll
     for (int d = 16; d > 0; d >>= 1) nv += __shfl_xor_sync(FULL, nv, d);
     S.cnt[lane] = c; S.off[lane] = off; S.np[lane] = np;
@@ -435,9 +466,9 @@ __device__ void route_prologue(const Params& P, Route& S, int8_t* s_ide, int16_t
     if (e >= 0) {
       const int c = b + rank;
       s_list[c] = (int16_t)p;
-      if (blockIdx.x == 0) P.meta[MH + p] = c;
+      if (blockIdx.x == 0 && P.hot_mode != 1) P.meta[MH + p] = c;
       if (rank == 0) S.wc[warp][e] = b + __popc(m);
-    } else if (blockIdx.x == 0 && p < NP) {
+    } else if (blockIdx.x == 0 && p < NP && P.hot_mode != 1) {
       P.meta[MH + p] = -1;
     }
     __syncwarp();
@@ -450,9 +481,9 @@ __device__ void route_prologue(const Params& P, Route& S, int8_t* s_ide, int16_t
     S.hdr[2] = ks1; S.hdr[3] = ks2;
     S.hdr[5] = (ks1 > 1 || P.force_atom) ? 1 : 0;
     S.hdr[6] = (ks2 > 1 || P.force_atom) ? 1 : 0;
-    if (blockIdx.x == 0) for (int i = 0; i < 8; ++i) P.meta[i] = S.hdr[i];
+    if (blockIdx.x == 0 && P.hot_mode != 1) for (int i = 0; i < 8; ++i) P.meta[i] = S.hdr[i];
   }
-  if (blockIdx.x == 0 && tid < 32) {
+  if (blockIdx.x == 0 && tid < 32 && P.hot_mode != 1) {
     P.meta[8 + tid] = S.cnt[tid]; P.meta[40 + tid] = S.off[tid]; P.meta[72 + tid] = S.np[tid];
   }
   __syncthreads();
@@ -468,11 +499,11 @@ __device__ void load_meta(const Params& P, Route& S) {
 // Units of a GEMM phase: u -> (expert e, pass j, row group rg, k-split ks); within an expert's block the pass
 // index is fastest, so passes over the same weights are adjacent (round-robin -> concurrent CTAs -> L2 hits).
 template <class C, int MODE>
-__device__ void phase_units(Route& S, int KS) {
+__device__ void phase_units(const Params& P, Route& S, int KS) {
   constexpr int NRG = ((MODE == 1) ? 512 : 256) / C::RW;
   if (threadIdx.x < 32) {   // warp scan over the 32 experts (was a serial thread-0 loop)
     const int lane = threadIdx.x;
-    const int n = S.np[lane] * NRG * KS;
+    const int n = incl_expert(P, S.cnt[lane]) ? S.np[lane] * NRG * KS : 0;
     const int tl = min(S.cnt[lane], C::TPW);
     const int c = n * (4 + (tl + 7) / 8);
     int iu = n, ic = c;
@@ -503,35 +534,78 @@ __device__ int first_unit(const Route& S, long long x) {
 // Stage the B operand rows of a pass for k in [k0, k0 + kw): MODE 1 x[token]; MODE 2 inter[c] (bf16) or
 // SwiGLU(h[c]) (fp32 gate/up partials, KS1 > 1). 16 B pieces; rows >= ntok are not touched (their columns
 // only feed discarded outputs).
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async
+// (strings as stream_lab S2 / k1_v0, GPU-validated)
+__device__ __forceinline__ void cp_async16(void* smem, const void* g) {
+  const uint32_t sa = (uint32_t)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(sa), "l"(g) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+
+// Stage the B operand rows of a pass for k in [k0, k0 + kw). x[token] (MODE 1) / inter[c] (MODE 2) via cp.async:
+// every piece is in flight at once (v2.1's load->store loop serialized ~ntok*kw/2048 L2 round trips per slice,
+// e.g. 8 at 64 tokens). SwiGLU(h[c]) (KS1 > 1, small T) through registers. Rows >= ntok are not
+// touched (they only feed discarded output columns). The caller's __syncthreads publishes the tile.
 template <class C, int MODE>
 __device__ void stage_x(const Params& P, const int16_t* s_list, __nv_bfloat16* xs, int c0, int ntok, int k0, int kw,
                         bool from_h) {
   const int ppr = kw >> 3;
   const int sh = __ffs(ppr) - 1;     // ppr is a power of two
   const int tot = ntok * ppr;
-  for (int idx = threadIdx.x; idx < tot; idx += 256) {
-    const int n = idx >> sh, pc = idx & (ppr - 1);
-    const int k = k0 + pc * 8;
-    uint4 v;
-    if constexpr (MODE == 1) {
-      const int tok = ((int)s_list[c0 + n]) >> 3;
-      v = __ldg(reinterpret_cast<const uint4*>(P.x + (size_t)tok * KDIM + k));
-    } else {
-      if (!from_h) {
-        v = __ldcg(reinterpret_cast<const uint4*>(P.inter + (size_t)(c0 + n) * KDIM + k));
+  if constexpr (C::NC == 1) {   // 8-token variant: v2.1's loop verbatim (lowest spills)
+    for (int idx = threadIdx.x; idx < tot; idx += 256) {
+      const int n = idx >> sh, pc = idx & (ppr - 1);
+      const int k = k0 + pc * 8;
+      uint4 v;
+      if constexpr (MODE == 1) {
+        const int tok = ((int)s_list[c0 + n]) >> 3;
+        v = __ldg(reinterpret_cast<const uint4*>(P.x + (size_t)tok * KDIM + k));
       } else {
-        const float* hr = P.h + (size_t)(c0 + n) * (2 * KDIM);
-        const float4 g0 = __ldcg(reinterpret_cast<const float4*>(hr + k));
-        const float4 g1 = __ldcg(reinterpret_cast<const float4*>(hr + k + 4));
-        const float4 u0 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k));
-        const float4 u1 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k + 4));
-        v.x = pack_bf2(swiglu(g0.x, u0.x), swiglu(g0.y, u0.y));
-        v.y = pack_bf2(swiglu(g0.z, u0.z), swiglu(g0.w, u0.w));
-        v.z = pack_bf2(swiglu(g1.x, u1.x), swiglu(g1.y, u1.y));
-        v.w = pack_bf2(swiglu(g1.z, u1.z), swiglu(g1.w, u1.w));
+        if (!from_h) {
+          v = __ldcg(reinterpret_cast<const uint4*>(P.inter + (size_t)(c0 + n) * KDIM + k));
+        } else {
+          const float* hr = P.h + (size_t)(c0 + n) * (2 * KDIM);
+          const float4 g0 = __ldcg(reinterpret_cast<const float4*>(hr + k));
+          const float4 g1 = __ldcg(reinterpret_cast<const float4*>(hr + k + 4));
+          const float4 u0 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k));
+          const float4 u1 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k + 4));
+          v.x = pack_bf2(swiglu(g0.x, u0.x), swiglu(g0.y, u0.y));
+          v.y = pack_bf2(swiglu(g0.z, u0.z), swiglu(g0.w, u0.w));
+          v.z = pack_bf2(swiglu(g1.x, u1.x), swiglu(g1.y, u1.y));
+          v.w = pack_bf2(swiglu(g1.z, u1.z), swiglu(g1.w, u1.w));
+        }
       }
+      *reinterpret_cast<uint4*>(xs + n * C::XSTR + pc * 8) = v;
     }
-    *reinterpret_cast<uint4*>(xs + n * C::XSTR + pc * 8) = v;
+    return;
+  }
+  if (MODE == 1 || !from_h) {
+    for (int idx = threadIdx.x; idx < tot; idx += 256) {
+      const int n = idx >> sh, pc = idx & (ppr - 1);
+      const int k = k0 + pc * 8;
+      const __nv_bfloat16* src;
+      if constexpr (MODE == 1) src = P.x + (size_t)(((int)s_list[c0 + n]) >> 3) * KDIM + k;
+      else src = P.inter + (size_t)(c0 + n) * KDIM + k;
+      cp_async16(xs + n * C::XSTR + pc * 8, src);
+    }
+    cp_async_commit();
+    cp_async_wait_all();
+  } else {
+    for (int idx = threadIdx.x; idx < tot; idx += 256) {
+      const int n = idx >> sh, pc = idx & (ppr - 1);
+      const float* hr = P.h + (size_t)(c0 + n) * (2 * KDIM) + k0 + pc * 8;
+      const float4 g0 = __ldcg(reinterpret_cast<const float4*>(hr));
+      const float4 g1 = __ldcg(reinterpret_cast<const float4*>(hr + 4));
+      const float4 u0 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM));
+      const float4 u1 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + 4));
+      uint4 v;
+      v.x = pack_bf2(swiglu(g0.x, u0.x), swiglu(g0.y, u0.y));
+      v.y = pack_bf2(swiglu(g0.z, u0.z), swiglu(g0.w, u0.w));
+      v.z = pack_bf2(swiglu(g1.x, u1.x), swiglu(g1.y, u1.y));
+      v.w = pack_bf2(swiglu(g1.z, u1.z), swiglu(g1.w, u1.w));
+      *reinterpret_cast<uint4*>(xs + n * C::XSTR + pc * 8) = v;
+    }
   }
 }
 
@@ -612,7 +686,7 @@ __device__ void gemm_phase(const Params& P, Route& S, const int16_t* s_list, __n
   const int KS = (MODE == 1) ? S.hdr[2] : S.hdr[3];
   const bool atom = ((MODE == 1) ? S.hdr[5] : S.hdr[6]) != 0;
   const bool from_h = (MODE == 2) && (S.hdr[5] != 0);
-  phase_units<C, MODE>(S, KS);
+  phase_units<C, MODE>(P, S, KS);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t = lane & 3;
   const int rw = warp / C::TW, tw = warp - rw * C::TW;
@@ -833,6 +907,35 @@ __device__ void fin_phase(const Params& P, const Route& S, float (*s_red)[8], in
   }
 }
 
+#if K2A2_HOT
+// Hot launch, W13 used atomics: inter = bf16(SwiGLU(h)) for the hot experts' rows, and those h rows back to zero.
+__device__ void convert_hot(const Params& P, const Route& S) {
+  const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+  for (int e = 0; e < 32; ++e) {
+    const int cnt = S.cnt[e];
+    if (cnt == 0 || !incl_expert(P, cnt)) continue;
+    const int tot = cnt * (KDIM / 8);
+    for (int idx = blockIdx.x * 256 + threadIdx.x; idx < tot; idx += gridDim.x * 256) {
+      const size_t c = (size_t)(S.off[e] + (idx >> 9));
+      const int k = (idx & 511) * 8;
+      float* hr = P.h + c * (2 * KDIM);
+      const float4 g0 = __ldcg(reinterpret_cast<const float4*>(hr + k));
+      const float4 g1 = __ldcg(reinterpret_cast<const float4*>(hr + k + 4));
+      const float4 u0 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k));
+      const float4 u1 = __ldcg(reinterpret_cast<const float4*>(hr + KDIM + k + 4));
+      uint4 v;
+      v.x = pack_bf2(swiglu(g0.x, u0.x), swiglu(g0.y, u0.y));
+      v.y = pack_bf2(swiglu(g0.z, u0.z), swiglu(g0.w, u0.w));
+      v.z = pack_bf2(swiglu(g1.x, u1.x), swiglu(g1.y, u1.y));
+      v.w = pack_bf2(swiglu(g1.z, u1.z), swiglu(g1.w, u1.w));
+      *reinterpret_cast<uint4*>(P.inter + c * KDIM + k) = v;
+      *reinterpret_cast<float4*>(hr + k) = z4; *reinterpret_cast<float4*>(hr + k + 4) = z4;
+      *reinterpret_cast<float4*>(hr + KDIM + k) = z4; *reinterpret_cast<float4*>(hr + KDIM + k + 4) = z4;
+    }
+  }
+}
+#endif
+
 template <class C>
 __global__ void __launch_bounds__(256, C::MINB) k2a2_kernel(const Params P) {
   __shared__ __align__(16) __nv_bfloat16 xs[C::XS];
@@ -848,13 +951,33 @@ __global__ void __launch_bounds__(256, C::MINB) k2a2_kernel(const Params P) {
   trace_mark(P, 1);
   if (P.mask & PH_G1) {
     if (S.hdr[6] != 0) {   // W2 will accumulate with atomics: zero its rows now (W2 runs after this phase)
-      const size_t n4 = (size_t)S.hdr[0] * KDIM / 4;
-      float4* yp = reinterpret_cast<float4*>(P.y);
       const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
-      for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256) yp[i] = z;
+      float4* yp = reinterpret_cast<float4*>(P.y);
+#if K2A2_HOT
+      if (P.hot_mode == 1) {   // hot launch: only the hot experts' rows (the cold rows belong to the last launch)
+        for (int e = 0; e < 32; ++e) {
+          if (S.cnt[e] == 0 || !incl_expert(P, S.cnt[e])) continue;
+          const size_t b4 = (size_t)S.off[e] * KDIM / 4, n4 = (size_t)S.cnt[e] * KDIM / 4;
+          for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256) yp[b4 + i] = z;
+        }
+      } else
+#endif
+      {
+        const size_t n4 = (size_t)S.hdr[0] * KDIM / 4;
+        for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256) yp[i] = z;
+      }
     }
     gemm_phase<C, 1>(P, S, s_list, xs, false);
     trace_mark(P, 2);
+#if K2A2_HOT
+    if (P.hot_mode == 1 && (P.mask & PH_G2) && S.hdr[5] != 0) {   // hot launch: SwiGLU(h) -> inter, h -> 0
+      grid_barrier(P);
+      convert_hot(P, S);
+      __syncthreads();
+      if (threadIdx.x == 0) S.hdr[5] = 0;                         // W2 then stages from inter
+      __syncthreads();
+    }
+#endif
   }
   if ((P.mask & PH_G1) && !(P.mask & PH_G2) && (P.mask & PH_FIN)) grid_barrier(P);
   if (P.mask & PH_G2) { gemm_phase<C, 2>(P, S, s_list, xs, (P.mask & PH_G1) != 0); trace_mark(P, 3); }
@@ -871,7 +994,8 @@ static k2a2::Params make_params(torch::Tensor& x, torch::Tensor& ids, torch::Ten
                                 torch::Tensor& gsc2, torch::Tensor& nw, torch::Tensor& h, torch::Tensor& inter,
                                 torch::Tensor& y, torch::Tensor& meta, torch::Tensor& bar, torch::Tensor& err,
                                 torch::Tensor& out, torch::Tensor& trace, int64_t M, int64_t lo, int64_t mask,
-                                int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe) {
+                                int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe, int64_t hot_t,
+                                int64_t hot_mode) {
   k2a2::Params p;
   p.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
   p.ids = ids.data_ptr<int>();
@@ -892,7 +1016,7 @@ static k2a2::Params make_params(torch::Tensor& x, torch::Tensor& ids, torch::Ten
   p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   p.trace = (probe & 4) ? reinterpret_cast<long long*>(trace.data_ptr()) : nullptr;
   p.M = (int)M; p.lo = (int)lo; p.mask = (int)mask; p.ks_target = (int)ks_target; p.asg = (int)asg;
-  p.force_atom = (int)force_atom; p.probe = (int)probe;
+  p.force_atom = (int)force_atom; p.probe = (int)probe; p.hot_t = (int)hot_t; p.hot_mode = (int)hot_mode;
   return p;
 }
 
@@ -920,9 +1044,9 @@ void run(int64_t vid, int64_t mask, torch::Tensor x, torch::Tensor ids, torch::T
          torch::Tensor s13q, torch::Tensor w2q, torch::Tensor s2q, torch::Tensor gsc13, torch::Tensor gsc2,
          torch::Tensor nw, torch::Tensor h, torch::Tensor inter, torch::Tensor y, torch::Tensor meta,
          torch::Tensor bar, torch::Tensor err, torch::Tensor out, torch::Tensor trace, int64_t M, int64_t lo,
-         int64_t G, int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe) {
+         int64_t G, int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe, int64_t hot_t, int64_t hot_mode) {
   const k2a2::Params p = make_params(x, ids, wts, w13q, s13q, w2q, s2q, gsc13, gsc2, nw, h, inter, y, meta, bar, err,
-                                     out, trace, M, lo, mask, ks_target, asg, force_atom, probe);
+                                     out, trace, M, lo, mask, ks_target, asg, force_atom, probe, hot_t, hot_mode);
   switch (vid) {
 @CASES@
     default: TORCH_CHECK(false, "k2a2: unknown variant");
@@ -944,7 +1068,7 @@ void run(int64_t vid, int64_t mask, torch::Tensor x, torch::Tensor ids, torch::T
          torch::Tensor s13q, torch::Tensor w2q, torch::Tensor s2q, torch::Tensor gsc13, torch::Tensor gsc2,
          torch::Tensor nw, torch::Tensor h, torch::Tensor inter, torch::Tensor y, torch::Tensor meta,
          torch::Tensor bar, torch::Tensor err, torch::Tensor out, torch::Tensor trace, int64_t M, int64_t lo,
-         int64_t G, int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe);
+         int64_t G, int64_t ks_target, int64_t asg, int64_t force_atom, int64_t probe, int64_t hot_t, int64_t hot_mode);
 std::vector<int64_t> attrs(int64_t vid);
 """
 
@@ -978,23 +1102,29 @@ def build_ext(name, variants, verbose=False):
 
 
 PH_ROUTE, PH_G1, PH_G2, PH_FIN = 1, 2, 4, 8
+HOT_LAUNCH_COMPILED = False   # K2A2_HOT=0 in KERNEL_SRC: the hot-expert launch split is compiled out
 FUSE_MASKS = {0: (PH_ROUTE | PH_G1, PH_G2, PH_FIN), 1: (PH_ROUTE | PH_G1, PH_G2 | PH_FIN),
               2: (PH_ROUTE | PH_G1 | PH_G2 | PH_FIN,)}
 
 
-def v2_call(st, data, vid, fuse=1, ks_target=2, asg=0, force_atom=0, probe=0):
-    """One v2 call (graph-capturable: fixed buffers, no host sync, no value-dependent host branching)."""
+def v2_call(st, data, vid, fuse=1, ks_target=2, asg=0, force_atom=0, probe=0, hot_vid=-1, hot_t=0):
+    """One v2 call (graph-capturable: fixed buffers, no host sync, no value-dependent host branching).
+    hot_t > 0 (with hot_vid): experts with >= hot_t tokens go to a separate launch of variant hot_vid (more tokens per
+    pass, one weight sweep), between (route + W13 cold) and (W2 cold + post-norm)."""
     x = data["hidden_states"].contiguous()
     ids = data["topk_ids"].to(torch.int32).contiguous()
     wts = data["topk_weights"].to(torch.float32).contiguous()
     m = x.shape[0]
     out = torch.empty((m, D_HIDDEN), dtype=torch.bfloat16, device=x.device)
-    g = st["grid"][vid]
     lo = data["config"]["local_start"]
-    for mask in FUSE_MASKS[fuse]:
-        st["mod"].run(vid, mask, x, ids, wts, st["w13q"], st["s13q"], st["w2q"], st["s2q"], st["gsc13"],
+    if hot_t > 0 and hot_vid >= 0 and HOT_LAUNCH_COMPILED:
+        launches = ((vid, PH_ROUTE | PH_G1, 0), (hot_vid, PH_ROUTE | PH_G1 | PH_G2, 1), (vid, PH_G2 | PH_FIN, 0))
+    else:
+        launches = tuple((vid, mk, 0) for mk in FUSE_MASKS[fuse])
+    for v, mask, hm in launches:
+        st["mod"].run(v, mask, x, ids, wts, st["w13q"], st["s13q"], st["w2q"], st["s2q"], st["gsc13"],
                       st["gsc2"], st["nw"], st["h"], st["inter"], st["y"], st["meta"], st["bar"], st["err"], out,
-                      st["trace"], m, lo, g, ks_target, asg, force_atom, probe)
+                      st["trace"], m, lo, st["grid"][v], ks_target, asg, force_atom, probe, hot_t, hm)
     return out
 
 
@@ -1297,9 +1427,9 @@ def prepare(weights: Weights):
                 d = synth_inputs(bs, seed, dev, dist)
                 ref = ref_fp32(d, weights)
                 rep = bucket_of(bs)
-                vid, fuse, kst, asg = V2_PLAN[rep]
+                vid, fuse, kst, asg, hv, ht = (tuple(V2_PLAN[rep]) + (-1, 0))[:6]
                 for fz in sorted({fuse, 0, 2}):
-                    got = v2_call(st, d, vid, fz, kst, asg)
+                    got = v2_call(st, d, vid, fz, kst, asg, 0, 0, hv if fz == fuse else -1, ht if fz == fuse else 0)
                     torch.cuda.synchronize()
                     tot, row = rel_err(got, ref)
                     errf = int(st["err"][0])
@@ -1319,11 +1449,12 @@ def prepare(weights: Weights):
             flush = torch.empty((64 * 1024 * 1024,), dtype=torch.float32, device=dev)   # 256 MiB > L2
             for lo, hi, rep in BUCKETS:
                 d = synth_inputs(rep, 400 + rep, dev)
-                vid, fuse, kst, asg = V2_PLAN[rep]
+                vid, fuse, kst, asg, hv, ht = (tuple(V2_PLAN[rep]) + (-1, 0))[:6]
                 ref = ref_fp32(d, weights)
                 st["err"].zero_()
                 t_inc, _ = time_graph(lambda dd: inc_kernel_fn(dd, state["inc"]), d, flush, AUTOTUNE_REPS)
-                t_v2, o_v2 = time_graph(lambda dd: v2_call(st, dd, vid, fuse, kst, asg), d, flush, AUTOTUNE_REPS)
+                t_v2, o_v2 = time_graph(lambda dd: v2_call(st, dd, vid, fuse, kst, asg, 0, 0, hv, ht), d, flush,
+                                        AUTOTUNE_REPS)
                 torch.cuda.synchronize()
                 errf = int(st["err"][0])            # grid-barrier timeout during the replays (co-residency)
                 r_rep, _ = rel_err(o_v2, ref)       # output of the last replay, not just the eager call
@@ -1349,6 +1480,6 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     st = state["v2"]
     rep = bucket_of(m)
     if st is not None and rep is not None and state["route"].get(rep) == "v2" and _v2_ok_for(cfg, m):
-        vid, fuse, kst, asg = V2_PLAN[rep]
-        return v2_call(st, data, vid, fuse, kst, asg)
+        vid, fuse, kst, asg, hv, ht = (tuple(V2_PLAN[rep]) + (-1, 0))[:6]
+        return v2_call(st, data, vid, fuse, kst, asg, 0, 0, hv, ht)
     return inc_kernel_fn(data, state["inc"])
