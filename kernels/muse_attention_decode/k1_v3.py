@@ -644,6 +644,77 @@ __device__ __forceinline__ void merge_finalize(const Params& p, const float* po,
   }
 }
 
+// Fold merge from global partials, staged (v3): lse [S][ROWS] -> smem in one coalesced pass, per-row weights
+// w = 2^(lse - M) computed once into smem, then every (row, quad) item sums w * O over the splits with independent
+// loads (no load depends on another load). The PROF stamps of k1_v3 showed the per-item loop of v1/v2 costing
+// ~20 us at L=8, S=8 (dependent L2 round trips). sm: >= S*ROWS + ROWS floats of free smem (the drained ring).
+template <int L>
+__device__ __forceinline__ void merge_global(const Params& p, const float* po, const float* pl, const int S, const int b,
+                                             const int hp, float* sm) {
+  constexpr int ROWS = 16 * L, R8 = 8 * L, ITEMS = ROWS * 16, K = ITEMS / NTHR;
+  const int n = S * ROWS;
+  for (int i = threadIdx.x; i < n; i += NTHR) sm[i] = __ldcg(pl + i);
+  __syncthreads();
+  float* wsum = sm + n;
+  for (int r = threadIdx.x; r < ROWS; r += NTHR) {
+    float M = neg_inf();
+    for (int s = 0; s < S; ++s) M = fmaxf(M, sm[s * ROWS + r]);
+    const float Mu = (M == neg_inf()) ? 0.f : M;
+    float ws = 0.f;
+    for (int s = 0; s < S; ++s) {
+      const float w = ex2(sm[s * ROWS + r] - Mu);
+      sm[s * ROWS + r] = w;
+      ws += w;
+    }
+    wsum[r] = ws;
+  }
+  __syncthreads();
+  const float vsc = __ldg(p.v_scale);
+  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
+  const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
+  float4 acc[K];
+#pragma unroll
+  for (int k = 0; k < K; ++k) acc[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 2
+  for (int s = 0; s < S; ++s) {                       // K=8 (L=8): 16 float4 loads in flight per thread
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      const int r = r0 + 16 * k;
+      const float w = sm[s * ROWS + r];
+      const float4 v = __ldcg(reinterpret_cast<const float4*>(po + ((size_t)s * ROWS + r) * 64 + 4 * u));
+      acc[k].x = fmaf(w, v.x, acc[k].x); acc[k].y = fmaf(w, v.y, acc[k].y);
+      acc[k].z = fmaf(w, v.z, acc[k].z); acc[k].w = fmaf(w, v.w, acc[k].w);
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    const int r = r0 + 16 * k;
+    float4 a4 = acc[k];
+    const float wt = wsum[r];
+    const float sc = (wt > 0.f) ? vsc / wt : 0.f;
+    a4.x *= sc; a4.y *= sc; a4.z *= sc; a4.w *= sc;
+    float ss = a4.x * a4.x + a4.y * a4.y + a4.z * a4.z + a4.w * a4.w;
+    ss += __shfl_xor_sync(FULL, ss, 8);
+    ss += __shfl_xor_sync(FULL, ss, 4);
+    ss += __shfl_xor_sync(FULL, ss, 2);
+    ss += __shfl_xor_sync(FULL, ss, 1);
+    const float rs = rsqrtf(ss * (1.f / 64.f) + 1e-5f);
+    const int hh = r / R8, rr = r - hh * R8, j = rr >> 3, gi = rr & 7;
+    const int qh = (2 * hp + hh) * 8 + gi;
+    const size_t tok = (size_t)b * L + j;
+    const uint2 graw = *reinterpret_cast<const uint2*>(p.qkv + tok * stride + (size_t)(p.Hq + 2 * p.Hkv) * 64 +
+                                                       (size_t)qh * 64 + 4 * u);
+    const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
+    const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
+    const __nv_bfloat162 o01 = __floats2bfloat162_rn(a4.x * rs * sigmoidf_(g01.x), a4.y * rs * sigmoidf_(g01.y));
+    const __nv_bfloat162 o23 = __floats2bfloat162_rn(a4.z * rs * sigmoidf_(g23.x), a4.w * rs * sigmoidf_(g23.y));
+    uint2 ow;
+    ow.x = *reinterpret_cast<const uint32_t*>(&o01);
+    ow.y = *reinterpret_cast<const uint32_t*>(&o23);
+    *reinterpret_cast<uint2*>(p.out + tok * (size_t)p.Hq * 64 + (size_t)qh * 64 + 4 * u) = ow;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // k1_main
 // ---------------------------------------------------------------------------------------------
@@ -706,6 +777,16 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
   const int ntl = (int)(((long long)(s_idx + 1) * nt_b) / S_b) - t0;
   const bool last = (s_idx == S_b - 1);
   const int seq = __ldg(p.seq_lens + b);
+  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
+  float2 xv[RPW];                                     // Q rows, loaded first (independent of the KV chain)
+#pragma unroll
+  for (int k = 0; k < RPW; ++k) {
+    const int R = warp + k * NWARP;
+    const int hh = R / R8, r = R - hh * R8, j = r >> 3, gi = r & 7;
+    const int qh = (2 * hp + hh) * 8 + gi;
+    xv[k] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+        p.qkv + ((size_t)b * L + j) * stride + (size_t)qh * 64 + 2 * lane));
+  }
   const int W = p.W;
   const int kstart = W ? max(0, seq - W + 1) : 0;
   const size_t rowB = (size_t)p.Hkv * 64;
@@ -760,17 +841,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
   __syncthreads();
 
   // ---- Q prep: RMSNorm (+RoPE); fp16 (L=1) or e4m3 (L=8, normalized+roped value, before x5.473) rows in smem
-  const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
   {
-    float2 xv[RPW];
-#pragma unroll
-    for (int k = 0; k < RPW; ++k) {
-      const int R = warp + k * NWARP;
-      const int hh = R / R8, r = R - hh * R8, j = r >> 3, gi = r & 7;
-      const int qh = (2 * hp + hh) * 8 + gi;
-      xv[k] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
-          p.qkv + ((size_t)b * L + j) * stride + (size_t)qh * 64 + 2 * lane));
-    }
 #pragma unroll
     for (int k = 0; k < RPW; ++k) {
       const int R = warp + k * NWARP;
@@ -990,7 +1061,11 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     if (plan_s[5]) {                                  // last CTA of (b, hp): every partial is written
       __threadfence();
       const size_t base = (size_t)hp * p.Gx + off_b;
-      merge_finalize<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp, true);
+      if ((S_b + 1) * ROWS <= ring_bytes<L, ST>() / 4)  // staged merge in the drained ring
+        merge_global<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp,
+                        reinterpret_cast<float*>(ring));
+      else
+        merge_finalize<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp, true);
       __syncthreads();
       if (tid == 0) *cnt = 0;                         // self-reset for the next call (after all reads)
       K1P(6);
