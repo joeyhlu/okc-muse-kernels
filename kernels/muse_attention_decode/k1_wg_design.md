@@ -253,3 +253,33 @@ It runs before the kernel.
    registers), so 1 CTA/SM with 3 warpgroups, or 128-key tiles.
 2. Barrier-free producer/consumer staging (FA3-style mbarriers instead of the per-tile `__syncthreads`).
 3. The L=8 merge fix, for the sliding shapes.
+
+## 8. k1_v6 lab (2026-10-24): software-pipelined wgmma loop, full L=8 only
+
+**Changes from v5** (k1_v6.py, ring depth 3, 3 Vᵀ buffers, 2 CTAs/SM, 128 registers with 4 B of spills):
+- QK(i) is issued asynchronously, and the Vᵀ transpose of tile i+1 runs while it executes.
+- PV(i) is left in flight across the next barrier, and is waited together with QK(i+1).
+
+The self-test passes, with the same errors as v5.
+
+**Same-process µs** (box_out/k1v6_lab1.log, k1v6_diag.log):
+
+| shape | v6 | v5 (3 stages) | rung-1 | no Vᵀ transpose | no softmax math | no wgmma |
+|---|---|---|---|---|---|---|
+| ver1 full | 33.1 | — | 31.5 | | | |
+| ver16 full | 199.3–199.8 | 196.8 | 195.2 | 188.9 | 148.3 | 147.4 |
+| ver32 full | 361.4–365.7 | 361.0 | 383.5–384.1 | 330.2 | 256.9 | 258.7 |
+
+**Lab gate: missed again** (≤ 300 / ≤ 160). The pipelining gave nothing.
+
+The isolation builds show what the time is:
+- Softmax math (exp2/max/FFMA) and the wgmma work each cost ~100 µs at ver32, and removing either one lands at
+  ~257 µs. So they are serialized on each warpgroup's chain, not hidden behind each other or behind memory.
+- exp2 alone is 128 per key at 16/clk/SM, ~78 µs of MUFU per SM at ver32.
+- The Vᵀ transpose costs ~31 µs.
+
+**What could pass** (unmeasured):
+- FA3's two-consumer ping-pong (named barriers so that one warpgroup's softmax overlaps the other's GEMMs), plus a
+  second S accumulator for QK(i+1) during softmax(i). This needs > 128 registers, so 1 CTA/SM with 3 warpgroups.
+- Polynomial exp2 on the FMA pipe for part of the rows (the FA4 trick), to take MUFU off the chain.
+- A cheaper transpose (4 keys × 32-bit stores).
