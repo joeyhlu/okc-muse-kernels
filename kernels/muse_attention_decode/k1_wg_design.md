@@ -312,3 +312,41 @@ What the data points to instead (unmeasured):
   conditional rescale with a fixed per-row max estimate could skip the per-tile 16-deep max chain and the alpha
   logic.
 - Or the stage-2 ping-pong, which hides issue latency across warpgroups rather than removing it.
+
+## 10. Last lab shot: k1_v7, slimmer softmax (2026-10-24). Gate missed; attention L=8 work stops here
+
+### Changes from v6 (k1_v7.py)
+
+1. **Row sums come from the tensor core.** PV is now `wgmma m64n72k32`. Vᵀ gets a 9th row group of e4m3 1.0
+   (VT_REGION is 2448, still == 16 mod 128), so accumulator columns 64..71 hold Σp for each row. That removes:
+   - 32 FADD per thread per tile;
+   - the l bookkeeping;
+   - the final quad reduce.
+
+   Because these are sums of the *e4m3-rounded* P, numerator and denominator are now consistent.
+2. **Exact row max by a pairwise tree** inside the thread's 16 values, then the 2 quad shuffles.
+3. **O rescale (including the row-sum columns)** only when a row max moved (warp vote). The max stays exact: no
+   bound estimate, no threshold.
+4. **Fused e4m3 packs:** two `cvt.e4m3x2` into the halves of one register.
+
+**Correctness:** the self-test errors are unchanged (e.g. 4.174e-3, 6.805e-3, 9.535e-3). 2 CTAs/SM, 128 registers,
+8–12 B of spill stores.
+
+### Same-process µs (box_out/k1v7_lab.log)
+
+| shape | v7 | v6 | rung-1 | gate |
+|---|---|---|---|---|
+| ver1 full | 32.2 | 33.0 | 31.6–31.8 | — |
+| ver16 full | 194.2 | 199.2 | 195.2–195.5 | ≤ 185 ✗ |
+| ver32 full | 351.7 | 366.1 | 382.9–384.8 | ≤ 320 ✗ |
+
+**Gate missed.** Per the instruction, no routed k1_v7, no judge run, no memcheck. The layer keeps rung-1 for L=8.
+
+### Status of the L=8 wgmma path
+
+**Where it stands:**
+- v7 is the best version: 1.09× over rung-1 at ver32 full, a tie at ver16 full, 0.99× at ver1 full.
+- Its remaining softmax and chain cost is about 95 µs over the no-softmax bound (257 µs).
+
+**Still unexplored (for a future attempt):** FA3's ping-pong with two consumer warpgroups and a second score
+accumulator, at 1 CTA/SM with 3 warpgroups.
