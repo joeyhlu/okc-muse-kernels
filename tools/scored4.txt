@@ -1,0 +1,2 @@
+muse_moe_w4a16 kernels/muse_moe_w4a16/k2a_v22_scored.py
+muse_decode_layer kernels/muse_decode_layer/k3_v07_scored.py
