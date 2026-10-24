@@ -12,10 +12,11 @@ Experts path (per call; static shapes, no host syncs, CUDA-graph capturable):
 
 Kernel (one source, MODE/BM/BN/S/NB/LAYOUT/REG template parameters): persistent CTAs (grid = #SMs) walk the
 tile list (m-block of BM sorted rows, n-tile of BN weight rows), n-tile fastest. 384 threads:
-  * producer warpgroup (WG0): cp.async 16 B streams of the gathered activation rows, the packed NVFP4 codes and
-    the E4M3 scales into an S-stage smem ring (completion on mbarriers via cp.async.mbarrier.arrive.noinc), then
-    dequantises each stage ONCE into a BF16 B tile (BN weight rows x 64 k, 128B-swizzled K-major, or the
-    no-swizzle core-matrix layout) in an NB-deep buffer ring; fence.proxy.async; mbarrier arrive.
+  * producer warpgroup (WG0): cp.async 16 B streams (8 threads per 128 B activation row, coalesced) of the gathered
+    activation rows, the packed NVFP4 codes and the E4M3 scales into an S-stage smem ring, S - NB stages ahead
+    (cp.async.commit_group / wait_group + a producer-only bar.sync), then dequantises each stage ONCE into a BF16
+    B tile (BN weight rows x 64 k, 128B-swizzled K-major, or the no-swizzle core-matrix layout) in an NB-deep
+    buffer ring; fence.proxy.async; one mbarrier arrival per producer warp.
   * two consumer warpgroups: SS wgmma m64nNk16 (A = activations, B = dequantised weights, both from smem),
     FP32 accumulators in registers, 4 wgmma per 64-k stage, one group in flight while the next stage waits;
     epilogue applies the FP32 global scale, SwiGLU in registers (gate/up rows of K2A's W13 tiles land in the
@@ -76,6 +77,7 @@ K2B_DEADLINE_S = 200.0         # since prepare() started: no new candidate is bu
 K2B_TIMING_DEADLINE_S = 265.0  # since prepare() started: no further candidate is timed after this (limit 300)
 K2B_MIN_GAIN = 0.97            # a candidate replaces Marlin for a class only if t_cand < K2B_MIN_GAIN * t_marlin
 K2B_TIMING_REPS = 5
+K2B_SELFTESTS = ((300, 11, 1.0), (2048, 12, 2.0))   # (tokens, seed, zipf) of the FP32-reference self-tests
 K2B_RUNTIME_FLAGS = 8          # OR'ed into every launch: 8 = no consumer-side fence.proxy.async (as CUTLASS; passed
                                # every box self-test), 16 = test_wait polling (slower)
 K2B_PROBES = (1, 2, 3, 7) if K2B_LAB else ()   # in-situ stage probes at T = 16384 (lab only)
@@ -1186,7 +1188,7 @@ def _k2b1_prepare(weights, state, t_start):
     sub = {"k2b": k, "bank": state["bank"], "post_expert_w": state["post_expert_w"]}
     tests = []
     try:
-        for tokens, seed, zipf in ((300, 11, 1.0), (2048, 12, 2.0)):
+        for tokens, seed, zipf in K2B_SELFTESTS:
             g = torch.Generator(device=dev).manual_seed(seed + 100)
             x = torch.randn((tokens, D_EXPERT), generator=g, device=dev).to(torch.bfloat16)
             ids, wts = k2b_synth_routing(tokens, seed, dev, zipf=zipf)

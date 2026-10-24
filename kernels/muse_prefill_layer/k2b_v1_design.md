@@ -455,3 +455,56 @@ What the probes say:
     (26 KB) = 148 KB, which at 128 B/clk is ≥ 0.58 µs.
   - Without the dequant traffic it is 106 KB (0.42 µs).
   - This is what ncu should confirm (§11).
+
+**Judge clone on the scored k2b_v1.py, 3 repeats** (box_out/k2b_v1_judge{1,2,3}.log; all 5 tests pass every time):
+
+| run | speedup [95%] | turn 1 | turn 4 | first turn |
+|---|---|---|---|---|
+| 1 | ×1.1807 [1.163, 1.198] | ×1.074 | ×1.188 | ×1.290 |
+| 2 | ×1.1799 [1.162, 1.198] | ×1.072 | ×1.186 | ×1.291 |
+| 3 | ×1.1802 [1.163, 1.198] | ×1.074 | ×1.185 | ×1.292 |
+
+v0 was ×1.075 and stock is ×1.0. In run 3, the per-shape speedup at T = 16,384 is ×1.18–1.32, and the experts are
+7.08 ms against Marlin's 11.71 ms in the same process.
+
+**compute-sanitizer memcheck** on the T = 300 self-test (sw128x256s5b3r): 0 errors, and the self-test passes under
+memcheck (err = 0). See box_out/k2b_v1_san_mem.log.
+
+
+
+At T = 753 on this flatter routing (~32 experts × ~34 routes), the 64-row M granularity pads about 1.9× and K2b
+trails Marlin by 4%. All three absolute targets are met.
+
+**ncu**: not available. The container lacks GPU performance-counter permission (ERR_NVGPUCTRPERM), and enabling it
+is a host setting we do not change. The binder below rests on the probes plus arithmetic.
+
+## 11. Next lever (from the probe table; ncu is unavailable on the pod)
+
+At 430 TF/s (43%), the consumer chain binds even with the dequant removed (p1: 0.97 µs per 128×256×64 stage, ideal
+≈ 0.52). Smem traffic per stage is 148 KB:
+
+| traffic | KB per stage |
+|---|---|
+| SS wgmma reads (B read by both WGs) | 80 |
+| dequant STS | 32 |
+| dequant LDS | 10 |
+| cp.async writes | 26 |
+
+At 128 B/clk that is 1,156 clk, which caps the tile at ≈ 0.58 µs/stage *if perfectly spread*. The tensor pipe
+waits on it.
+
+1. **K2b v2: RS wgmma, swap-AB, with K2A's lane items as the A fragments.**
+   - This is the one lever that removes the binder instead of tuning around it.
+   - K2A's per-lane 16 B item (rows g, g+8 × 4 k16 steps of one k64 block) is exactly an m64 RS A fragment for 4
+     wgmma k16 steps. K2A v2.3 already runs RS wgmma on this layout (tools/box/wgmma_unit.py mode 1 validated).
+   - Consumers dequant in registers: one LDS.128 per lane item, `deq4` + `bmul2`.
+   - Tokens become the wgmma N (≤ 256), and activations are the only smem operand.
+   - Per stage: activations 2 WG × 32 KB reads + 37 KB cp.async writes + 4.5 KB code LDS ≈ 105 KB, against 148 KB
+     today. The 32 KB dequant STS and the 64 KB B reads disappear, and so does the producer dequant (p2 − p3 ≈
+     2.1 ms at 16K).
+   - The cost is more L2→SM activation traffic (256-token tiles re-read per 128-row weight tile: 37 vs 26 KB/stage).
+     p3 says the feed is not binding today (0.42 µs/stage), but it would be the next limit.
+   - Same layout, same scheduler, same harness: a contained change to the consumer and the producer.
+2. **Inside v1** (smaller): ping-pong consumers (hide the per-tile epilogue and drain), and REG = 1 everywhere.
+   - REG = 1 is consistently 8–12% faster.
+   - Per-tile wgmma N by valid row count for T ≈ 753, where the tail tiles are mostly padding.
