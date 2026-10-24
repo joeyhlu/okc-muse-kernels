@@ -38,6 +38,7 @@ LOG2E = 1.4426950408889634
 P_OFFSET = 8.0     # p = exp2(s2 - m + 8) in (0, 256]
 RMS_EPS = 1e-5
 L8_Q_FP16 = False  # k1_v4: L=8 queries in fp16 (as L=1); False = v1-v3 E4M3 queries (set by k1_v4_emulate.py)
+L8_P_E4M3 = False  # K1-WG: L=8 probabilities rounded to E4M3 for the FP8 PV wgmma (set by k1_wg_emulate.py)
 
 
 def ceil_div(a, b):
@@ -846,7 +847,8 @@ def emulate_k1(data, n_sm=132, cps=CPS, min_chunk=MIN_CHUNK, stats=None, visits=
                     lsum[w] = lsum[w] * alpha + p.sum(1)
                     if bool((alpha != 1.0).any()):           # device: warp vote, skip the rescale otherwise
                         O[w] = O[w] * alpha[:, None]
-                    O[w] = O[w] + p.half().float() @ Vt[ko:ko + kn, h]
+                    pq = p.clamp(max=448.0).to(FP8).float() if (L8_P_E4M3 and L == 8) else p.half().float()
+                    O[w] = O[w] + pq @ Vt[ko:ko + kn, h]
                     m[w] = m_new
 
             for i in range(t0, t1):
