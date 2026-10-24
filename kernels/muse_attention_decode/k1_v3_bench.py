@@ -93,11 +93,11 @@ for i in idx:
                 mod._MOD.k1_prof_read()
                 torch.sum(flush_buf, dim=0, out=sink)
                 fn(data)
-                pr = mod._MOD.k1_prof_read().view(4096, 8).double()
+                pr = mod._MOD.k1_prof_read().view(4096, 16).double()
                 v = pr[pr[:, 0] > 0]
                 t0 = v[:, 0].min()
                 parts = []
-                for sl in range(7):
+                for sl in range(11):
                     col = v[:, sl]
                     col = col[col > 0]
                     if len(col):

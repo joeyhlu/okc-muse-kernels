@@ -194,6 +194,22 @@ struct Params {
   float qk_sm;                // qk_scale_factor * sm_scale
 };
 
+#ifndef K1_PROF
+#define K1_PROF 0                                    // 1: per-CTA %globaltimer phase stamps into k1_prof (lab only)
+#endif
+#if K1_PROF
+__device__ unsigned long long k1_prof[4096 * 16];
+__device__ __forceinline__ unsigned long long gtime() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+#define K1P(slot) do { if (threadIdx.x == 0 && blockIdx.y * gridDim.x + blockIdx.x < 4096) \
+    k1_prof[(blockIdx.y * gridDim.x + blockIdx.x) * 16 + (slot)] = gtime(); } while (0)
+#else
+#define K1P(slot) do {} while (0)
+#endif
+
 __device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }
 
 __device__ __forceinline__ float ex2(float x) {
@@ -655,6 +671,7 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
   const int n = S * ROWS;
   for (int i = threadIdx.x; i < n; i += NTHR) sm[i] = __ldcg(pl + i);
   __syncthreads();
+  K1P(8);
   float* wsum = sm + n;
   for (int r = threadIdx.x; r < ROWS; r += NTHR) {
     float M = neg_inf();
@@ -669,6 +686,7 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
     wsum[r] = ws;
   }
   __syncthreads();
+  K1P(9);
   const float vsc = __ldg(p.v_scale);
   const size_t stride = (size_t)(2 * p.Hq + 2 * p.Hkv) * 64;
   const int r0 = threadIdx.x >> 4, u = threadIdx.x & 15;
@@ -686,6 +704,7 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
       acc[k].z = fmaf(w, v.z, acc[k].z); acc[k].w = fmaf(w, v.w, acc[k].w);
     }
   }
+  K1P(10);
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     const int r = r0 + 16 * k;
@@ -724,21 +743,7 @@ __device__ __forceinline__ void merge_global(const Params& p, const float* po, c
 #ifndef K1_DIAG
 #define K1_DIAG 0
 #endif
-#ifndef K1_PROF
-#define K1_PROF 0                                    // 1: per-CTA %globaltimer phase stamps into k1_prof (lab only)
-#endif
-#if K1_PROF
-__device__ unsigned long long k1_prof[4096 * 8];
-__device__ __forceinline__ unsigned long long gtime() {
-  unsigned long long t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
-#define K1P(slot) do { if (threadIdx.x == 0 && blockIdx.y * gridDim.x + blockIdx.x < 4096) \
-    k1_prof[(blockIdx.y * gridDim.x + blockIdx.x) * 8 + (slot)] = gtime(); } while (0)
-#else
-#define K1P(slot) do {} while (0)
-#endif
+
 template <int L, int ST>
 __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {
 #if K1_ARCH_OK
@@ -1060,6 +1065,7 @@ __global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const
     K1P(5);
     if (plan_s[5]) {                                  // last CTA of (b, hp): every partial is written
       __threadfence();
+      K1P(7);
       const size_t base = (size_t)hp * p.Gx + off_b;
       if ((S_b + 1) * ROWS <= ring_bytes<L, ST>() / 4)  // staged merge in the drained ring
         merge_global<L>(p, p.part_o + base * ROWS * 64, p.part_lse + base * ROWS, S_b, b, hp,
@@ -1193,10 +1199,10 @@ int64_t k1_occupancy(int64_t L, int64_t ST) {
 // lab only (K1_PROF builds): read and clear the per-CTA phase stamps; empty tensor otherwise
 torch::Tensor k1_prof_read() {
 #if K1_PROF
-  auto t = torch::empty({4096 * 8}, torch::dtype(torch::kInt64));
+  auto t = torch::empty({4096 * 16}, torch::dtype(torch::kInt64));
   C10_CUDA_CHECK(cudaDeviceSynchronize());
-  C10_CUDA_CHECK(cudaMemcpyFromSymbol(t.data_ptr<int64_t>(), k1::k1_prof, sizeof(unsigned long long) * 4096 * 8));
-  static unsigned long long zeros[4096 * 8];
+  C10_CUDA_CHECK(cudaMemcpyFromSymbol(t.data_ptr<int64_t>(), k1::k1_prof, sizeof(unsigned long long) * 4096 * 16));
+  static unsigned long long zeros[4096 * 16];
   C10_CUDA_CHECK(cudaMemcpyToSymbol(k1::k1_prof, zeros, sizeof(zeros)));
   return t;
 #else
