@@ -154,11 +154,61 @@ def layout_tests(seed=11):
     return nconf
 
 
+def pp_producer_test(seed=13):
+    """k1_pp producer (v8): thread pq -> keys k0+{0,1,8,9} (k0 = 16q+2tp), chunk c; raw V chunk e at e*2048+pq*16; 4x4
+    byte transpose (PRMT network) -> 32-bit V^T words at vt_off(head c>>2, step q>>1, dim 16(c&3)+d, kl 16(q&1)+4tp),
+    VT_REGION 2448 / SBO 272 (9th row group = ones). Checks content == V[key(s,k)][n] and bank-conflict-free phases."""
+    g = torch.Generator().manual_seed(seed)
+    Vb = torch.randint(0, 256, (64, 2, 64), generator=g, dtype=torch.uint8)
+    region = 2448
+    vraw = torch.zeros(8192, dtype=torch.uint8)
+    vt = torch.zeros(4 * region, dtype=torch.uint8)
+    cover = torch.zeros(64, 8, dtype=torch.int32)
+    lds, sts = {}, {}
+    def prmt(x, y, sel):   # x, y: lists of 4 bytes; returns 4 bytes
+        src = x + y
+        return [src[(sel >> (4 * i)) & 7] for i in range(4)]
+    for pq in range(128):
+        q, tp, cc = pq >> 5, (pq >> 3) & 3, pq & 7
+        k0 = 16 * q + 2 * tp
+        for e in range(4):
+            x = k0 + (e & 1) + 8 * (e >> 1)
+            cover[x, cc] += 1
+            vraw[e * 2048 + pq * 16: e * 2048 + pq * 16 + 16] = Vb[x].reshape(-1)[16 * cc:16 * cc + 16]
+            lds.setdefault((pq // 8, e), []).append(e * 2048 + pq * 16)
+        h, s_, kl = cc >> 2, q >> 1, 16 * (q & 1) + 4 * tp
+        va = [vraw[e * 2048 + pq * 16: e * 2048 + pq * 16 + 16].tolist() for e in range(4)]
+        for w4 in range(4):
+            a = [va[e][4 * w4:4 * w4 + 4] for e in range(4)]
+            t01, t23 = prmt(a[0], a[1], 0x5140), prmt(a[2], a[3], 0x5140)
+            u01, u23 = prmt(a[0], a[1], 0x7362), prmt(a[2], a[3], 0x7362)
+            r = [prmt(t01, t23, 0x5410), prmt(t01, t23, 0x7632), prmt(u01, u23, 0x5410), prmt(u01, u23, 0x7632)]
+            for u in range(4):
+                d = 4 * w4 + u
+                n = 16 * (cc & 3) + d
+                addr = (2 * s_ + h) * region + il_addr(n, kl, 128, VT_SBO)
+                vt[addr:addr + 4] = torch.tensor(r[u], dtype=torch.uint8)
+                sts.setdefault((pq // 32, d), []).append(addr)
+    assert bool((cover == 1).all())
+    assert all(V3.conflict_free(a, 16) for a in lds.values()), "pp raw-V LDS conflict"
+    assert all(V3.conflict_free(a, 4) for a in sts.values()), "pp V^T STS.32 conflict"
+    for h in range(2):
+        for s_ in range(2):
+            for n in range(64):
+                for k in range(32):
+                    assert vt[(2 * s_ + h) * region + il_addr(n, k, 128, VT_SBO)] == Vb[key_of(s_, k), h, n], "pp V^T"
+    assert 8 * VT_SBO + 2 * 128 <= region and region % 128 == 16
+
+
 def main():
     t0 = time.time()
     nconf = layout_tests()
     print(f"[wg layout] K/Q tiles (INTERLEAVE, LBO 128 / SBO 512), V^T (LBO 128 / SBO 272, region 2192, permuted keys), P register"
           f" packing and P_perm.V^T == P.V: OK; V^T STS.U16 + own-V LDS.128 phases conflict-free")
+    pp_producer_test()
+    print("[wg layout] k1_pp producer: 4-key byte transpose -> V^T words (region 2448, ones group fits): OK, conflict-free")
+    if "--layout-only" in sys.argv:
+        return
     E.warp_roles = V3.warp_roles_v3
     E.L8_Q_FP16 = False
     E.L8_P_E4M3 = True
