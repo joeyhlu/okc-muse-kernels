@@ -193,3 +193,110 @@ Logs: `box_out/k2a_m1_test_v24a.log` for the v2.2 and v2.4b rows, `box_out/k2a_m
 - `tools/box/consumer_probe.py`, log `box_out/consumer_probe.log`
 - `kernels/muse_moe_w4a16/k2a_v24.py`; `tools/box/k2a_m1_test.py`; logs `box_out/k2a_v24_judge*.log`/`.json`,
   `box_out/k2a_m1_test.log`
+
+
+### 6.1 Per-GPU memory under the judge's launch
+The launch: `--mem-fraction-static 0.85`, `--max-running-requests 32`, `--cuda-graph-max-bs-decode 32`, HiCache on,
+`--chunked-prefill-size 16384`.
+
+How SGLang sizes the KV pool (`model_runner_components/kv_pool_runtime.py:58-140`):
+- Sizing runs *after* weight load and graph capture.
+- budget = free memory after capture − headroom, where headroom = pre_model_load_memory × (1 − 0.85).
+- Fewer than one token raises `RuntimeError("Not enough memory …")` (`pool_configurator.py:91-95`).
+
+| item | GiB / GPU | source |
+|---|---|---|
+| HBM | 140.4 | nvidia-smi on the box: 143,771 MiB |
+| context + NCCL before load | ~1.5 | estimate |
+| headroom 0.15 × pre-load free | 20.8 | `kv_pool_runtime.py:73-75` |
+| NVFP4 experts, 60 layers (Marlin layout = K2A layout bytes) | **50.62** | 32 × 28.31 MB × 60; 05-moe: 864 MiB/layer |
+| BF16 experts, layers 0 and 61 (quant excludes) | 6.00 | 02-model-layer: 3 GiB/layer |
+| pre/post expert proj, replicated | 7.75 | 128 MiB × 62 |
+| attention (TP 8) | 2.18 | hidden 8192, q/o 8192, kv 2 × 1024 |
+| router gates (replicated, ≤ fp32) | 0.48 | |
+| embeddings + lm_head (vocab-parallel) | 0.77 | |
+| DFlash draft (5 layers + fc) | 1.62 | 06 §4.3 |
+| **weights total** | **69.4** | 06's 65 GiB missed the BF16 layers 0/61 |
+| graph pools (decode bs ≤ 32, prefill buckets ≤ 16K) + workspace + sampling | 5–9 | 06 assumed 5; the 16K-chunk Marlin caches (~3 GiB) and DFlash hidden (1.3 GB) push it up |
+| **KV budget** | **39.6–43.6** | |
+| **KV pool** at 14,797 B per full-pool token | **2.88–3.17M full / 2.30–2.53M SWA tokens** | |
+
+The workload's live set (07):
+- c = 32: 32 × 80–92K = **2.6–2.9M full-layer tokens**. That is already at or near the pool, as 06 found (evictions,
+  load-backs).
+- c = 16: about 1.4M running plus 1.4M cached.
+
+**Adding a second, K2A-layout copy of the NVFP4 experts (+50.62 GiB):**
+
+| graph pools | KV budget |
+|---|---|
+| 5 GiB | **−7.0 GiB** |
+| 9 GiB | **−11.0 GiB** |
+
+- Startup aborts with "Not enough memory".
+- Even with the 0.85 headroom patched to zero, the pool is 9.8–13.8 GiB = **0.71–1.00M tokens**. That is a third of
+  the c=32 live set, and below c=16's running set plus prefix reuse.
+- Partial duplication costs 0.84 GiB = 61K pool tokens per layer.
+  - Duplicating 5 layers costs about 10% of the pool and buys 5/60 of the gain: about 0.24 ms per step at c=16,
+    0.7%.
+  - Not worth it while c=32 is capacity-bound.
+
+### 6.2 Mechanics, if it were attempted
+- **Where.** In `layers/quantization/muse_spark_nvfp4_moe.py`, in `_process_weights_for_marlin` (`:126-140`).
+  - Build the K2A copy from the native `gate_up_proj`/`down_proj` (+ scales) *before* the `del layer._parameters[native]`
+    loop. Store it as new non-loader tensors on the layer.
+  - `model_loader/` stays untouched, and the registered names and shapes are unchanged.
+  - Peak transient per layer: native + Marlin + K2A = 2.5 GiB.
+- **Does the profiler see it?** Yes. Everything allocated in `process_weights_after_loading` exists before
+  post-capture sizing reads free memory, so the KV pool shrinks to fit rather than OOMing later.
+  - With +50.6 GiB the budget goes ≤ 0 and init fails loudly (`pool_configurator.py:91-95`).
+  - Near the limit, the DFlash worker silently skips its draft CUDA graphs when less than 1 GB is free after target
+    init (`dflash_worker_v2.py:707-720`). That would be a slowdown, not an error.
+- **Precision rules.** No effect. Both copies are lossless permutations of the same NVFP4 bytes. Marlin's scale
+  re-encoding (`marlin_utils_fp4.py:29-44`: E4M3 → half × 2^7 → top byte) is exact for the non-negative scales the
+  checkpoint has.
+  - What the rules care about is unchanged from 05-moe: K2A's outputs differ from stock Marlin by 5.5e-3 rel-L2 per
+    MoE output, which is rounding (K2A applies the FP32 global scale on the accumulator).
+  - Activations stay BF16.
+
+### 6.3 Routing (moot given 6.1, but for the record)
+- T ≤ 320 goes to K2A. This covers every verify/decode step, since T = 8 × running requests ≤ 256, and every
+  extend/prefill chunk of 9–320 tokens.
+  - Measured K2A wins: T = 8, 32, 128, 256 (05-moe §2).
+  - 257–320 is K2A's 193–320 bucket, unmeasured but next to the T=256 win.
+- T > 320 goes to stock Marlin. The ~753-token later-turn extends and the 16K first-turn chunks are where K2A loses
+  1.5–2.5×.
+- No mixed batches: `enable_mixed_chunk=False`, so a forward is either a verify step or an extend.
+
+
+| rung (verify T) | per layer | per step | share of step |
+|---|---|---|---|
+| c=1 (T=8) | −9.3 µs | **−0.56 ms** | **3.0%** of 18.7 ms |
+| c=16 (T=128) | −47.4 µs | **−2.84 ms** | **8.1%** of ~35 ms |
+| c=32 (T=256) | −21.2 µs | **−1.27 ms** | ~2.6–2.8% of a ~45–50 ms verify step (not measured) |
+
+- k3_v07's in-layer A/B saw +11 µs on sliding layers at T=32 (c=4), so c=4 is about neutral.
+- If gap levers 1+2 were built later (×0.5 haircut), per layer: −18 µs at T=8, −45 at T=128, −80 at T=256.
+  - That adds **−1.08 ms (5.8%) at c=1, −2.7 ms (7.7%) at c=16, −4.8 ms at c=32**.
+  - Combined with today's gain: about −1.6 ms (8.8%), −5.5 ms (16%) and −6.1 ms per step.
+
+- Marlin's NVFP4 MoE layout is a lossless permutation (`gptq_marlin_moe_repack`) and its scales decode exactly (6.2).
+- Marlin's design: a warp-wide 16 B-per-thread load covers a k16 × n64 tile of 4-bit weights, i.e. eight n8
+  B-fragments. **Verify this for the FP4 repack** in `gptq_marlin_moe_repack` and `marlin_utils_fp4` before relying on
+  it.
+- If it holds, then in K2A's swap-AB orientation (weights = MMA A operand) an A fragment for rows
+  {16i + g, 16i + g + 8} is exactly the B fragments of n8 tiles 2i and 2i+1, so no shuffles are needed, up to Marlin's
+  nibble interleave.
+- The decode would be Marlin's LOP3 trick. The probe (§2) measures it at 3.62 TB/s with 4 mma per 16 B, against
+  3.92 for v2's deq4: about 8% lower consumer ceiling, irrelevant while in-situ rates are 1.5–2.4 TB/s.
+- The global scale is Marlin's collapsed BF16 per-expert scale, as the 05 module already does.
+- Everything else is K2A v2.4 unchanged: units, launch plans, the M1 hardening, the post-norm.
+- Expected: most of 6.4's gain (−0.56 / −2.84 / −1.27 ms per step), with no prefill regression and no KV-pool cost.
+- Risk: the swap-AB fragment wiring on Marlin's tile order. It is emulator-checkable on the laptop the same way v2's
+  repack was.
+- Patch delta against 05-moe.diff would be:
+  1. drop 05's load-time K2A repack;
+  2. keep Marlin's repack;
+  3. `muse_spark_k2a.forward` takes Marlin's `w13_weight`/`w2_weight`/scales for T ≤ 320 and calls stock Marlin for
+     T > 320;
+  4. the generator `gen_05_k2a.py` points at the new kernel file.
