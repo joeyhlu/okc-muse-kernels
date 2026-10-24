@@ -283,3 +283,32 @@ The isolation builds show what the time is:
   second S accumulator for QK(i+1) during softmax(i). This needs > 128 registers, so 1 CTA/SM with 3 warpgroups.
 - Polynomial exp2 on the FMA pipe for part of the rows (the FA4 trick), to take MUFU off the chain.
 - A cheaper transpose (4 keys × 32-bit stores).
+
+## 9. Stage 1 cheap levers (2026-10-24): exp2 polynomial sweep; gate missed
+
+**Polynomial exp2 on the FMA/ALU pipes** (`K1_POLYJ` = number of 8-key blocks per row that use it). The fit is
+degree 3, max relative error 1.3e-4. Self-test errors are unchanged to the third digit (e.g. 4.176e-3 → 4.174e-3).
+
+Same-process µs (box_out/k1v6_poly.log):
+
+| fraction on poly | ver16 full | ver32 full | rung-1 ver16 / ver32 |
+|---|---|---|---|
+| 0 % (v6) | 198.8 | 364.3 | 195.4 / 383.4 |
+| 25 % | 206.9 | 378.8 | 195.3 / 383.4 |
+| 50 % | 215.3 | 392.9 | 195.4 / 383.4 |
+| 75 % | 219.3 | 401.7 | 195.6 / 383.3 |
+
+**It gets worse, monotonically.** MUFU is not the limiter. The softmax cost is instruction issue and latency on the
+ALU/FMA side (FMNMX chains, FFMA, the f32→e4m3 packs, shuffles), and the polynomial adds about 7 issue slots per
+value.
+
+**The 32-bit Vᵀ transpose was not built.** Removing the transpose *entirely* measured 330.2 µs (§8, no-transpose
+build), so no cheaper transpose can reach the ≤ 330 gate on its own.
+
+**Stage 1 gate (ver32 full ≤ 330): missed. Stage 2 not started.**
+
+What the data points to instead (unmeasured):
+- Cut the per-value softmax instruction count rather than move it between pipes. For example, an FA4-style
+  conditional rescale with a fixed per-row max estimate could skip the per-tile 16-deep max chain and the alpha
+  logic.
+- Or the stage-2 ping-pong, which hides issue latency across warpgroups rather than removing it.

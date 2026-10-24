@@ -764,6 +764,21 @@ __device__ __forceinline__ void tile_wg(float (&S)[32], float (&O)[32], float (&
 #endif
 }
 
+#ifndef K1_POLYJ
+#define K1_POLYJ 0                                   // of the 8 key blocks per row and tile, how many use ex2_poly
+#endif
+// exp2 on the FMA/ALU pipes (FA4-style): round-to-nearest split x = j + f, f in [-0.5, 0.5], degree-3 fit of 2^f
+// (max rel err 1.3e-4, far below the e4m3 rounding P gets next), j added to the exponent. x >= -126 (masked -inf
+// -> 2^-126, a negligible term). Relieves MUFU (16/clk/SM), which carries 128 exp2 per key at L=8.
+__device__ __forceinline__ float ex2_poly(float x) {
+  x = fmaxf(x, -126.f);
+  const float t = __fadd_rn(x, 12582912.f);
+  const float jf = __fadd_rn(t, -12582912.f);
+  const float f = __fadd_rn(x, -jf);
+  const float pp = fmaf(fmaf(fmaf(0.0550424707f, f, 0.242289932f), f, 0.693254439f), f, 0.999950127f);
+  const int ji = __float_as_int(t) - 0x4B400000;
+  return __int_as_float(__float_as_int(pp) + (ji << 23));
+}
 // v6 software pipeline pieces (QK issue / softmax+pack / PV issue), used with PV(i) left in flight across the
 // next barrier and the V^T transpose of tile i+1 overlapped with the QK(i) wgmma.
 __device__ __forceinline__ void qk_issue(float (&S)[32], const uint64_t dq, const uint64_t dk) {
@@ -822,7 +837,8 @@ __device__ __forceinline__ void softmax_pack(float (&S)[32], float (&O)[32], flo
     for (int j = 0; j < 8; ++j) {
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
-        const float pv = ex2(fmaf(S[4 * j + 2 * rb + e], cl2, -bo));
+        const float xa = fmaf(S[4 * j + 2 * rb + e], cl2, -bo);
+        const float pv = (j < K1_POLYJ) ? ex2_poly(xa) : ex2(xa);
         S[4 * j + 2 * rb + e] = pv;
         ps += pv;
       }
