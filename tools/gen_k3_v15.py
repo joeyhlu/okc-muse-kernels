@@ -275,6 +275,21 @@ def _v15_fa4_selftest(state, mod, dev):
                 tot1, row1 = _k1_rel_rows(out, other.view(B, 8, -1))
             except Exception as ex:  # noqa: BLE001
                 print(f"[fa4] self-test case {ci}: comparison with the existing route ({which}) skipped (it raised {ex!r})", flush=True)
+            # Stock's own error on the identical case: FA4 must agree with the reference nearly as well as stock (r1
+            # FA3, the same FP8-QK numerics) does. K1 v7 (fp16 QK) is printed for information only.
+            tot_r1 = row_r1 = -1.0
+            try:
+                d3 = _v15_fa4_case(dev, layer, B, ctx, seed)
+                o_r1 = _r1_attention(d3["qkv"].view(T, -1), d3, state).view(B, 8, -1)
+                torch.cuda.synchronize(dev)
+                pos3 = d3["seq_lens"].long()[:, None] + torch.arange(8, device=dev)
+                slots3 = torch.gather(d3["page_table"].long(), 1, pos3)
+                k3n = d3["k_cache"].view(torch.uint8).view(-1, 2, 64)[slots3]
+                v3n = d3["v_cache"].view(torch.uint8).view(-1, 2, 64)[slots3]
+                tot_r1, row_r1 = _k1_rel_rows(o_r1, _k1_ref_attention(d3, k3n, v3n, q_e4m3=True))
+                del d3, o_r1
+            except Exception as ex:  # noqa: BLE001
+                print(f"[fa4] self-test case {ci}: stock r1 error not measured (it raised {ex!r})", flush=True)
             tg = -1.0
             if layer not in graphed:
                 graphed.add(layer)
@@ -285,8 +300,10 @@ def _v15_fa4_selftest(state, mod, dev):
                 torch.cuda.synchronize(dev)
                 tg, _ = _k1_rel_rows(og, o1)
                 del g, og
-            good = (bool(torch.isfinite(out.float()).all()) and tot < 2e-2 and row < 6e-2 and kt < 5e-2 and vt < 5e-2 and trep < 1e-3
-                    and (tot1 < 0 or (tot1 < 3e-2 and row1 < 1.5e-1)) and tg < 1e-3)
+            stock_ok = (tot <= 1.25 * tot_r1 + 5e-3 and row <= 1.25 * row_r1 + 2e-2) if tot_r1 >= 0 else (tot < 5e-2 and row < 1e-1)
+            good = (bool(torch.isfinite(out.float()).all()) and tot < 1e-1 and row < 1.5e-1 and stock_ok
+                    and kt < 5e-2 and vt < 5e-2 and trep < 1e-3 and tg < 1e-3)
+            print(f"[fa4] self-test case {ci}: stock r1 vs fp32 ref rel {tot_r1:.3e} worst row {row_r1:.3e}", flush=True)
             print(f"[fa4] self-test case {ci}: out vs fp32 ref rel {tot:.3e} worst row {row:.3e}; new K {kt:.3e} V {vt:.3e}; vs {which} rel {tot1:.3e} "
                   f"worst row {row1:.3e}; repeat {trep:.1e}; graph replay {tg:.1e}; first call {t_first:.2f}s -> {'ok' if good else 'FAIL'}", flush=True)
             if not good:
