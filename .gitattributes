@@ -1,0 +1,2 @@
+# Keep every file byte-exact on every OS (submission files and pod scripts must stay LF).
+* -text
