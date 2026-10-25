@@ -298,3 +298,42 @@ about 0.3 µs):
 - Per load: decode x2.76 / 1.24 / 1.14, verify x2.58 / 1.64 / 1.57.
 - An attention-problem submission should also route decode full B16/32 to K1 v4. Those two shapes run at
   x1.03 / 1.02 on r1 here.
+
+## 11. v6: v5 as one plain source, with no runtime patching (A19 REVISED; `tools/gen_k1_fa4v6.py` → `k1_fa4v6.py`)
+
+The judge's static checker rejected the v2/v5 loaders (importlib, sys.modules registration, temp files, runtime source
+patching: "edits loaded modules"). v6 has the same kernels, routes and numerics as one generated source file.
+
+**What the generator does:**
+- Reads the image copy of `flash_fwd_sm90.py` (box_out/fa4_image, sha256 16815521…).
+- Applies v5's eight sm90 patches, each anchor exactly once.
+- Removes `load` / `load_KV` / `load_Bias`; the subclass provides `load`.
+- Renames every module-level name the vendored text binds to `k1fa4_*` (tokenize-based: attribute and keyword
+  names are left alone). `cutlass`, `cute`, `const_expr`, `Int32` and `Float32` are kept, since the DSL
+  preprocessor may match them by name.
+- Rewrites the imports as normal `from <unmodified image module> import X as k1fa4_X`.
+- Prepends the FA4 BSD-3 notice.
+
+**What the tail adds (`tools/gen_k1_fa4v6_tail.py.in`):**
+- The v2 subclass `k1fa4_Sm90Fwd`.
+- `k1fa4_fwd_partials`, about 40 lines of `interface._flash_attn_fwd`'s host path for this one configuration. It does
+  the same compile and call arguments and FP8-as-uint8 views, with an in-process compile dict; interface.py is not
+  vendored.
+- The Triton prologue and combine kernels, `k1fa4_route_ok`, `k1fa4_run`.
+- A self-contained `k1fa4_self_test`: its own inputs, an FP32 reference, the r1 stock-kernel path, the
+  stock-relative rule and bit-exact cache incl. row 0.
+
+**Properties:**
+- 102,445 bytes in total; the vendored FA4 part is 74,306 bytes.
+- Every top-level name is `k1fa4_`/`K1FA4_`/`_k1fa4_`-prefixed (plus torch / triton / tl / cutlass / cute and four
+  cutlass names).
+- No `__name__`, sys.path, file writes or environment writes.
+- Scan: none of importlib, sys.modules, exec(, builtin compile(, __import__, setattr(, globals()[, open(,
+  spec_from_file_location, module_from_spec, tempfile (only `cute.compile(` appears).
+
+**Measured** (`box_out/fa4v6_job1_lab.log`):
+- Self-test 8/8 PASS, cache == r1 on every case. Import takes 4.4 s; the self-test takes 30 s including JIT.
+- Same-process timing of v5 vs v6 on all 12 shapes (two interleaved runs each) is within ±0.4 µs; for example
+  dec16 sliding 12.58 / 12.64, ver32 full 259.9 / 259.4.
+- Judge clone of `k1_fa4v6_route.py` (r1_glue + v6 pasted at top level + a routing kernel_fn;
+  `box_out/fa4v6_judge.log`): **16/16 tests pass, x1.7304 [1.705, 1.756]**. The v5 route got x1.7198.

@@ -1,0 +1,500 @@
+
+# =====================================================================================================================
+# K1-FA4 v6 (team joeyhlu): FA4 v2 core (subclass of the vendored kernel above) + fused prologue / combine-norm-gate
+# kernels (Triton) + route + self-test. Design and measurements: kernels/muse_attention_decode/k1_fa4_design.md
+# sections 8-11. Every top-level name below starts with k1fa4_ / K1FA4_ / _k1fa4_, so this text can be pasted at the top
+# level of another file.
+# =====================================================================================================================
+import torch
+import triton
+import triton.language as tl
+from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import to_cute_tensor as k1fa4_to_cute_tensor
+
+K1FA4_RAW_STAGES = 2
+K1FA4_TILE = (64, 128)
+K1FA4_MAX_SPLITS = 128
+K1FA4_STAGES = {"full": 3, "sliding": 2}  # K/V pipeline depth per layer type
+K1FA4_TRIG = {"full": "epi", "sliding": "epi"}  # PDL trigger in the FA4 kernel: False, "start" or "epi"
+K1FA4_SPLITS = {("sliding", 1): 32}  # (layer, batch) -> num_splits; else k1fa4_num_splits_for
+K1FA4_RMS_EPS = 1e-5
+K1FA4_ROPE_POSITIONS = 1 << 21
+K1FA4_STATE = {"ready": None}
+_k1fa4_compiled = {}
+_k1fa4_rope = {}
+
+
+class k1fa4_Sm90Fwd(k1fa4_FlashAttentionForwardSm90):
+    """FA4 sm90 forward: FP8 QK (E4M3 Q via FA4's pack-GQA TMA, K gathered by FA4's PagedKVManager straight into the
+    FP8 wgmma stages), F16 PV (V gathered into a raw FP8 ring, upcast per thread into the swizzled F16 stage), 2 CTAs
+    per SM, PDL wait in the producer."""
+
+    def __init__(self, dtype, *args, **kwargs):
+        kind = "sliding" if kwargs.get("is_local") else "full"
+        k1fa4_K["stages"] = K1FA4_STAGES[kind]
+        k1fa4_K["trig"] = K1FA4_TRIG[kind]
+        super().__init__(cutlass.Float16, *args, **kwargs)  # P, V, O and the PV wgmma are F16
+
+    def _get_shared_storage_cls(self):
+        q_n = max(cute.cosize(self.sQ_layout), 2 * cute.cosize(self.sO_layout))  # sO (F16) aliases sQ (E4M3)
+        sQ_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, q_n], 1024]
+        sK_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(self.sK_layout)], 1024]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sV_layout)], 1024]
+        sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, 0], 1024]
+        sVr_struct = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, K1FA4_RAW_STAGES * self.tile_n * self.tile_hdimv], 1024]
+        mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 2]
+        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+
+        @cute.struct
+        class SharedStorageK1fa4:
+            mbar_ptr_Q: mbar_ptr_Q_struct
+            mbar_ptr_K: mbar_ptr_K_struct
+            mbar_ptr_V: mbar_ptr_V_struct
+            sV: sV_struct
+            sQ: sQ_struct
+            sK: sK_struct
+            sP: sP_struct
+            sVr: sVr_struct
+
+        return SharedStorageK1fa4
+
+    @cute.jit
+    def _k1fa4_upcast_own(self, pkm, tiled_r2s, tidx, sXr, sX):
+        """One 128-key V tile: each thread upcasts (E4M3 -> F16, exact) the 16-byte chunks its own cp.async wrote."""
+        tRs = pkm.gmem_thr_copy_KV.partition_D(cute.group_modes(sXr, 0, 1))
+        tXs = tiled_r2s.get_slice(tidx).partition_D(cute.group_modes(sX, 0, 1))
+        for m in cutlass.range_constexpr(cute.size(tRs.shape[1])):
+            r8 = cute.make_fragment_like(tRs[None, m, None])
+            cute.autovec_copy(tRs[None, m, None], r8)
+            r16 = cute.make_fragment_like(tXs[None, m, None])
+            r16v = cute.make_tensor(r16.iterator, r8.layout)
+            r16v.store(r8.load().to(self.dtype))
+            cute.copy(tiled_r2s, r16, tXs[None, m, None])
+
+    @cute.jit
+    def load(self, mQ, mK, mV, sQ, sK, sV, tma_atom_Q, tma_atom_K, tma_atom_V, mBias, sBias, tma_atom_Bias,
+             pipeline_k, pipeline_v, pipeline_bias, pipeline_q, gmem_tiled_copy_Q, mPageTable,
+             blocksparse_tensors, block_info, SeqlenInfoCls, TileSchedulerCls, num_splits: Int32 = 1):
+        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        tidx, _, _ = cute.arch.thread_idx()
+        nthr = self.num_threads_per_warp_group
+        if const_expr(k1fa4_K["pdl"]):
+            cute.arch.griddepcontrol_wait()  # the prologue's E4M3 q and new K/V rows are visible from here on
+            if const_expr(k1fa4_K["trig"] == "start"):
+                cute.arch.griddepcontrol_launch_dependents()
+        storage = self._k1_storage
+        sVr = storage.sVr.get_tensor(cute.make_layout(
+            (self.tile_n, self.tile_hdimv, K1FA4_RAW_STAGES),
+            stride=(self.tile_hdimv, 1, self.tile_n * self.tile_hdimv)))
+        tiled_r2s = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=128),
+            cute.make_ordered_layout((nthr // 4, 4), order=(1, 0)), cute.make_layout((1, 16)))
+
+        q_producer_phase = Int32(1)
+        k_state = k1fa4_pipeline.make_pipeline_state(k1fa4_pipeline.PipelineUserType.Producer, self.num_stages)
+        v_state = k1fa4_pipeline.make_pipeline_state(k1fa4_pipeline.PipelineUserType.Producer, self.num_stages)
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+            load_Q, _, _ = k1fa4_copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ,
+                                                            single_stage=True)
+            pkm = k1fa4_PagedKVManager.create(mPageTable, mK, mV, k1fa4_FastDivmodDivisor(mK.shape[0]), batch_idx,
+                                              head_idx, tidx, seqlen.seqlen_k, 0, self.tile_n, self.tile_hdim,
+                                              self.tile_hdimv, nthr, mK.element_type, arch=90)
+            if warp_idx_in_wg == 0:
+                pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+            q_producer_phase ^= 1
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            nblk = n_block_max - n_block_min
+            if nblk > 0:
+                for it in cutlass.range(nblk, unroll=1):
+                    n_block = n_block_max - 1 - it
+                    pipeline_k.producer_acquire(k_state)
+                    pkm.load_page_table(n_block)
+                    pkm.load_KV(n_block, sK[None, None, k_state.index], "K")
+                    pipeline_k.producer_commit(k_state)
+                    k_state.advance()
+                    pkm.load_KV(n_block, sVr[None, None, it % K1FA4_RAW_STAGES], "V")
+                    cute.arch.cp_async_commit_group()
+                    if it > 0:
+                        cute.arch.cp_async_wait_group(1)
+                        pipeline_v.producer_acquire(v_state)
+                        self._k1fa4_upcast_own(pkm, tiled_r2s, tidx, sVr[None, None, (it - 1) % K1FA4_RAW_STAGES],
+                                               sV[None, None, v_state.index])
+                        cute.arch.fence_view_async_shared()
+                        cute.arch.mbarrier_arrive(pipeline_v.sync_object_full.get_barrier(v_state.index))
+                        v_state.advance()
+                cute.arch.cp_async_wait_group(0)
+                pipeline_v.producer_acquire(v_state)
+                self._k1fa4_upcast_own(pkm, tiled_r2s, tidx, sVr[None, None, (nblk - 1) % K1FA4_RAW_STAGES],
+                                       sV[None, None, v_state.index])
+                cute.arch.fence_view_async_shared()
+                cute.arch.mbarrier_arrive(pipeline_v.sync_object_full.get_barrier(v_state.index))
+                v_state.advance()
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+        pipeline_v.producer_tail(v_state)
+
+
+def k1fa4_num_splits_heuristic(total_mblocks, num_sms, num_n_blocks, max_splits):
+    """FA4 interface.num_splits_heuristic (vendored)."""
+    if num_n_blocks <= 4 or total_mblocks == 0:
+        return 1
+    return min(num_sms // total_mblocks, max_splits, num_n_blocks)
+
+
+def k1fa4_num_splits_for(batch, hkv, keys, num_sms=132, ctas_per_sm=2):
+    nnb = (keys + K1FA4_TILE[1] - 1) // K1FA4_TILE[1]
+    return max(2, min(K1FA4_MAX_SPLITS, k1fa4_num_splits_heuristic(batch * hkv, num_sms, nnb, 128) * ctas_per_sm))
+
+
+def k1fa4_fwd_partials(q8, k8, v8, page_table, seqused_k, softmax_scale, num_splits, window=0):
+    """FA4 sm90 split-KV forward (host path of FA4 interface._flash_attn_fwd for this one configuration: pack-GQA,
+    paged page-size-1 cp.async KV, causal or local window, split partials returned, no combine).
+    q8 [B, L, Hq, 64], k8/v8 [P, 1, Hkv, 64] E4M3. Returns out_partial f32 [S, B, L, Hq, 64], lse_partial f32
+    [S, B, Hq, L] (natural log)."""
+    assert q8.dtype == k8.dtype == v8.dtype == torch.float8_e4m3fn and k8.shape[1] == 1 and num_splits >= 2
+    B, L, hq, d = q8.shape
+    hkv = k8.shape[2]
+    assert d == 64 and hq == 8 * hkv
+    local = bool(window)
+    wl, wr = (window - 1, 0) if local else (None, None)
+    o_part = torch.empty((num_splits, B, L, hq, d), dtype=torch.float32, device=q8.device)
+    lse_part = torch.empty((num_splits, B, hq, L), dtype=torch.float32, device=q8.device)
+    kind = "sliding" if local else "full"
+    key = (local, hq // hkv, d, K1FA4_STAGES[kind], K1FA4_TRIG[kind], k1fa4_K["pdl"], k1fa4_K["minb"],
+           k1fa4_K["regs1"])
+    fn = _k1fa4_compiled.get(key)
+    if fn is None:
+        fa = k1fa4_Sm90Fwd(cutlass.Float8E4M3FN, d, d, hq // hkv, is_causal=not local, is_local=local,
+                           is_split_kv=True, pack_gqa=True, tile_m=K1FA4_TILE[0], tile_n=K1FA4_TILE[1],
+                           num_stages=2, num_threads=384, Q_in_regs=False, intra_wg_overlap=False, mma_pv_is_rs=True,
+                           mask_mod=None, score_mod=None, has_aux_tensors=False, q_subtile_factor=None,
+                           paged_kv_non_tma=True, has_bias=False, bias_block_size=K1FA4_TILE[0],
+                           rel_extent_padded=0)
+        tc = k1fa4_to_cute_tensor
+        fn = cute.compile(
+            fa, tc(q8), tc(k8), tc(v8), tc(o_part), tc(lse_part, assumed_align=4), softmax_scale, None, None, None,
+            tc(seqused_k, assumed_align=4, leading_dim=0), tc(page_table, assumed_align=4, leading_dim=1), wl, wr,
+            None, None, k1fa4_AuxData(None, None), None,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        _k1fa4_compiled[key] = fn
+    fn(q8.view(torch.uint8), k8.view(torch.uint8), v8.view(torch.uint8), o_part, lse_part, softmax_scale, None, None,
+       None, seqused_k, page_table, wl, wr, None, None, k1fa4_AuxData(None, None), None)
+    return o_part, lse_part
+
+
+@triton.jit
+def _k1fa4_prologue(QKV, Q_OUT, POS, COS_SIN, K_CACHE, V_CACHE, CACHE_LOC, eps, stride_qkv, n_rows,
+                    NUM_Q_HEADS: tl.constexpr, NUM_KV_HEADS: tl.constexpr, D: tl.constexpr, BD: tl.constexpr,
+                    BLOCK_M: tl.constexpr, HAS_ROPE: tl.constexpr, USE_PDL: tl.constexpr,
+                    FP8_MAX_C: tl.constexpr = 448.0):
+    """SGLang FusedQKNorm (_qk_rms_norm_fwd_kernel with HAS_KV_STORE and FP8_KV_STORE) arithmetic, verbatim; stores
+    every cache row (no reserved slot 0) and skips the unused bf16 K output."""
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < n_rows
+    cols = tl.arange(0, BD)
+    col_mask = cols < D
+    mask = row_mask[:, None] & col_mask[None, :]
+    HEADS: tl.constexpr = NUM_Q_HEADS + 2 * NUM_KV_HEADS
+    token = rows // HEADS
+    head = rows % HEADS
+    is_q = head < NUM_Q_HEADS
+    is_k = (head >= NUM_Q_HEADS) & (head < NUM_Q_HEADS + NUM_KV_HEADS)
+    is_v = head >= NUM_Q_HEADS + NUM_KV_HEADS
+    src = token * stride_qkv + head * D
+    raw = tl.load(QKV + src[:, None] + cols[None, :], mask=mask, other=0.0)
+    x = raw.to(tl.float32)
+    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / D
+    rstd = tl.rsqrt(var + eps)
+    x = x * rstd[:, None]
+    if HAS_ROPE:
+        x = x.to(QKV.dtype.element_ty).to(tl.float32)
+        partner_cols = cols ^ 1
+        xp = tl.load(QKV + src[:, None] + partner_cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        xp = (xp * rstd[:, None]).to(QKV.dtype.element_ty).to(tl.float32)
+        pos = tl.load(POS + token, mask=row_mask, other=0).to(tl.int64)
+        freq = cols // 2
+        cs_mask = row_mask[:, None] & (cols < D)[None, :]
+        cos = tl.load(COS_SIN + pos[:, None] * D + freq[None, :], mask=cs_mask, other=1.0)
+        sin = tl.load(COS_SIN + pos[:, None] * D + D // 2 + freq[None, :], mask=cs_mask, other=0.0)
+        is_even = (cols % 2 == 0)[None, :]
+        x = tl.where(is_even, x * cos - xp * sin, xp * sin + x * cos)
+    x = x.to(QKV.dtype.element_ty).to(tl.float32)
+    x = tl.where(is_v[:, None], raw.to(tl.float32), x)
+    x = tl.minimum(tl.maximum(x, -FP8_MAX_C), FP8_MAX_C)
+    loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)
+    kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
+    kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D
+    tl.store(K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=mask & is_k[:, None])
+    tl.store(V_CACHE + kv_dst[:, None] + cols[None, :], x, mask=mask & is_v[:, None])
+    q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)
+    tl.store(Q_OUT + q_dst[:, None] + cols[None, :], x, mask=mask & is_q[:, None])
+
+
+@triton.jit
+def _k1fa4_combine_gate(OP, LSEP, QKV, OUT, stride_qkv, gate_off, n_rows, NS, B, L, eps,
+                        H: tl.constexpr, D: tl.constexpr, NS_P2: tl.constexpr, USE_PDL: tl.constexpr):
+    """One program per (token, head) row r = (b * L + l) * H + h:
+    out = rms_norm(bf16(sum_s w_s O_s / sum_s w_s)) * sigmoid(gate), w_s = exp(lse_s - max lse)."""
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    r = tl.program_id(0)
+    t = r // H
+    h = r % H
+    b = t // L
+    l = t % L
+    lrow = (b * H + h) * L + l
+    s = tl.arange(0, NS_P2)
+    smask = s < NS
+    lse = tl.load(LSEP + s * (B * H * L) + lrow, mask=smask, other=float("-inf"))
+    m = tl.max(lse, axis=0)
+    m = tl.where(m == float("-inf"), 0.0, m)
+    w = tl.exp(lse - m)
+    den = tl.sum(w, axis=0)
+    d = tl.arange(0, D)
+    o = tl.load(OP + s[:, None] * (n_rows * D) + r * D + d[None, :], mask=smask[:, None], other=0.0)
+    acc = tl.sum(w[:, None] * o, axis=0) / tl.where(den > 0, den, 1.0)
+    acc = acc.to(tl.bfloat16).to(tl.float32)
+    var = tl.sum(acc * acc, axis=0) / D
+    y = acc * tl.rsqrt(var + eps)
+    g = tl.load(QKV + t * stride_qkv + gate_off + h * D + d).to(tl.float32)
+    y = y * (1.0 / (1.0 + tl.exp(-g)))
+    tl.store(OUT + t * (H * D) + h * D + d, y.to(tl.bfloat16))
+
+
+def k1fa4_cos_sin(theta, d, device):
+    """[2^21, d] float32 cos | sin, as SGLang's RotaryEmbedding (and r1) builds it, cached per theta."""
+    key = (theta, str(device))
+    cache = _k1fa4_rope.get(key)
+    if cache is None:
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float, device=device) / d))
+        freqs = torch.einsum("i,j -> ij", torch.arange(K1FA4_ROPE_POSITIONS, dtype=torch.float, device=device),
+                             inv_freq)
+        cache = _k1fa4_rope[key] = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+    return cache
+
+
+def k1fa4_supported(cfg):
+    return (cfg["q_len"] in (1, 8) and cfg["page_size"] == 1 and cfg["kv_scale"] == 1.0 and cfg["head_dim"] == 64
+            and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"])
+
+
+def k1fa4_route_ok(cfg):
+    """Measured routes (k1_fa4_design.md section 10): sliding L=1 / L=8 at every batch, full L=8 at every batch,
+    full L=1 at B=1 only (K1 v4 is faster at B16/32 full decode)."""
+    if not k1fa4_supported(cfg):
+        return False
+    return bool(cfg["window"]) or cfg["q_len"] == 8 or cfg["batch"] <= 1
+
+
+def k1fa4_run(data, splits=None, pdl=True):
+    """Attention-problem kernel_fn contract: prologue -> FA4 core (PDL) -> combine + norm-gate (PDL); bf16 [B, L, Hq*64]."""
+    cfg = data["config"]
+    batch, length = cfg["batch"], cfg["q_len"]
+    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    window = cfg["window"]
+    tokens = batch * length
+    qkv = data["qkv"].view(tokens, -1)
+    device = qkv.device
+    k_cache, v_cache = data["k_cache"], data["v_cache"]
+    q8 = torch.empty((tokens, hq * d), dtype=torch.float8_e4m3fn, device=device)
+    n_rows = tokens * (hq + 2 * hkv)
+    block_m = 4 if n_rows < 1024 else (8 if n_rows < 8192 else 16)
+    theta = cfg["rope_theta"]
+    cos_sin = k1fa4_cos_sin(theta, d, device) if theta else qkv
+    pdl_kw = {"launch_pdl": True} if pdl else {}
+    _k1fa4_prologue[(triton.cdiv(n_rows, block_m),)](
+        qkv, q8, data["positions"] if theta else qkv, cos_sin, k_cache.view(-1, hkv * d), v_cache.view(-1, hkv * d),
+        data["cache_loc"], K1FA4_RMS_EPS, qkv.stride(0), n_rows, hq, hkv, d, triton.next_power_of_2(d), block_m,
+        HAS_ROPE=bool(theta), USE_PDL=pdl, num_warps=4, **pdl_kw)
+    max_k = data["page_table"].shape[1]
+    keys = min(max_k, window + length) if window else max_k
+    ns = splits or K1FA4_SPLITS.get(("sliding" if window else "full", batch)) or k1fa4_num_splits_for(batch, hkv, keys)
+    k1fa4_K["pdl"] = bool(pdl)
+    o_part, lse_part = k1fa4_fwd_partials(q8.view(batch, length, hq, d), k_cache, v_cache, data["page_table"],
+                                          data["cache_seqlens"], cfg["sm_scale"] * cfg["qk_scale_factor"], ns,
+                                          window=window)
+    out = torch.empty((batch, length, hq * d), dtype=torch.bfloat16, device=device)
+    rows = tokens * hq
+    _k1fa4_combine_gate[(rows,)](
+        o_part, lse_part, qkv, out, qkv.stride(0), (hq + 2 * hkv) * d, rows, ns, batch, length, K1FA4_RMS_EPS,
+        H=hq, D=d, NS_P2=triton.next_power_of_2(ns), USE_PDL=pdl, num_warps=2 if ns <= 8 else 4, **pdl_kw)
+    return out
+
+
+# ---- self-test: stock-relative rule vs an FP32 reference, cache bytes bit-exact vs the r1 (stock-kernel) path ----
+
+def _k1fa4_case(batch, ctx, length, window, seed, row0, device):
+    """Attention-problem inputs (page size 1, unit scales, tp8 heads). row0: request 0's first new token lives in
+    cache row 0 (SGLang's FusedQKNorm store skips that row; the judge's inputs can use it)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    hq, hkv, d = 16, 2, 64
+    seq = torch.randint(max(1, ctx // 2), ctx + 1, (batch,), generator=g, device=device)
+    seq[0] = ctx
+    max_pages = ctx + length
+    total = batch * max_pages
+    perm = torch.randperm(total, generator=g, device=device)
+    if row0:
+        j = int((perm == 0).nonzero()[0, 0])
+        perm[j], perm[ctx] = perm[ctx].clone(), 0
+    pt = torch.full((batch, max_pages), -1, dtype=torch.int32, device=device)
+    off = 0
+    for b in range(batch):
+        n = int(seq[b]) + length
+        pt[b, :n] = perm[off:off + n].to(torch.int32)
+        off += n
+    f8 = torch.float8_e4m3fn
+    k_cache = torch.randn((total, 1, hkv, d), generator=g, device=device).to(f8)
+    v_cache = torch.randn((total, 1, hkv, d), generator=g, device=device).to(f8)
+    q = (2 * torch.randn((batch, length, hq, d), generator=g, device=device)).to(torch.bfloat16)
+    k = (2 * torch.randn((batch, length, hkv, d), generator=g, device=device)).to(torch.bfloat16)
+    v = torch.randn((batch, length, hkv, d), generator=g, device=device).to(torch.bfloat16)
+    gate = torch.randn((batch, length, hq * d), generator=g, device=device).to(torch.bfloat16)
+    qkv = torch.cat([q.flatten(2), k.flatten(2), v.flatten(2), gate], -1)
+    positions = (seq[:, None] + torch.arange(length, device=device)).reshape(-1)
+    cache_loc = torch.gather(pt.long(), 1, positions.view(batch, length)).reshape(-1)
+    one = torch.tensor(1.0, dtype=torch.float32, device=device)
+    return {
+        "qkv": qkv, "positions": positions, "cache_loc": cache_loc,
+        "cache_seqlens": (seq + length).to(torch.int32),
+        "cu_seqlens_q": torch.arange(0, batch * length + 1, length, dtype=torch.int32, device=device),
+        "scheduler_metadata": None, "k_cache": k_cache, "v_cache": v_cache, "k_scale": one, "v_scale": one.clone(),
+        "page_table": pt, "seq_lens": seq.to(torch.int32),
+        "config": {"batch": batch, "q_len": length, "num_q_heads": hq, "num_kv_heads": hkv, "head_dim": d,
+                   "page_size": 1, "window": window, "rope_theta": 500000.0 if window else 0.0,
+                   "qk_scale_factor": 5.4730064863875, "sm_scale": 0.125, "kv_scale": 1.0},
+    }
+
+
+def _k1fa4_reference(data):
+    """FP32 attention as the problem's reference.ref_kernel computes it (bf16-rounded normalized query)."""
+    cfg = data["config"]
+    batch, length = cfg["batch"], cfg["q_len"]
+    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    x = data["qkv"].view(batch, length, -1)
+    q = x[..., :hq * d].reshape(batch, length, hq, d).float()
+    k = x[..., hq * d:(hq + hkv) * d].reshape(batch, length, hkv, d).float()
+    v = x[..., (hq + hkv) * d:(hq + 2 * hkv) * d].reshape(batch, length, hkv, d)
+    gate = x[..., (hq + 2 * hkv) * d:].float()
+
+    def rms(t):
+        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + K1FA4_RMS_EPS)
+
+    def rope(t, pos, theta):
+        inv = 1.0 / (theta ** (torch.arange(0, d, 2, device=t.device).float() / d))
+        ang = pos.float()[..., None] * inv
+        cos, sin = ang.cos().unsqueeze(-2), ang.sin().unsqueeze(-2)
+        even, odd = t[..., 0::2], t[..., 1::2]
+        return torch.stack([even * cos - odd * sin, even * sin + odd * cos], -1).flatten(-2)
+
+    pos = data["seq_lens"].long()[:, None] + torch.arange(length, device=q.device)
+    qn, kn = rms(q) * cfg["qk_scale_factor"], rms(k)
+    if cfg["rope_theta"]:
+        qn, kn = rope(qn, pos, cfg["rope_theta"]), rope(kn, pos, cfg["rope_theta"])
+    qn = qn.to(torch.bfloat16).float()
+    k_new, v_new = kn.to(torch.float8_e4m3fn).float(), v.float().to(torch.float8_e4m3fn).float()
+    kf, vf = data["k_cache"].view(-1, hkv, d), data["v_cache"].view(-1, hkv, d)
+    out = torch.empty((batch, length, hq, d), device=q.device)
+    for b in range(batch):
+        seq = int(data["seq_lens"][b])
+        rows = data["page_table"][b, :seq].long()
+        keys = torch.cat([kf[rows].float(), k_new[b]])
+        vals = torch.cat([vf[rows].float(), v_new[b]])
+        for j in range(length):
+            p = seq + j
+            start = max(0, p - cfg["window"] + 1) if cfg["window"] else 0
+            att = torch.einsum("kgd,tkd->kgt", qn[b, j].view(hkv, hq // hkv, d), keys[start:p + 1]) * cfg["sm_scale"]
+            out[b, j] = torch.einsum("kgt,tkd->kgd", att.softmax(-1), vals[start:p + 1]).reshape(hq, d)
+    out = rms(out) * torch.sigmoid(gate.view(batch, length, hq, d))
+    return out.reshape(batch, length, hq * d)
+
+
+def _k1fa4_r1_path(data):
+    """The stock-kernel path (rung 1): SGLang FusedQKNorm (staged FP8 KV store) + store_cache + FA3 + rms_norm_gate."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache as k1fa4_fa3
+    from sglang.kernels.ops.kvcache.kvcache import store_cache as k1fa4_store_cache
+    from sglang.kernels.ops.muse_spark_v12.fused_qk_norm import FusedQKNorm as k1fa4_FusedQKNorm
+    from sglang.kernels.ops.muse_spark_v12.norm_gate import rms_norm_gate as k1fa4_rms_norm_gate
+    cfg = data["config"]
+    batch, length = cfg["batch"], cfg["q_len"]
+    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    tokens = batch * length
+    qkv = data["qkv"].view(tokens, -1)
+    device = qkv.device
+    width = hkv * d
+    f8 = torch.float8_e4m3fn
+    k_stage = torch.empty((tokens + 1, width), dtype=f8, device=device)
+    v_stage = torch.empty((tokens + 1, width), dtype=f8, device=device)
+    kv_store = (k_stage, v_stage, torch.arange(1, tokens + 1, dtype=torch.int64, device=device))
+    norm = k1fa4_FusedQKNorm(head_dim=d, num_q_heads=hq, num_kv_heads=hkv, eps=K1FA4_RMS_EPS)
+    if cfg["rope_theta"]:
+        q8, _ = norm.forward_triton(qkv, data["positions"], k1fa4_cos_sin(cfg["rope_theta"], d, device), kv_store)
+    else:
+        q8, _ = norm.forward_triton(qkv, None, None, kv_store)
+    k1fa4_store_cache(k_stage[1:].view(torch.uint8), v_stage[1:].view(torch.uint8),
+                      data["k_cache"].view(-1, width).view(torch.uint8), data["v_cache"].view(-1, width).view(torch.uint8),
+                      data["cache_loc"], reserved_skip_index=-1)
+    window = cfg["window"]
+    out = k1fa4_fa3(q=q8.view(tokens, hq, d), k_cache=data["k_cache"], v_cache=data["v_cache"],
+                    page_table=data["page_table"], cache_seqlens=data["cache_seqlens"],
+                    cu_seqlens_q=data["cu_seqlens_q"], max_seqlen_q=length,
+                    softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
+                    window_size=(window - 1, 0) if window else (-1, -1), scheduler_metadata=None)
+    if isinstance(out, tuple):
+        out = out[0]
+    gate = qkv[:, (hq + 2 * hkv) * d:]
+    o = k1fa4_rms_norm_gate(out.reshape(tokens, hq * d).to(torch.bfloat16), gate, None, head_dim=d,
+                            eps=K1FA4_RMS_EPS, has_norm=True)
+    return o.view(batch, length, hq * d)
+
+
+K1FA4_SELF_TEST = [  # (batch, ctx, q_len, window, seed, row0)
+    (3, 2100, 1, 2048, 101, False), (4, 6000, 8, 2048, 102, False), (2, 9000, 8, 0, 103, False),
+    (1, 3000, 1, 0, 104, False), (3, 100, 8, 0, 107, False), (1, 10, 1, 2048, 108, False),
+    (5, 3000, 1, 2048, 105, True), (2, 4000, 8, 0, 106, True),
+]
+
+
+def k1fa4_self_test(device=None, cases=None, verbose=True):
+    """Per case: rel L2 vs the FP32 reference <= 1.25 x the r1 path's + 5e-3, finite output, and the new cache bytes
+    equal to the r1 path's. Sets K1FA4_STATE["ready"]; returns it."""
+    device = device or torch.device("cuda")
+    ok_all = True
+    try:
+        for batch, ctx, length, window, seed, row0 in (cases or K1FA4_SELF_TEST):
+            ref = _k1fa4_reference(_k1fa4_case(batch, ctx, length, window, seed, row0, device))
+            d1 = _k1fa4_case(batch, ctx, length, window, seed, row0, device)
+            o1 = _k1fa4_r1_path(d1)
+            d6 = _k1fa4_case(batch, ctx, length, window, seed, row0, device)
+            o6 = k1fa4_run(d6)
+            torch.cuda.synchronize()
+            e1 = float((o1.float() - ref).norm() / ref.norm())
+            e6 = float((o6.float() - ref).norm() / ref.norm())
+            rows = d6["cache_loc"]
+            same = (torch.equal(d6["k_cache"].view(-1, 128).view(torch.uint8)[rows],
+                                d1["k_cache"].view(-1, 128).view(torch.uint8)[rows])
+                    and torch.equal(d6["v_cache"].view(-1, 128).view(torch.uint8)[rows],
+                                    d1["v_cache"].view(-1, 128).view(torch.uint8)[rows]))
+            ok = bool(torch.isfinite(o6).all()) and e6 <= 1.25 * e1 + 5e-3 and same
+            ok_all &= ok
+            if verbose:
+                print(f"[k1fa4] self-test B{batch} ctx{ctx} L{length} w{window}{' row0' if row0 else ''}: "
+                      f"{'PASS' if ok else 'FAIL'} err {e6:.4e} (r1 {e1:.4e}) cache==r1 {same}", flush=True)
+    except Exception as ex:  # noqa: BLE001
+        print(f"[k1fa4] self-test ERROR {repr(ex)[:400]}", flush=True)
+        ok_all = False
+    K1FA4_STATE["ready"] = ok_all
+    return ok_all
