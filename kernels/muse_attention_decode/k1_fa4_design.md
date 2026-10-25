@@ -105,3 +105,88 @@ For comparison, the brief's in-layer k1_v7 numbers are 185.8 / 338.2 µs.
 - IWO (FA3-order overlap) is slower than no-IWO at 1 CTA/SM. It was not re-tested with the FP8 producer.
 - The layer integration (decode_layer k3 file) needs the module inlined or imported. The submission size is
   fine (this file is about 12 KB).
+
+## 8. v2: FP8 QK + sliding-window layers (`k1_fa4v2.py`, `k1_fa4v2_route.py`; 2026-10-25)
+
+**Kernel changes vs v1.**
+- QK is an E4M3 x E4M3 wgmma. Q is r1's E4M3 query, the precision stock FA3 uses (A16), loaded by FA4's
+  pack-GQA TMA into an FP8 sQ.
+- K is gathered by FA4's `PagedKVManager` straight into the FP8 swizzled sK stages and signalled with FA4's own
+  cp.async mbarrier arrive. There is no K upcast.
+- PV is unchanged from v1: F16 with F16 P. V goes through the raw FP8 ring and the barrier-free own-bytes upcast.
+- Producer order per block: K(i) issued, then V(i-1) upcast. This serves both the no-IWO and IWO consumers.
+- Sliding layers use FA4's local mask: window_left = 2047, right = 0, causal, the same semantics as r1's FA3
+  call with window (2047, 0).
+- K/V pipeline depth is 3 on full layers and 2 on sliding layers. The compile key separates local from full, so
+  both compiled kernels coexist.
+
+**A19 packaging.**
+- The image's files are read, patched as text and loaded from a `tempfile.mkdtemp` dir under the new names
+  `k1fa4v2_*`.
+- No environment writes. The JIT cache is process-local through `cache_dir=None` in the patched interface's
+  own cache factory.
+- No existing module or sys.modules entry is touched.
+
+**Attention core** (`box_out/fa4v2_job1_core.log`; same harness as §3):
+
+| build | ver16 full | ver32 full | rel L2 vs exact FP32 |
+|---|---|---|---|
+| FA3 (stock) | 191.0 | 378.0 | 4.4e-2 / 6.8e-2 |
+| v1 (F16 QK/PV) | 153.0 | 300.6 | 1.7e-3 |
+| **v2 (FP8 QK, F16 PV), stages 2** | **132.0** | **261.8** | 2.3e-2 / 1.9e-2 (the E4M3 query) |
+| v2, stages 3 | 131.6 | 258.1 | |
+| v2 L2-resident / half context | 125.5 / 69.9 | 247.1 / 138.1 | |
+
+The targets were ≤ 140 and ≤ 280: both met. That is 1.45x FA3 and 1.15x v1 at verify32.
+
+**Full kernel_fn** (QK-norm + store + attention + gate; graph replay, cold L2; jobs 1–3, repeats agree within
+about 1 µs):
+
+| shape | r1 (stock FA3) | v1 route | v2 route | v2 vs r1 |
+|---|---|---|---|---|
+| ver1 sliding | 18.1 | — | **13.5** (auto splits) | −25% |
+| ver16 sliding | 23.9 | — | **18.0** (4 splits; auto 18.7) | −25% |
+| ver32 sliding | 29.5 | — | **22.4** (auto = 4 splits) | −24% |
+| ver1 full | 31.2 | — | 30.3 | −3% (not routed) |
+| ver16 full | 195.2 | 159.6 | **136.5–137.6** | −30% |
+| ver32 full | 383.1 | 311.1 | **263.5** (stages 3; 266.3 with 2) | −31% |
+
+- Sliding gate (≥ 15% faster than r1 at ver16 and ver32): **met**, at 21–25%.
+- IWO (FA3-order overlap) is within ±1 µs of no-IWO everywhere, so no-IWO is kept.
+- Sliding split count: 2 is too few at B16 (21.5). 8 and 16 are too many at B32 (27.6 / 33.7): combine and
+  per-CTA overhead dominate.
+
+**Self-test** (forced route, attention problem's `check_implementation`): 9/9 PASS.
+- Full: ctx 100 / 6000 edges / 80K coherent mixed / 100K.
+- Sliding: ctx 1000 (shorter than the window) / 5000 mixed / 6000 edges (keys at both window edges) / 6000 soft / 100K.
+- Errors are at the reference's own E4M3-query level, for example 0.092 against a bound of 0.150.
+- decode_layer uses the same bound constants (REL_L2_TOL 0.15, FP8_QUERY_FACTOR 2.5, floor 0.03). The layer
+  judge clone of the integration is the real check there.
+
+**What the integration should route** (`route_ok`):
+- L=8 full layers for B ≥ 16.
+- L=8 sliding layers for all B (1 / 16 / 32).
+- Page size 1 and kv_scale 1 only, with the 8:1 GQA head layout and head dim 64.
+- Splits: `num_splits_for` (FA4 heuristic x 2), except sliding B16 → 4.
+- Everything else stays on r1.
+
+**Open levers.**
+- An FP8 PV with E4M3 P (stock numerics) would remove the V upcast, at most about 30 µs at verify32. It needs a
+  Vᵀ byte transpose in the producer and a key permutation of the P fragment (the v5 trick). Not done.
+- B=1 full shows no gain with this split heuristic.
+
+**Judge clone, attention problem** (`box_out/fa4v2_judge.log`, `fa4v2_judge.json`; route file as the submission,
+lazy prepare on the first eager call):
+- **16/16 tests pass. Speedup x1.3226 [1.303, 1.342].**
+- Verify loads (routed): x1.588 / 1.523 / 1.515. Decode loads (r1 rung-1 levers only): x1.246 / 1.107 / 1.059.
+- Per shape:
+
+  | shape | stock | ours | speedup |
+  |---|---|---|---|
+  | ver1 sliding | 24.3 | 12.9 | x1.88 |
+  | ver16 sliding | 29.7 | 17.6 | x1.69 |
+  | ver32 sliding | 36.0 | 21.5 | x1.67 |
+  | ver16 full | 205.0 | 140.1 | x1.46 |
+  | ver32 full | 390.1 | 263.8 | x1.48 |
+
+- For the attention-problem submission, the route should be combined with k1_v4's decode kernels.

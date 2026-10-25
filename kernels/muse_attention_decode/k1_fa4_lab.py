@@ -176,6 +176,15 @@ say(f"BENCH empty-graph replay {floor:.2f} us (subtracted)")
 
 POOL = 16384
 _K1MOD = []
+_K2MOD = []
+
+
+def get_k2():
+    if not _K2MOD:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import k1_fa4v2
+        _K2MOD.append(k1_fa4v2)
+    return _K2MOD[0]
 
 
 def get_k1():
@@ -213,6 +222,12 @@ VARIANTS = [
     ("st3_noOL_l2", "fa4", {"tile": (64, 128), "patch": {"stages": 3}, "iwo": False, "l2": True}),
     ("p2st3_noOL", "fa4", {"tile": (64, 128), "patch": dict(P2, stages=3), "split_mul": 2, "iwo": False}),
     ("p2st3_noOL_l2", "fa4", {"tile": (64, 128), "patch": dict(P2, stages=3), "split_mul": 2, "iwo": False, "l2": True}),
+    ("k2", "k2", {}),
+    ("k2_l2", "k2", {"l2": True}),
+    ("k2_half", "k2", {"half": True}),
+    ("k2_s2x", "k2", {"split_mul": 2}),
+    ("k2_st3", "k2", {"stages": 3}),
+    ("k2_st3_l2", "k2", {"stages": 3, "l2": True}),
     ("k1_bar", "k1", {"cvt": "direct", "map": "bar"}),
     ("k1_bar_skip", "k1", {"cvt": "skip", "map": "bar"}),
     ("k1_own_skip", "k1", {"cvt": "skip", "map": "own"}),
@@ -261,6 +276,7 @@ for i in [int(x) for x in args.shapes.split(",")]:
     scale = cfg["sm_scale"] * cfg["qk_scale_factor"]
     q8 = qn.reshape(B * L, hq, 64).to(FP8)
     q16 = qn.to(torch.float16).contiguous()  # [B, L, Hq, 64]
+    q8b = qn.to(FP8).contiguous()  # [B, L, Hq, 64] E4M3 (stock query precision) for the FP8-QK build
     kc, vc = data["k_cache"], data["v_cache"]  # [P, 1, Hkv, 64] fp8
     k16, v16 = kc.to(torch.float16), vc.to(torch.float16)
     pt = data["page_table"]
@@ -286,6 +302,14 @@ for i in [int(x) for x in args.shapes.split(",")]:
                                               window_size=(-1, -1))
                 return (out[0] if isinstance(out, tuple) else out).view(B, L, hq, 64)
             return fn, None
+        if kind == "k2":
+            k2 = get_k2()
+            k2.set_stages(o.get("stages", 2))
+            ns2 = min(k2.MAX_SPLITS, k2.num_splits_for(B, hkv, mk_) * o.get("split_mul", 1))
+
+            def fn2():
+                return k2.fwd(q8b, kc, vc, ptab, sls, mk_, scale, ns2)
+            return fn2, ns2
         if kind == "k1":
             k1 = get_k1()
             k1.set_cvt(o.get("cvt", "direct"), o.get("map", "own"))
