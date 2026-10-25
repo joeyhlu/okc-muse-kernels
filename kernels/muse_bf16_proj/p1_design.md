@@ -213,6 +213,32 @@ qkv T1 at 9.0 µs is 3.15 TB/s including a 1 µs ramp, so it reaches the 3.5 TB/
 (projection, T bucket) from the lab's paste-ready `P1_GEOMETRY` / `P1_ROUTE`. Routes need ≥ 1.03× net, otherwise
 today's path is kept.
 
+### R.7 Round 3b: back to the 2b kernel, now inside `p1_module.py`
+
+**Round 3 on the box was worse:**
+- 111 registers, and `<1,2>` / `<1,0>` spilled 64 / 44 B.
+- About 15 warps per SM; the stream probe reached only 2.0–3.1 TB/s at that grid.
+- Net × fell on every shape (qkv 0.914 / 1.185 …).
+
+**Changes:**
+- The module now carries the **exact round-2b kernel**: per-k-tile decode → mma, refill after use, 8 × 4-B x loads, the
+  2b lane map, and 56 registers in 2b.
+- It keeps 2b's deterministic per-slot split-K and adds only an XOR stream probe (MODE 3).
+- The k-permuted v4 x loads are **not** kept. Their register effect was never measured apart from round 3's bundle,
+  and they would change the measured format.
+- The sweep is gone. The geometry is hard-coded from `box_out/p1_lab2b.log`:
+
+| projection | T=1 (W, S, D) | T=8 (W, S, D) |
+|---|---|---|
+| qkv | (16, 1, 1) | (4, 8, 1) |
+| o | (8, 1, 1) | (8, 1, 1) |
+| pooler | (16, 1, 1) | (16, 1, 1) |
+| unpooler | (16, 1, 1) | (16, 1, 1) |
+
+- `P1_ROUTE` = qkv T1/T8, o T1, pooler T1/T8 and unpooler T8 on P1; o T8 and unpooler T1 keep today's path.
+- **Instantiations.** The layer builds only `p1s_kernel<1,0>` (`p1_build(layer_only=True)`, i.e.
+  `-DP1_LAYER_ONLY=1`). The lab also builds `<1,1>` (BF16 control), `<1,2>` (mixed) and `<1,3>` (probe).
+
 ### R.5 Round 3 sketch (T = 16/32, not started)
 The CTA would cover 4–8 row tiles over a K chunk, with x chunks of 512 k double-buffered in smem (one barrier per chunk),
 B fragments from ldmatrix shared by all the CTA's warps, and split-K S = 2–4 via `red.global.add.v2.f32` plus last-CTA

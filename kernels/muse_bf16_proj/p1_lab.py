@@ -1,13 +1,13 @@
-# p1 lab (round 3): P12 lossless BF16 weights + p1s streaming GEMV for T <= 8 (LAB ONLY, never submit)
-"""P1 lab, round 3. The kernel, packer, verify and layer API live in kernels/muse_bf16_proj/p1_module.py (the
+# p1 lab (round 3b): P12 lossless BF16 weights + p1s streaming GEMV for T <= 8 (LAB ONLY, never submit)
+"""P1 lab, round 3b (the round-2b kernel inside p1_module.py, hard-coded 2b geometries, no sweep). The kernel, packer, verify and layer API live in kernels/muse_bf16_proj/p1_module.py (the
 integration module); this file times them. In ONE process (CUDA graph per call, 256 MB L2 flush before every replay,
 paired alternating order): pack + bit-exact verify, GEMV checks (one-hot escape columns, random x vs FP64, repeat
 bit-identical, split-K determinism stress with the FP32-atomic negative control), then per (projection, T in {1, 8}):
-today's k3_v12 path vs p1s on BF16 vs p1s packed (each swept over single-wave geometries) and the pure-LDG stream
-probe at the packed winner's grid (the ceiling). Prints the table and paste-ready P1_GEOMETRY / P1_ROUTE dicts.
+today's k3_v12 path vs p1s on BF16 vs p1s packed at P1M.P1_GEOMETRY[(proj, T)] and the pure-LDG stream probe at
+the same grid (the ceiling). Prints the table and the measured route table (net x >= 1.03 -> P1).
 
     python3 tools/box/sass_gate.py kernels/muse_bf16_proj/p1_module.py        # compile gate (the CUDA lives there)
-    python3 kernels/muse_bf16_proj/p1_lab.py 2>&1 | tee box_out/p1_lab3.log
+    python3 kernels/muse_bf16_proj/p1_lab.py 2>&1 | tee box_out/p1_lab3b.log
 """
 
 import argparse
@@ -34,10 +34,7 @@ REPS_SWEEP = 9
 REPS_FINAL = 41
 GATE = 1.15             # packed must be >= 15% faster (net of the graph replay floor) than today's path
 N_SMS = 132
-SWEEP_W = (2, 4, 6, 8, 12, 16)
-SWEEP_S = (1, 2, 3, 4, 5, 6, 7, 8)
-SWEEP_D = (1, 2, 3)
-INST = {(1, 0), (2, 0), (3, 0), (1, 1), (2, 1), (3, 1), (1, 2), (2, 2), (2, 3), (3, 3)}   # (depth, mode) built
+INST = {(1, 0), (1, 1), (1, 2), (1, 3)}   # (depth, mode) built with P1_LAYER_ONLY = 0
 
 
 def p1_build():
@@ -194,8 +191,7 @@ def geometries(P, n_rows, min_ctas=1):
         for split in (1, 2, 4, 8):
             if split * warps > P["nsb"] or nrt * split < min_ctas:
                 continue
-            for depth in (1, 2):
-                out.append((warps, split, depth))
+            out.append((warps, split, 1))
     return out
 
 
@@ -220,29 +216,6 @@ def residency(mod, P, n_rows, geo, mode=None):
     sbb = 2048 if mode == 1 else 1536
     sb_per_warp = P["nsb"] / (split * warps)
     return regs, local, occ, avg_warps, avg_warps * min(depth, sb_per_warp) * sbb, waves
-
-
-def sweep_geometries(mod, P, n_rows, limit=28):
-    """Round 3: single-wave candidates (every CTA resident at once), ranked by weight bytes in flight per SM, plus the
-    round-2b incumbent (16, 1, 2)."""
-    mode = mode_of(P, n_rows)
-    cands = []
-    for warps in SWEEP_W:
-        for split in SWEEP_S:
-            if split * warps > P["nsb"]:
-                continue
-            for depth in SWEEP_D:
-                if (depth, mode) not in INST:
-                    continue
-                regs, local, occ, wsm, infl, waves = residency(mod, P, n_rows, (warps, split, depth), mode)
-                if occ < 1 or waves > 1.0 or local > 0:
-                    continue
-                cands.append((-infl, split, (warps, split, depth)))
-    cands.sort()
-    out = [c[2] for c in cands[:limit]]
-    if (16, 1, 2) not in out and 16 * 1 <= P["nsb"]:
-        out.append((16, 1, 2))
-    return out
 
 
 def main():
@@ -310,8 +283,8 @@ def main():
     def check_geos(pk, n_rows):
         geos = geometries(pk, n_rows)
         pick = [geos[0]]
-        pick += [g for g in geos if g[1] > 1 and g[2] == 2][:1]       # split-K atomics + fixup path
-        pick += [g for g in geos if g[1] == 1 and g[2] == 2][-1:]     # deepest S = 1 path
+        pick += [g for g in geos if g[1] > 1][:1]                    # split-K slot reduction + fixup path
+        pick += [g for g in geos if g[1] == 1][-1:]                   # widest S = 1 CTA
         return list(dict.fromkeys(pick))
 
     def one_hot_cols(pk, w, n_rows, cols, mb):
@@ -379,7 +352,7 @@ def main():
             n_rows = pv["N"]
             geos = geometries(pv, n_rows)
             smax = max(g[1] for g in geos)
-            geo = [g for g in geos if g[1] == smax and g[2] == 2][0]
+            geo = [g for g in geos if g[1] == smax][0]
             x = torch.randn((8, pv["K"]), generator=gen, device=dev).to(torch.bfloat16)
             distinct = {}
             for rm in (0, 1):
@@ -448,25 +421,15 @@ def main():
             fa, label = today(name, m, x)
             ga = graph_of(fa)
             bests = {}
+            geo = P1M.P1_GEOMETRY[({"cat": "pooler"}.get(name, name), P1M.p1_bucket(m))]   # hard-coded, no sweep
             for var, pv in (("packed", P[name]), ("raw", PR[name])):
-                geos = sweep_geometries(mod, pv, n_rows, limit=12 if args.quick else 28)
-                sweep, best = [], None
-                for geo in geos:
-                    try:
-                        p1s_call(mod, pv, x, out, n_rows, ldo, geo)
-                        gb = graph_of(lambda geo=geo, pv=pv: p1s_call(mod, pv, x, out, n_rows, ldo, geo))
-                    except Exception as ex:  # noqa: BLE001
-                        print(f"[p1]   {name} M={m} {var} geo {geo}: launch failed {ex!r}", flush=True)
-                        continue
+                try:
+                    p1s_call(mod, pv, x, out, n_rows, ldo, geo)
+                    gb = graph_of(lambda pv=pv: p1s_call(mod, pv, x, out, n_rows, ldo, geo))
                     _, tb, _ = time_pair(ga, gb, flush, reps_sweep)
-                    sweep.append((tb, geo))
-                    if best is None or tb < best[0]:
-                        best = (tb, geo, gb)
-                sweep.sort()
-                print(f"[p1] {name} M={m} {var} sweep (us, (warps,split,depth)): " +
-                      ", ".join(f"{t:.1f} {g}" for t, g in sweep[:6]), flush=True)
-                if best is not None:
-                    bests[var] = best
+                    bests[var] = (tb, geo, gb)
+                except Exception as ex:  # noqa: BLE001
+                    print(f"[p1]   {name} M={m} {var} geo {geo}: launch failed {ex!r}", flush=True)
             if "packed" not in bests:
                 print(f"[p1] {name} M={m}: no packed geometry ran", flush=True)
                 continue
@@ -479,7 +442,7 @@ def main():
             mb = P[name]["bytes"] * n_rows / P[name]["N"] / 1e6
             regs, local, occ, wsm, infl, waves = residency(mod, P[name], n_rows, best[1])
             # pure-LDG stream probe at the packed winner's grid (same loads, XOR consume): the achievable ceiling
-            pgeo = (best[1][0], best[1][1], max(2, best[1][2]))
+            pgeo = best[1]
             t_p = float("nan")
             try:
                 p1s_call(mod, P[name], x, out, n_rows, ldo, pgeo, mode=3)
@@ -531,10 +494,11 @@ def main():
               f"{ratio:.3f} | {net:.3f} | {c_ratio:.3f} | {geo} | {regs} | {wsm:.1f} | {infl / 1024:.0f} | "
               f"{waves:.2f} | {mb:.1f} | {mb / max(t_b - floor_us, 1e-3):.2f} | {mb / max(t_p - floor_us, 1e-3):.2f} | "
               f"{'PASS' if g else 'fail'} |")
-    print("\n# paste into kernels/muse_bf16_proj/p1_module.py (route = net x >= "
-          f"{P1M.P1_ROUTE_MIN} vs today's path, same process)")
-    print("P1_GEOMETRY = {" + ", ".join(f"{k!r}: {v!r}" for k, v in sorted(geo_tab.items())) + "}")
-    print("P1_ROUTE = {" + ", ".join(f"{k!r}: {v!r}" for k, v in sorted(route_tab.items())) + "}")
+    print("\n# measured route (net x >= " f"{P1M.P1_ROUTE_MIN} vs today's path, same process) vs the "
+          "hard-coded P1M.P1_ROUTE (round 2b)")
+    print("P1_ROUTE_MEASURED = {" + ", ".join(f"{k!r}: {v!r}" for k, v in sorted(route_tab.items())) + "}")
+    diff = {k: v for k, v in route_tab.items() if P1M.P1_ROUTE.get((k[0], P1M.p1_bucket(k[1]))) != v}
+    print(f"[p1] route changes vs P1M.P1_ROUTE: {diff if diff else 'none'}")
     n_shapes = len(rows)
     print(f"\n[p1] GATE (bit-exact unpack on all weights; packed >= x{GATE} net vs today on qkv, o, pooler, unpooler at "
           f"T in {P1_TS}): {'PASS' if (gate_ok and ok_all and n_shapes == 2 * len(shapes)) else 'FAIL'} "

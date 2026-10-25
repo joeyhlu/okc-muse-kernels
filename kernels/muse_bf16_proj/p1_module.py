@@ -1,5 +1,6 @@
 # p1_module: P12 lossless 12-bit BF16 weights + p1s streaming GEMV for T <= 8 (integration module for decode_layer)
-"""P1 integration module (round 3). Self-contained: torch + one load_inline build; no os / sys / subprocess.
+"""P1 integration module (round 3b = the measured round-2b kernel). Self-contained: torch + one load_inline build;
+no os / sys / subprocess. Round 3's ring/2-accumulator/k-permuted kernel was slower (111 regs, spills) and is gone.
 
 Prepare time (untimed, deterministic, on the GPU):
     st = p1_prepare({"qkv": qkv_gate, "o": o, "pooler": pooler, "unpooler": unpooler})
@@ -11,21 +12,21 @@ Call time (CUDA-graph safe: no allocation when `out` is given, no host sync, bra
     p1_gemv(st, "qkv", x, out)                       # x [T, K] bf16 contiguous (T <= 8), out [T, N] bf16
     p1_gemv(st, "unpooler", x, zbuf[:T], n_rows=1024, ldo=8192)   # T <= 8 slice -> columns 0..1023 of the zero buffer
 
-Format P12 (round 3 lane map; unchanged bits): 16-row tile x 64-k super-block (SB) = 1536 B (3 x 512 B), lane L =
-(g, t) = (L >> 2, L & 3), A-fragment register o = 4 kt + i, half h:
-    row = g + 8 (i & 1),   k = 64 sb + 16 t + 4 kt + 2 (i >> 1) + h      (k-permuted inside the SB: lane t owns the 16
-    contiguous k [16 t, 16 t + 16), so its x B-fragment words are 32 contiguous bytes = 2 x ld.global.nc.v4)
+Format P12 (round-2b lane map, the mma.m16n8k16 A-fragment order): 16-row tile x 64-k super-block (SB) = 1536 B
+(3 x 512 B), lane L = (g, t) = (L >> 2, L & 3), A-fragment register o = 4 kt + i, half h:
+    row = g + 8 (i & 1),   k = 64 sb + 16 kt + 2 t + 8 (i >> 1) + h
     byte plane (chunks 0/1): byte 2 (o & 7) + h = (n & 1) << 7 | mantissa7;  code plane (chunk 2): word kt holds
     n1, n2, n3, sign of (o, h) at ((8, 9, 10, 15) + 16 h + 4 i) mod 32;  n = e - base[rt] in [0, 15]
     decode: a[o] = prmt(bw[o >> 1], 0x38383838, o odd ? 0x4342 : 0x4140) | (rotr(cw[kt], 4 i) & 0x87008700)
     (scaled bf16, exponent 0x70 | n); the tile's result x scale[rt] = 2^(base - 112), exact.
     escapes: per-row-tile list (<= 32, sorted by (sb, kt)) patched in registers; 256-row groups needing more -> RAW.
 
-Kernel p1s_kernel<D, MODE>: CTA = one 16-row tile x a K slice (grid nrt x S); W warps split the slice; per SB a lane
-issues 3 x 16-B weight loads (no L1 allocate) + 2 x 16-B x loads (L1-cached); D-stage register ring, each stage
-refilled right after its SB is decoded and BEFORE that SB's HMMA batch; 2 accumulators (k-tiles 0,2 / 1,3); W
-partials meet in 8 KB smem; S > 1: rank-ordered slot reduction by the last CTA (bit-reproducible, no spin).
-MODE 0 packed, 1 RAW (BF16 control), 2 mixed (per-CTA branch), 3 stream probe (same loads, XOR consume: the ceiling).
+Kernel p1s_kernel<1, MODE> (round 2b, 56 regs, 0 spills): CTA = one 16-row tile x a K slice (grid nrt x S); W warps
+split the slice into contiguous SB runs; per SB a lane issues 3 x 16-B weight loads (no L1 allocate) + 8 x 4-B x
+loads (L1-cached, token g < T); per k-tile decode -> mma -> escape key compare; the stage is refilled after use; W
+partials meet in 8 KB smem; S > 1: each slice stores its FP32 partial in its own slot, the last CTA (counter, no spin)
+sums the slots in rank order (bit-reproducible). MODE 0 packed (the only one the layer builds: -DP1_LAYER_ONLY=1),
+1 RAW (BF16 control), 2 mixed (per-CTA branch), 3 stream probe (MODE 0's loads, XOR consume: the ceiling).
 """
 
 import hashlib
@@ -39,15 +40,15 @@ P1_RAW_GROUP = 16       # row tiles that share a format (256 rows)
 P1_MAXT = 8             # T <= 8 (one n8 token group)
 
 # Hard-coded geometry (warps per CTA, split-K CTAs per row tile, ring depth) per (projection, T bucket), bucket 1 = T 1,
-# bucket 8 = T 2..8. Round-2b measured winners; the round-3 lab prints a replacement dict ("P1_GEOMETRY = {...}").
+# bucket 8 = T 2..8: the round-2b sweep winners (box_out/p1_lab2b.log). No runtime autotune.
 P1_GEOMETRY = {
-    ("qkv", 1): (16, 1, 2), ("qkv", 8): (16, 1, 2),
-    ("o", 1): (16, 1, 2), ("o", 8): (16, 1, 2),
-    ("pooler", 1): (16, 1, 2), ("pooler", 8): (16, 1, 2),
-    ("unpooler", 1): (16, 1, 2), ("unpooler", 8): (16, 1, 2),
+    ("qkv", 1): (16, 1, 1), ("qkv", 8): (4, 8, 1),
+    ("o", 1): (8, 1, 1), ("o", 8): (8, 1, 1),
+    ("pooler", 1): (16, 1, 1), ("pooler", 8): (16, 1, 1),
+    ("unpooler", 1): (16, 1, 1), ("unpooler", 8): (16, 1, 1),
 }
-# Route: True = P1 (measured >= 1.03x net vs today's path), False = keep today's path. Round 2b (box): qkv 1.066 /
-# 1.237, o 1.108 / 1.000, pooler 1.143 / 1.481, unpooler slice 0.856 / 1.086. The lab prints "P1_ROUTE = {...}".
+# Route: True = P1 (measured >= 1.03x net vs today's path, round 2b, same process), False = keep today's path:
+# qkv 1.066 / 1.237, o 1.108 / 1.000, pooler 1.143 / 1.481, unpooler slice 0.856 / 1.086 (T = 1 / T = 8).
 P1_ROUTE = {
     ("qkv", 1): True, ("qkv", 8): True,
     ("o", 1): True, ("o", 8): False,
@@ -79,6 +80,10 @@ P1_CUDA_SRC = r"""
 #include <stdint.h>
 #include <vector>
 
+#ifndef P1_LAYER_ONLY
+#define P1_LAYER_ONLY 0
+#endif
+
 namespace p1 {
 
 constexpr uint32_t KC4 = 0x38383838u;     // hi byte of every scaled bf16: exponent bits e4..e7 of 0x70
@@ -93,13 +98,15 @@ struct Args {
   const uint8_t* pk; const int64_t* toff; const float* scale; const int* eoff; const int2* esc; const uint8_t* fmt;
   __nv_bfloat16* out; int ldo; int N; int nsb_total;  // out [M, ldo] bf16, columns [0, N)
   float* ws; int* cnt;                                 // split > 1: FP32 workspace [9][8][N] + counters [N/16]
-  int red_mode;                                        // 0: rank-ordered slots [s][tok][N]; 1: FP32 atomics in slot 8
-};                                                     //    (order-dependent; negative control only)
+  int red_mode;                                        // 0: deterministic slots [s][tok][N], summed q = 0..S-1 by the
+                                                       //    last CTA; 1: FP32 atomics into slot 8 (round 2's
+                                                       //    order-dependent reduction, kept as a negative control)
+};
 
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int r) { return __funnelshift_r(x, x, r); }
 
-// k-tile kt of a packed SB (the lane's three 16-B chunks) -> 4 A-fragment registers (scaled bf16x2)
-__device__ __forceinline__ void dec_kt(const uint4 (&p)[3], const int kt, uint32_t* a) {
+// k-tile kt of a packed SB (the lane's three 16-B chunks) -> the 4 A-fragment registers (scaled bf16x2)
+__device__ __forceinline__ void dec_kt(const uint4 (&p)[3], const int kt, uint32_t (&a)[4]) {
   const uint4 bc = p[kt >> 1];
   const uint32_t w0 = (kt & 1) ? bc.z : bc.x;
   const uint32_t w1 = (kt & 1) ? bc.w : bc.y;
@@ -110,11 +117,10 @@ __device__ __forceinline__ void dec_kt(const uint4 (&p)[3], const int kt, uint32
   a[3] = __byte_perm(w1, KC4, 0x4342) | (rotr(cw, 12) & CMASK);
 }
 
-__device__ __forceinline__ void mma16816(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                         uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
 // weights: streamed once, keep them out of L1
@@ -124,27 +130,27 @@ __device__ __forceinline__ uint4 ldw(const uint8_t* p) {
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
   return r;
 }
-// x: re-read by every row tile on the SM, so L1-cached; volatile keeps the loads in the ring with the weights
-__device__ __forceinline__ uint4 ldx4(const uint4* p) {
-  uint4 r;
-  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+// x B-fragment words: re-read by every row tile on the SM, so L1-cached; volatile keeps them issued with the weights
+__device__ __forceinline__ uint32_t ldx(const uint32_t* p) {
+  uint32_t r;
+  asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(r) : "l"(p));
   return r;
 }
 
-// escapes: key = local SB * 4 + kt; entries sorted by key; warp-uniform loop; patches the owning lane's a[o]
+// escape patch of k-tile `key` (= local SB * 4 + kt) into a[4]; entries sorted by key; warp-uniform loop
 __device__ __forceinline__ int esc_key(uint32_t m, int sb_lo) { return ((int)(m & 0xFFFFu) - sb_lo) * 4 + (int)((m >> 23) & 3u); }
-__device__ __forceinline__ void esc_patch(uint32_t (&a)[16], int key, int sb_lo, int lane, uint32_t em, uint32_t ev,
-                                          int& cur, int end, int& nkey) {
+__device__ __forceinline__ void esc_patch4(uint32_t (&a)[4], int key, int sb_lo, int lane, uint32_t em, uint32_t ev,
+                                           int& cur, int end, int& nkey) {
   while (cur < end) {
     const uint32_t m = __shfl_sync(0xffffffffu, em, cur);
     if (esc_key(m, sb_lo) != key) break;
     const uint32_t v = __shfl_sync(0xffffffffu, ev, cur);
     if (lane == (int)((m >> 16) & 31u)) {
-      const int o = (int)((m >> 21) & 15u), h = (int)((m >> 25) & 1u);
+      const int i = (int)((m >> 21) & 3u), h = (int)((m >> 25) & 1u);
       const uint32_t sc = v & 0xFFFFu;
 #pragma unroll
-      for (int q = 0; q < 16; ++q)
-        if (q == o) a[q] = h ? ((a[q] & 0x0000FFFFu) | (sc << 16)) : ((a[q] & 0xFFFF0000u) | sc);
+      for (int q = 0; q < 4; ++q)
+        if (q == i) a[q] = h ? ((a[q] & 0x0000FFFFu) | (sc << 16)) : ((a[q] & 0xFFFF0000u) | sc);
     }
     ++cur;
   }
@@ -152,8 +158,9 @@ __device__ __forceinline__ void esc_patch(uint32_t (&a)[16], int key, int sb_lo,
   nkey = cur < end ? esc_key(mn, sb_lo) : BIG;
 }
 
-// One warp streams SBs [sb_lo, sb_lo + nsb) of row tile rt through a D-stage register ring.
-// KM 0 packed, 1 raw, 3 probe (packed bytes + x, XOR consume, no decode / mma).
+// One warp streams SBs [sb_lo, sb_lo + nsb) of row tile rt with D stages in flight, accumulating into acc (rows g, g+8;
+// tokens 2t, 2t+1). KM 0: packed P12; 1: RAW plain bf16 fragments (4 x 16 B per lane per SB, no decode, no escapes);
+// 3: stream probe (the packed loads + x loads of KM 0, consumed by XOR: no decode, no mma -> the ceiling at this grid).
 template <int D, int KM>
 __device__ __forceinline__ void stream(const Args& A, int rt, int lane, int sb_lo, int nsb, float (&acc)[4]) {
   constexpr bool RAW = KM == 1;
@@ -163,16 +170,18 @@ __device__ __forceinline__ void stream(const Args& A, int rt, int lane, int sb_l
   const int g = lane >> 2, t = lane & 3;
   const bool xon = g < A.M;
   const uint8_t* wp = A.pk + A.toff[rt] + (long long)sb_lo * SBB + lane * 16;
-  // lane (g, t) owns k in [64 sb + 16 t, 64 sb + 16 t + 16) of token g: 2 x 16 B per SB (8 uint4 per SB of x)
-  const uint4* xp = reinterpret_cast<const uint4*>(A.x + (size_t)(xon ? g : 0) * A.ldx + (size_t)sb_lo * 64 + 16 * t);
+  // word t + 4j of the SB's 32 x-words of token g = b[j]: b[2kt] = x[g][16kt + 2t ..], b[2kt+1] = x[g][16kt + 2t + 8 ..]
+  const uint32_t* xw = reinterpret_cast<const uint32_t*>(A.x + (size_t)(xon ? g : 0) * A.ldx + (size_t)sb_lo * 64 + 2 * t);
   uint4 w[D][NCH];
-  uint4 xv[D][2];
+  uint32_t b[D][8];
+  // 1. weights of the first D SBs: prepare()-time data, issued before the PDL wait
 #pragma unroll
   for (int d = 0; d < D; ++d)
     if (d < nsb) {
 #pragma unroll
       for (int c = 0; c < NCH; ++c) w[d][c] = ldw(wp + d * SBB + c * 512);
     }
+  // 2. this warp's escape entries (one per lane; the in-range ones are contiguous because the list is key-sorted)
   uint32_t em = 0u, ev = 0u;
   int cur = 32, end = 0, nkey = BIG;
   if constexpr (KM == 0) {
@@ -190,72 +199,64 @@ __device__ __forceinline__ void stream(const Args& A, int rt, int lane, int sb_l
     const uint32_t mf = __shfl_sync(0xffffffffu, em, cur & 31);
     nkey = msk ? esc_key(mf, sb_lo) : BIG;
   }
-  // PDL: x (and the output) belong to the predecessor kernel; everything above is prepare()-time data
+  // 3. PDL: x (and the output) belong to the predecessor kernel. A no-op without programmatic serialization.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #pragma unroll
   for (int d = 0; d < D; ++d)
     if (d < nsb) {
-      xv[d][0] = ldx4(xp + d * 8);
-      xv[d][1] = ldx4(xp + d * 8 + 1);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t v = ldx(xw + d * 32 + 4 * j);
+        b[d][j] = xon ? v : 0u;
+      }
     }
-  float acc1[4] = {0.f, 0.f, 0.f, 0.f};
+  // 4. rolling stream
   uint32_t px = 0u;
   for (int s0 = 0; s0 < nsb; s0 += D) {
 #pragma unroll
     for (int d = 0; d < D; ++d) {
       const int s = s0 + d;
       if (s < nsb) {
-        uint32_t a[16];
-        if constexpr (RAW) {
+        if constexpr (PROBE) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            a[4 * c] = w[d][c].x; a[4 * c + 1] = w[d][c].y; a[4 * c + 2] = w[d][c].z; a[4 * c + 3] = w[d][c].w;
-          }
-        } else if constexpr (PROBE) {
+          for (int c = 0; c < NCH; ++c) px ^= w[d][c].x ^ w[d][c].y ^ w[d][c].z ^ w[d][c].w;
 #pragma unroll
-          for (int c = 0; c < 3; ++c) px ^= w[d][c].x ^ w[d][c].y ^ w[d][c].z ^ w[d][c].w;
+          for (int j = 0; j < 8; ++j) px ^= b[d][j];
         } else {
 #pragma unroll
-          for (int kt = 0; kt < 4; ++kt) dec_kt(w[d], kt, a + 4 * kt);
+          for (int kt = 0; kt < 4; ++kt) {
+            uint32_t a[4];
+            if constexpr (RAW) {
+              a[0] = w[d][kt].x; a[1] = w[d][kt].y; a[2] = w[d][kt].z; a[3] = w[d][kt].w;
+            } else {
+              dec_kt(w[d], kt, a);
+              const int key = s * 4 + kt;
+              if (key == nkey) esc_patch4(a, key, sb_lo, lane, em, ev, cur, end, nkey);
+            }
+            mma16816(acc, a, b[d][2 * kt], b[d][2 * kt + 1]);
+          }
         }
-        uint32_t b[8] = {xv[d][0].x, xv[d][0].y, xv[d][0].z, xv[d][0].w, xv[d][1].x, xv[d][1].y, xv[d][1].z, xv[d][1].w};
-        // refill this stage with SB s + D before the HMMA batch: D SBs stay in flight
         if (s + D < nsb) {
 #pragma unroll
           for (int c = 0; c < NCH; ++c) w[d][c] = ldw(wp + (s + D) * SBB + c * 512);
-          xv[d][0] = ldx4(xp + (s + D) * 8);
-          xv[d][1] = ldx4(xp + (s + D) * 8 + 1);
-        }
-        if constexpr (PROBE) {
 #pragma unroll
-          for (int j = 0; j < 8; ++j) px ^= b[j];
-        } else {
-#pragma unroll
-          for (int j = 0; j < 8; ++j) b[j] = xon ? b[j] : 0u;
-          if constexpr (KM == 0) {
-#pragma unroll
-            for (int kt = 0; kt < 4; ++kt)
-              if (s * 4 + kt == nkey) esc_patch(a, s * 4 + kt, sb_lo, lane, em, ev, cur, end, nkey);
+          for (int j = 0; j < 8; ++j) {
+            const uint32_t v = ldx(xw + (s + D) * 32 + 4 * j);
+            b[d][j] = xon ? v : 0u;
           }
-          mma16816(acc, a[0], a[1], a[2], a[3], b[0], b[1]);
-          mma16816(acc1, a[4], a[5], a[6], a[7], b[2], b[3]);
-          mma16816(acc, a[8], a[9], a[10], a[11], b[4], b[5]);
-          mma16816(acc1, a[12], a[13], a[14], a[15], b[6], b[7]);
         }
       }
     }
   }
-#pragma unroll
-  for (int j = 0; j < 4; ++j) acc[j] += acc1[j];
   if constexpr (PROBE) acc[0] = __uint_as_float(px & 0x007FFFFFu);   // finite, deterministic, keeps the loads live
 }
 
-// D = 1: <= 64 registers (2 x 512 or 4 x 256 threads per SM); D >= 2: <= 128 (no spills; the lab sweeps W / S so the
-// grid stays resident)
+// D = 1: <= 64 registers (2 x 512 or 4 x 256 threads per SM); D = 2: <= 128 (no spills; the sweep picks W / S so the
+// grid stays resident: e.g. qkv W = 8, S = 2 -> 288 CTAs at 3 x 256 threads per SM)
 template <int D, int MODE> struct Bounds { static constexpr int minb = D == 1 ? 2 : 1; };
 
 // out[t, rt*16 + r] = scale[rt] * sum_k x[t, k] W''[rt*16 + r, k], t < M <= 8. grid = (N / 16, S), block = 32 W.
-// MODE 0: all row tiles packed; 1: all RAW; 2: mixed (CTA-uniform branch on fmt[rt]); 3: stream probe.
+// MODE 0: every row tile packed; 1: every row tile RAW; 2: mixed (CTA-uniform branch on fmt[rt]); 3: stream probe.
 template <int D, int MODE>
 __global__ void __launch_bounds__(512, Bounds<D, MODE>::minb) p1s_kernel(const __grid_constant__ Args A) {
   __shared__ float red[MAXW][128];      // [warp][row * 8 + token]
@@ -276,6 +277,7 @@ __global__ void __launch_bounds__(512, Bounds<D, MODE>::minb) p1s_kernel(const _
     if (A.fmt[rt]) stream<D, 1>(A, rt, lane, sb_lo, sb_hi - sb_lo, acc);
     else stream<D, 0>(A, rt, lane, sb_lo, sb_hi - sb_lo, acc);
   }
+  // warp partials -> smem -> one thread per (row, token)
   {
     const int g = lane >> 2, t = lane & 3;
     float* rw = red[warp];
@@ -296,16 +298,14 @@ __global__ void __launch_bounds__(512, Bounds<D, MODE>::minb) p1s_kernel(const _
     else atomicAdd(A.ws + ((size_t)64 + tok) * A.N + row, v);   // control: order-dependent FP32 sum (slot 8)
   }
   if (S == 1) return;
-  // split-K fixup: barrier, then ONE thread publishes (fence + counter); the last CTA's thread 0 fences again and
-  // its barrier orders the slot reads. Rank-ordered sum q = 0..S-1: bit-reproducible, nothing to re-zero, no spin.
+  // split-K fixup: the last CTA of this row tile sums the S slots in rank order (bit-reproducible; nothing to
+  // re-zero) and resets the counter. No spin: the other CTAs just exit.
+  __threadfence();
   __syncthreads();
-  if (tid == 0) {
-    __threadfence();
-    s_last = (atomicAdd(A.cnt + rt, 1) == S - 1);
-    if (s_last) __threadfence();
-  }
+  if (tid == 0) s_last = (atomicAdd(A.cnt + rt, 1) == S - 1);
   __syncthreads();
   if (!s_last) return;
+  __threadfence();
   if (mine) {
     float sum = 0.f;
     if (A.red_mode == 0) {
@@ -344,6 +344,7 @@ __global__ void p1_unpack_kernel(const uint8_t* __restrict__ pk, const int64_t* 
       dec_kt(q, kt, t4);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
+        // scaled exponent 0x70 | n -> original base + n
         uint32_t wv = t4[i], o = 0u;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -372,7 +373,7 @@ __global__ void p1_unpack_kernel(const uint8_t* __restrict__ pk, const int64_t* 
   for (int o = 0; o < 16; ++o) {
     const int kt = o >> 2, i = o & 3;
     const int row = rt * 16 + g + 8 * (i & 1);
-    const int k = sb * 64 + 16 * t + 4 * kt + 2 * (i >> 1);   // round-3 k-permuted lane map
+    const int k = sb * 64 + 16 * kt + 2 * t + 8 * (i >> 1);
     *reinterpret_cast<uint32_t*>(out + (size_t)row * K + k) = v[o];   // (k, k+1) = (lo, hi)
   }
 }
@@ -403,8 +404,7 @@ static std::vector<int64_t> info_t(int warps) {
 
 }  // namespace p1
 
-// instantiations: MODE 0 / 1 at D 1..3, MODE 2 at D 1..2, MODE 3 (probe) at D 2..3
-#define P1S_EACH(X) X(1, 0) X(2, 0) X(3, 0) X(1, 1) X(2, 1) X(3, 1) X(1, 2) X(2, 2) X(2, 3) X(3, 3)
+#define P1S_DISPATCH(D_, M_, CALL) if (depth == D_ && mode == M_) { CALL; }
 
 void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tensor scale, torch::Tensor eoff,
               torch::Tensor esc, torch::Tensor fmt, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t M,
@@ -421,8 +421,8 @@ void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
   TORCH_CHECK(toff.numel() >= nrt && scale.numel() >= nrt && eoff.numel() >= nrt + 1 && fmt.numel() >= nrt, "p1s: meta");
   TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.stride(1) == 1 && out.stride(0) == ldo && ldo >= N &&
               out.size(0) >= M && out.size(1) >= N, "p1s: out bf16 [M, >= N] with row stride ldo");
-  TORCH_CHECK(warps >= 1 && warps <= 16 && depth >= 1 && depth <= 3 && mode >= 0 && mode <= 3,
-              "p1s: 1 <= warps <= 16, 1 <= depth <= 3, mode in 0..3");
+  TORCH_CHECK((warps == 4 || warps == 8 || warps == 16) && depth == 1 && mode >= 0 && mode <= 3,
+              "p1s: warps in {4, 8, 16}, depth 1 (the round-2b winners), mode in 0..3");
   TORCH_CHECK(split >= 1 && split <= 8 && split * warps <= nsb,
               "p1s: 1 <= split <= 8 and every warp needs >= 1 super-block (split * warps <= K / 64)");
   TORCH_CHECK(red_mode == 0 || red_mode == 1, "p1s: red_mode 0 (deterministic) or 1 (atomic control)");
@@ -438,17 +438,23 @@ void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
   A.ws = split > 1 ? ws.data_ptr<float>() : nullptr; A.cnt = split > 1 ? cnt.data_ptr<int>() : nullptr;
   A.red_mode = (int)red_mode;
   const int w = (int)warps, S = (int)split, pd = (int)pdl;
-#define P1S_LAUNCH(D_, M_) if (depth == D_ && mode == M_) { p1::launch<D_, M_>(A, w, S, nrt, pd); return; }
-  P1S_EACH(P1S_LAUNCH)
-#undef P1S_LAUNCH
-  TORCH_CHECK(false, "p1s: no instantiation for this (depth, mode)");
+  P1S_DISPATCH(1, 0, (p1::launch<1, 0>(A, w, S, nrt, pd)); return)
+#if !P1_LAYER_ONLY
+  P1S_DISPATCH(1, 1, (p1::launch<1, 1>(A, w, S, nrt, pd)); return)
+  P1S_DISPATCH(1, 2, (p1::launch<1, 2>(A, w, S, nrt, pd)); return)
+  P1S_DISPATCH(1, 3, (p1::launch<1, 3>(A, w, S, nrt, pd)); return)
+#endif
+  TORCH_CHECK(false, "p1s: no instantiation");
 }
 
 std::vector<int64_t> p1s_info(int64_t depth, int64_t mode, int64_t warps) {
   const int w = (int)warps;
-#define P1S_INFO(D_, M_) if (depth == D_ && mode == M_) { return p1::info_t<D_, M_>(w); }
-  P1S_EACH(P1S_INFO)
-#undef P1S_INFO
+  P1S_DISPATCH(1, 0, return (p1::info_t<1, 0>(w)))
+#if !P1_LAYER_ONLY
+  P1S_DISPATCH(1, 1, return (p1::info_t<1, 1>(w)))
+  P1S_DISPATCH(1, 2, return (p1::info_t<1, 2>(w)))
+  P1S_DISPATCH(1, 3, return (p1::info_t<1, 3>(w)))
+#endif
   return {0, 0, 0};
 }
 
@@ -469,32 +475,33 @@ void p1_unpack(torch::Tensor pk, torch::Tensor toff, torch::Tensor base, torch::
 _P1_MOD = None
 
 
-def p1_build(verbose=False):
-    """Compile once per process (load_inline caches by source hash). Never called inside kernel_fn."""
+def p1_build(verbose=False, layer_only=False):
+    """Compile once per process (load_inline caches by source hash). Never called inside kernel_fn.
+    layer_only: instantiate only p1s_kernel<1, 0> (the routed path) - what the decode_layer file builds."""
     global _P1_MOD
     if _P1_MOD is not None:
         return _P1_MOD
     from torch.utils.cpp_extension import load_inline
-    tag = hashlib.sha1((P1_CPP_SRC + P1_CUDA_SRC).encode()).hexdigest()[:10]
+    flags = ["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90a,code=sm_90a",
+             f"-DP1_LAYER_ONLY={1 if layer_only else 0}"]
+    tag = hashlib.sha1((P1_CPP_SRC + P1_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
     t0 = time.time()
     _P1_MOD = load_inline(
         name=f"p1s_mod_{tag}", cpp_sources=P1_CPP_SRC, cuda_sources=P1_CUDA_SRC,
-        functions=["p1s_gemv", "p1s_info", "p1_unpack"],
-        extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90a,code=sm_90a"],
-        verbose=verbose)
+        functions=["p1s_gemv", "p1s_info", "p1_unpack"], extra_cuda_cflags=flags, verbose=verbose)
     print(f"[p1] compiled in {time.time() - t0:.1f}s", flush=True)
     return _P1_MOD
 
 
 # ================================================================================================ packer (GPU)
 def p1_lane_maps(device):
-    """(row_local, k_local) of (lane, register o, half h) inside one 16 x 64 SB (round-3 k-permuted map)."""
+    """(row_local, k_local) of (lane, register o, half h) inside one 16 x 64 SB (round-2b A-fragment map)."""
     L = torch.arange(32, device=device).view(32, 1, 1)
     o = torch.arange(16, device=device).view(1, 16, 1)
     h = torch.arange(2, device=device).view(1, 1, 2)
     g, t, kt, i = L // 4, L % 4, o // 4, o % 4
     row = (g + 8 * (i % 2) + 0 * h).expand(32, 16, 2)
-    kk = (16 * t + 4 * kt + 2 * (i // 2) + h).expand(32, 16, 2)
+    kk = (16 * kt + 2 * t + 8 * (i // 2) + h).expand(32, 16, 2)
     return row, kk
 
 
@@ -502,7 +509,7 @@ def p1_esc_columns(esc):
     """k (within the matrix) of each escape entry (int32 [E, 2] meta/vals), for the one-hot probes."""
     e = esc[:, 0].long()
     sb, L, o, h = e & 0xFFFF, (e >> 16) & 31, (e >> 21) & 15, (e >> 25) & 1
-    return 64 * sb + 16 * (L & 3) + 4 * (o >> 2) + 2 * ((o & 3) >> 1) + h
+    return 64 * sb + 16 * (o >> 2) + 2 * (L & 3) + 8 * ((o & 3) >> 1) + h
 
 
 def _wrap32(v64):
@@ -643,12 +650,12 @@ def p1_bucket(T):
     return 1 if T == 1 else 8
 
 
-def p1_prepare(weights, geometry=None, route=None, build=True):
+def p1_prepare(weights, geometry=None, route=None, build=True, layer_only=True):
     """weights: {"qkv": [2304, 8192], "o": [8192, 1024], "pooler": [4096, 8192], "unpooler": [8192, 4096]} BF16 CUDA.
     Returns the P1 state (or None if the build fails). A projection whose pack is not bit-exact is left out (its
     calls route to the caller's path). Prepare-time only: allocates, compiles, synchronizes."""
     try:
-        mod = p1_build() if build else _P1_MOD
+        mod = p1_build(layer_only=layer_only) if build else _P1_MOD
     except Exception as ex:  # noqa: BLE001
         print(f"[p1] build FAILED -> today's path everywhere: {ex!r}", flush=True)
         return None
