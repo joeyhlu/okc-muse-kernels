@@ -39,6 +39,8 @@ LABS = (0, TRACE, NULL, NULL | TRACE, CAMP, CAMP | TRACE, CAMP | NULL, CAMP | NU
 # (NC, NST, CTAs/SM, HOTCAP): vid 0 = v3.3's plan for bs 1-32; 1 = its bs128/256 cold variant (16 tokens/pass);
 # 2 = 32 tokens/pass at 2 stages (fewer re-passes of hot experts)
 VARIANTS = [(1, 3, 2, 0), (2, 3, 2, 0), (4, 2, 2, 0)]
+# variants compiled per mask (tools/box/a2_lab.py ROWS use these): NC2 / NC4 only real and null, everything else NC1
+BUILD = {lab: ((0, 1, 2) if lab in (0, NULL) else (0,)) for lab in LABS}
 SW = 18432
 SMEM_MIN = 80 * 1024   # dynamic smem floor of the instrumented copies: 3 x (80 KiB + static) > 228 KiB/SM -> 2 CTAs/SM
 HREC, ROWS = 32, 6
@@ -408,8 +410,10 @@ __global__ void a2_gtcal_kernel(long long* out, int iters) {
 """
 
 
-def lab_source(labs=LABS, variants=VARIANTS):
-    """(cuda source, cpp declarations) of the lab extension: one patched v3.3 copy per lab mask."""
+def lab_source(labs=LABS, variants=VARIANTS, build=None):
+    """(cuda source, cpp declarations) of the lab extension: one patched v3.3 copy per lab mask, each with the
+    variant ids build[mask] (default BUILD; a vid outside it fails at run time with "unknown variant")."""
+    build = BUILD if build is None else build
     src, wg = _shipped()
     for name, old, new in PATCHES:
         n = src.count(old)
@@ -424,16 +428,18 @@ def lab_source(labs=LABS, variants=VARIANTS):
     vv = [tuple(v) + (0,) * (4 - len(v)) for v in variants]
     if any(v[3] for v in vv):
         raise ValueError("a2 lab: HOTCAP variants are not instrumented")
-    cases = "\n".join("    case %d: launch3<%d, %d, %d, %d>(p, (int)G, (int)G3, (int)mask); break;" % (i, *v)
-                      for i, v in enumerate(vv))
-    attrs = "\n".join("    case %d: return attrs3<%d, %d, %d, %d>();" % (i, *v) for i, v in enumerate(vv))
-    src = src.replace("@CASES3@", cases).replace("@ATTRS3@", attrs).replace("@WGSPECS@", wg)
+    src = src.replace("@WGSPECS@", wg)
     k = src.index("namespace k3 {")
     head, body = src[:k], src[k:]
     parts = [head, GTCAL]
     for lab in labs:
+        vids = [i for i in build.get(lab, range(len(vv))) if i < len(vv)]
+        cases = "\n".join("    case %d: launch3<%d, %d, %d, %d>(p, (int)G, (int)G3, (int)mask); break;" % (i, *vv[i])
+                          for i in vids)
+        attrs = "\n".join("    case %d: return attrs3<%d, %d, %d, %d>();" % (i, *vv[i]) for i in vids)
+        copy = body.replace("@CASES3@", cases).replace("@ATTRS3@", attrs)
         parts.append(f"\nnamespace a2L{lab} {{\nconstexpr int A2_LAB = {lab};\nconstexpr int A2_SMEM_MIN = {SMEM_MIN};\n"
-                     f"{body}\n}}  // namespace a2L{lab}\n")
+                     f"{copy}\n}}  // namespace a2L{lab}\n")
     run_cases = "\n".join(f"    case {lab}: a2L{lab}::run3({RUN_NAMES}); break;" for lab in labs)
     attr_cases = "\n".join(f"    case {lab}: return a2L{lab}::attrs3v(vid);" for lab in labs)
     parts.append(
@@ -466,9 +472,15 @@ def build(labs=LABS, variants=VARIANTS, name="a2_k2a_lab", verbose=False):
     return mod, time.time() - t0
 
 
-if __name__ == "__main__":   # write the generated source for an offline compile check
+# tools/box/sass_gate.py reads module-level *_SRC literals with ast; the lab source is generated, so the gate gets it
+# through this placeholder: python3 kernels/lab/a2_k2a_lab.py box_out/a2_lab_gen.cu, then
+# python3 tools/box/sass_gate.py kernels/lab/a2_k2a_lab.py --subst '@A2_LAB_CUDA@=file:box_out/a2_lab_gen.cu'
+A2_GATE_SRC = "@A2_LAB_CUDA@"
+
+if __name__ == "__main__":   # write the generated CUDA source (+ .cpp declarations) for sass_gate / an offline nvcc
     import sys
     cu, cp = lab_source()
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "a2_k2a_lab_gen.cu")
-    out.write_text(cp + "\n// ---- cuda ----\n" + cu)
-    print(f"wrote {out} ({len(cu)} chars cuda)")
+    out.write_text(cu)
+    out.with_suffix(".cpp").write_text(cp)
+    print(f"wrote {out} ({len(cu)} chars) and {out.with_suffix('.cpp')}")
