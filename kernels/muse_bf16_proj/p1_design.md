@@ -1,0 +1,328 @@
+# P1: lossless 12-bit BF16 weights + fused decode/skinny-GEMM for the layer projections at T <= 32
+
+Status: laptop phase only. Nothing has been compiled or run on a GPU, and nothing has been submitted.
+- Lab: `kernels/muse_bf16_proj/p1_lab.py`. It runs on the pod and is never a submission.
+- CPU emulation: `scratchpad/p1/emulate.py`. This is the session scratchpad, not the repo. It needs only the standard
+  library, because the laptop has no numpy.
+
+## 0. Decision summary
+
+| item | choice / number |
+|---|---|
+| code | **P12**, fixed 12 bits per weight: an 8-bit byte plane and a 4-bit code plane, laid out in mma.m16n8k16 A-fragment order. Measured size: 0.7503–0.7509 of BF16, metadata included. |
+| window | 16 exponents per 16-row tile. Each tile picks the base that holds the most of its weights. |
+| escape rate, judge generator (`randn/sqrt(K)`) | **6.5e-5** (K = 8192), **9.8e-5** (K = 1024 and 4096) per weight. Monte Carlo and analytic agree. That is about 9 escapes per 16×8192 tile. Expected RAW tiles: about 1e-7. |
+| 11-bit variant (8-exponent window) | escapes **1.25–1.35%** of weights, about 1770 per tile. Rejected. |
+| escape mechanism | Escaped weights are coded 0. Each 16-row tile has a sorted patch list of up to 32 entries (8 B each), applied in registers before the mma: the tensor core sees the exact weight. A 256-row group whose tile exceeds 32 escapes, or has an escape that cannot be scaled exactly, is stored RAW (plain BF16). |
+| exactness | Bit-exact unpack for any input: zeros, ±0, subnormals, ±inf, NaN, outliers, heavy tails. Emulation: 0 failures; all 3 negative controls fail as they must. |
+| kernel | One launch per projection: register-direct 16-B loads, decode to bf16x2 A fragments, mma.sync m16n8k16 with x as B from shared memory (ldmatrix), FP32 accumulation. Split-K reduces through a thread-block cluster's DSMEM (no atomics, no second kernel, deterministic). Prefetch of D = 2–3 super-blocks; PDL-ready. |
+| ALU at 4.4 TB/s packed | INT pipe 27%, issue 18–24%, HMMA (T = 32) 30–40%, ldmatrix smem 40% (20% with 2 row tiles per warp). Not decode-bound on paper. |
+| T = 128 / 256 | **Stay on cuBLAS.** The skinny design is mma-issue and x-reuse limited there; a packed wgmma GEMM would be its own project. |
+| predicted layer gain (lb10 model, calibrated to the judge) | **+5.1% central, +2.5% after the R7 ×0.5 haircut** (1.612 → 1.694 / 1.652). |
+| gate risk | **o_proj is predicted to miss the 15% gate** (1.02–1.07×). It is ramp-bound: 3.05 µs of its 6.6 µs is fixed cost. See §6. |
+
+## 1. Why
+
+lb10 (`box_out/lb10_analysis.md`, column "ours" = k3_v09) gives the per-op exclusive µs below. k3_v12 runs the same projection
+path, except that it writes the T ≤ 8 unpooler into a zero buffer.
+
+| shape | qkv | o | pooler (+router) | unpooler | projections / layer |
+|---|---|---|---|---|---|
+| decode 1 (T=1) | 12.1 (R1B GEMV) | 6.7 (cuBLAS) | 18.2 (R1B + FP32 router on the side stream) | 5.8 (R1B, 1/8 slice) | 43% sliding / 40% full |
+| verify 1 (T=8) | 14.0 (cuBLAS) | 6.8 | 22.9 (cuBLAS + side router) | 8.1 (cuBLAS slice) | 34% / 31% |
+| decode 16 | 13.6 | 6.6 | 24.4 (cuBLAS "cat" [pooler; hi; lo], FP32 out) | 19.9 (cuBLAS, full) | 37% / 26% |
+| decode 32 | 13.8 | 6.8 | 24.0 ("cat") | 20.1 | 31% / 17% |
+
+These GEMVs and skinny GEMMs are weight-bandwidth bound. Their bytes are BF16 `randn/sqrt(K)`
+(`problems/muse_decode_layer/reference.py` `dense`), so the exponent carries only 2.54 bits of entropy, measured. TASK.md
+"Weights" allows "BF16 weights stay BF16, or smaller, losslessly", and "Dequantizing inside your kernels is fine".
+
+**Why the competitor's attempt failed** (research_competitors.md §b.5, bra1ndump): "Lossless BF16 compression: 41 µs vs
+19–20 µs uncompressed, abandoned." Our reading is that the decode cost more than the bytes saved. That suggests a
+variable-length or table decode, or one in a consumer that was already issue-bound (their M1 path is FMA-GEMV style).
+P12 is built around that failure:
+- fixed width, so no bit-stream state and no tables;
+- 2.75 integer ops per two weights;
+- the decoded registers are the mma A fragments themselves, so there is no BF16→FP32 conversion and no FMA per weight;
+- the tensor cores do the products at every T, including T = 1, where they sit 7/8 idle at no cost.
+
+## 2. Code format P12
+
+**Geometry.**
+- Row tile: 16 rows.
+- Super-block (SB): 16 rows × 64 k = 1024 weights = **1536 B = 3 × 512 B**. One 16-B load per lane per chunk, fully
+  coalesced (a warp instruction reads 512 contiguous bytes).
+- Lane L owns 32 weights per SB: the 16 bf16x2 A-fragment registers o = 0..15 of the four 16×16 k-tiles.
+- With g = L>>2, t = L&3, kt = o>>2, i = o&3, half h:
+  `row = g + 8(i&1)`, `k = 64·sb + 16·kt + 2t + 8(i>>1) + h`. This is the m16n8k16 A layout.
+
+**Per tile.**
+- base b = argmax over b ∈ [1, 239] of #weights with exponent e ∈ [b, b+15]. So e = 0 (zero, subnormal) and e = 255
+  (inf, NaN) always escape.
+- n = e − b ∈ [0, 15].
+
+**Planes.**
+- chunk 0/1 (byte plane): byte = `(n & 1) << 7 | mantissa7`, at byte `2(o&7)+h` of the lane's 16 B.
+- chunk 2 (code plane): 4 u32 words cw[kt]. Bits n1, n2, n3, sign of (o, h) sit at
+  `((8, 9, 10, 15) + 16h + 4i) mod 32`. The four rotations tile the 32 bits exactly; emulate.py check A.
+
+**Decode to the scaled domain** (exponent 0x70 | n, C = 112):
+
+```
+a[o] = prmt(bw[o>>1], 0x38383838, o odd ? 0x4342 : 0x4140) | (rotr(cw[kt], 4i) & 0x87008700)
+```
+
+- PRMT puts the two stored bytes in bits 0–7 and 16–23 and the constant exponent bits e4..e7 = 0111 (0x38) in each
+  high byte.
+- One rotate (none for i = 0) plus one LOP3 merge the code bits e1 e2 e3 and the sign.
+- Per 8 weights: **4 PRMT + 3 SHF + 4 LOP3** = 1.375 INT ops per weight, 0.92 per packed byte.
+
+**Exact rescale.**
+- The tile's GEMM result is multiplied by `scale[rt] = 2^(b − 112)`, one FMUL per output.
+- Multiplying every weight by the same power of two commutes with FP32 rounding, and with the tensor core's aligned
+  accumulation, unless an intermediate overflows or goes subnormal. So the result equals the GEMM on the original
+  weights.
+- Escapes are patched with W·2^(112−b). That value is checked in prepare() to be exactly representable; otherwise the
+  group goes RAW.
+- Choosing C as a multiple of 16 is what makes the exponent an OR rather than an add. It saves one op per two weights.
+
+**Unpack.** `orig = (v & 0x807F) | ((b + (e'' & 15)) << 7)`. Escapes take the raw16 field of their entry. The result is
+bit-exact by construction and verified on the GPU for every projection.
+
+**Metadata.** Per tile: `toff` (int64), `scale` (f32), `base` (i32, unpack only), `fmt` (u8), `eoff` (i32). Per escape:
+int2 `{sb | lane<<16 | o<<21 | h<<25, scaled16 | raw16<<16}`. Total size: **12.005–12.015 bits/weight**.
+
+**Why not fewer bits.**
+- 3-bit code: escapes 1.3%, so a patch path on 99.99% of SBs or RAW everywhere.
+- Entropy coding (H(e) = 2.54 → about 10.5 bits/weight) brings back the competitor's failure mode.
+- Sign and mantissa are incompressible (uniform).
+
+## 3. Escape scheme
+
+| case | handling | cost on the hot path |
+|---|---|---|
+| e outside [b, b+15] (tiny values, outliers), ±0, subnormal, ±inf, NaN (NaN stored as 0x7FC0 scaled, raw bits kept) | entry in the tile's patch list, ≤ 32 per tile (one per lane) | one compare per SB per row tile (warp-uniform). On a hit (~7% of SBs), the slow path decodes all 16 registers, the warp walks its entries with shfl, and the owning lane rewrites one bf16 half. |
+| > 32 escapes in a tile, or an escape that is not exactly scalable (e.g. 3e38 in a small-base tile) | the whole **256-row group** is stored RAW: plain BF16 in fragment order, 2048 B/SB, scale 1. The format is CTA-uniform for every geometry with ≤ 256 rows per CTA, so the branch sits outside the loop. | none (a separate instantiation of the loop) |
+
+Measured on the generator distribution (emulate.py §F, 2M samples per K; analytic in brackets):
+
+| matrix | N × K | escapes/weight | per 16-row tile | E[RAW tiles] | 11-bit escapes |
+|---|---|---|---|---|---|
+| qkv_gate | 2304×8192 | 6.5e-5 [6.9e-5] | 9.0 | 9e-8 | 1.35% |
+| o | 8192×1024 | 9.8e-5 [9.7e-5] | 1.6 | 0 | 1.23% |
+| pooler | 4096×8192 | 6.5e-5 [6.9e-5] | 9.0 | 2e-7 | 1.35% |
+| unpooler | 8192×4096 | 9.9e-5 [9.7e-5] | 6.4 | 5e-11 | 1.25% |
+| router hi (bf16(w)) | 256×8192 | 8.0e-5 | 10.5 | 4e-7 | 1.40% |
+| router lo (bf16(w − hi)) | 256×8192 | 5.5e-4 | 72 | **all 16 (RAW)** | 3.96% |
+
+The router lo plane only rides in the T ≥ 16 "cat" GEMM. It stays BF16 (4.2 MB), which costs 1 MB of savings (~0.2 µs).
+
+**Exactness evidence** (emulate.py, 0 failures, 27 s):
+- B. Full-K row tiles of every shape. Bit-exact unpack, and the GEMM view (scaled × 2^(b−112)) is value-exact.
+- C. Stress inputs:
+  - heavy tails, 1% zeros and inf/NaN/subnormal specials: all RAW, exact;
+  - the same data with an unlimited patch list: 413 patches plus 2 unscalable-RAW tiles, exact;
+  - an all-specials tile: exact.
+- D. A split-K GEMM view with S = 1/3/8 against float64: max relative error 0, and every escape applied exactly once.
+- E. Negative controls, all detected:
+  - skipping the patches: 9 mismatches;
+  - a wrong rotation for o = 6: 6572 mismatches;
+  - one flipped code bit: 1 mismatch;
+  - the 11-bit window escapes 1.34%.
+
+## 4. Kernel `p1_gemm_kernel<NT, ROWT, D, F32>` (p1_lab.py)
+
+**Mapping.**
+- `out[t, n] = Σ_k x[t,k] W[n,k]` for t < M ≤ 32. NT = ⌈M/8⌉ ∈ {1, 2, 4} n8 token groups. M ≤ 8 uses NT = 1 and
+  zero-pads the tokens.
+- Warp = ROWT ∈ {1, 2} row tiles × the CTA's K slice. CTA = 4 or 8 warps = 64–256 rows.
+- grid = (row groups, S), with **cluster (1, S, 1)**, S ∈ {1, 2, 4, 8}. Uneven K slices are allowed.
+
+**Phases.**
+1. **Prologue.** Issue the first D super-blocks: 3 × LDG.128 per row tile, or 4 for RAW. Load the warp's in-slice
+   escape entries: one per lane, then ballot, ffs and clz.
+2. `griddepcontrol.wait`. Everything before it reads prepare()-time data only, so under PDL the weight stream starts
+   inside the predecessor's tail. Without PDL it is a no-op.
+3. Stage x[0:8·NT, k-slice] in shared memory, zero rows ≥ M. Use a 16-B row pad for conflict-free ldmatrix.
+   `__syncthreads`.
+4. **Loop over SBs.** Unrolled by D; each stage is refilled right after its use. Fast path per k-tile:
+   - B fragments: NT = 1 takes one ldmatrix.x4 per two k-tiles; NT ≥ 2 takes one ldmatrix.x4 per pair of token groups;
+   - per row tile: `dec_kt` (4 PRMT, 3 SHF, 4 LOP3), then NT × mma.m16n8k16.bf16 with FP32 accumulation.
+   If any row tile of the warp has its next escape in this SB, the slow path runs: decode 16, patch, mma.
+5. **Epilogue.**
+   - × scale[rt], fragments → smem [8NT][rows] FP32, `cluster.sync()`;
+   - rank r sums its rows/S share over the S ranks in fixed order (DSMEM `map_shared_rank`) and stores BF16 (or FP32
+     for "cat");
+   - `cluster.sync()`. There are no global atomics, no workspace, no counters and no second kernel (lessons §6:
+     a 2nd kernel costs +5.4 µs).
+   - R9: the only waits are hardware barriers (`__syncthreads`, `barrier.cluster`, `griddepcontrol`). No spin loops,
+     so no flag and no `__trap`.
+
+**Bytes in flight.**
+- 8 warps × 2 CTAs × ROWT=1 × ~2.5 SB × 1.5 KB ≈ **60 KB/SM** (NT ≤ 2). With 1 CTA/SM × 8 warps × ROWT=2, also ~60 KB.
+- Both exceed the 32 KiB/SM that plain LDG.128 needs for 4.3–4.5 TB/s (lessons §5).
+- Weights never touch shared memory.
+
+**Registers (estimate).**
+- NT=1/ROWT=1/D=3 ≈ 80, giving 2–3 CTAs/SM.
+- NT=4/ROWT=2/D=3 ≈ 150, so `__launch_bounds__(256, 1)` is chosen by `Occ<>`. The compile gate reports the real counts
+  and spills.
+
+**Geometry is not hard-coded.** The lab sweeps (warps ∈ {4, 8}, ROWT ∈ {1, 2}, S ∈ {1, 2, 4, 8}, D ∈ {2, 3}) per
+(projection, T), subject to smem ≤ 227 KB and 48–4096 CTAs, and prints the top 6.
+
+**Call sites** (k3_v12 `kernel_fn`):
+
+| projection | today | packed path |
+|---|---|---|
+| qkv | T=1 R1B, else cuBLAS | p1 for T ≤ 32 |
+| o | cuBLAS | p1 for T ≤ 32 (only if it passes) |
+| pooler, T ≤ 8 | R1B / cuBLAS, with the FP32 router (`f32`) kept on the side stream | p1 on the first 4096 rows of the packed **cat** matrix |
+| pooler, T = 16/32 | cuBLAS cat | p1 on all 4608 cat rows, FP32 out into v8_tail as today |
+| unpooler, T ≤ 8 | R1B / cuBLAS slice | p1 on the first 1024 rows, written into `v12_zbuf` with ldo = 8192 |
+| unpooler, T = 16/32 | cuBLAS | p1 on the full matrix |
+
+At T > 32 everything stays as today. The raw BF16 weights stay resident for those paths, which is allowed: the packed copy
+is an extra lossless representation.
+
+## 5. ALU budget (per byte, at the power-cap clock of 1.755 GHz, 132 SMs)
+
+- 4.4 TB/s of packed bytes = **19.0 B/clk/SM** = 12.7 weights/clk/SM = 0.0124 SB/clk/SM.
+- INT (PRMT/SHF/LOP3, 64 lanes/clk/SM, measured 63.2): 44 warp-ops per SB → **17.4 lane-ops/clk/SM = 27%**. The budget
+  is 3.4 INT ops per packed byte; P12 uses 0.92.
+- Issue: 59 warp-instructions per SB at NT=1 (44 INT + 3 LDG + 4 HMMA + 2 LDSM + ~6 loop/branch), 77 at NT=4 →
+  0.73–0.95 of 4 warp-instructions/clk/SM = **18–24%**.
+- HMMA at T = 32: 16 per SB → 0.20/clk/SM, against the measured mma.sync rate of 0.5–0.67 (lessons §7) → 30–40%.
+- ldmatrix at NT=4 with ROWT=1: 4 KB per SB → 51 of 128 B/clk/SM = 40%. ROWT=2 halves it.
+
+For comparison, the NVFP4 stream (lessons §6) hit 3.0–3.4 TB/s at 1 INT op per weight once it had too few warps. That
+failure was occupancy, not ALU. Here the decode is 1.4 INT ops per weight at less than half that weight rate. **The risk
+is latency hiding, not decode.** That is why the lab separates "the same kernel on BF16" from "packed".
+
+## 6. Per-shape model (µs, nsys-exclusive kernel time as in lb10)
+
+**Model.**
+- BF16 formula = 3.05 + MB/4.74 (lessons §6). It includes the concurrent 8.4 MB FP32 router for the pooler at T ≤ 8.
+- packed central = 3.05 + 0.30 (cluster epilogue, x stage) + MB_packed/(4.74 × 0.92 decode interference)
+  + 0.1·T/8 (x stage).
+- haircut = today − 0.5 × (today − central) (R7).
+- "p1 on BF16" is the same kernel on RAW tiles: it isolates the structural gain.
+
+| proj | T | today | BF16 formula | p1 on BF16 | packed ideal | **packed central** | **haircut** | central × | haircut × | compression alone × |
+|---|---|---|---|---|---|---|---|---|---|---|
+| qkv | 1 | 12.1 | 11.0 | 11.3 | 9.0 | **9.9** | 11.0 | 1.22 | 1.10 | 1.15 |
+| qkv | 8 | 14.1 | 11.0 | 11.4 | 9.0 | **9.9** | 12.0 | 1.42 | 1.17 | 1.15 |
+| qkv | 16 | 13.6 | 11.0 | 11.5 | 9.0 | **10.0** | 11.8 | 1.35 | 1.15 | 1.15 |
+| qkv | 32 | 13.9 | 11.0 | 11.7 | 9.0 | **10.2** | 12.1 | 1.36 | 1.15 | 1.14 |
+| o | 1 | 6.7 | 6.6 | 6.9 | 5.7 | **6.2** | 6.5 | 1.07 | 1.03 | 1.10 |
+| o | 8 | 6.8 | 6.6 | 7.0 | 5.7 | **6.3** | 6.6 | 1.07 | 1.04 | 1.10 |
+| o | 16 | 6.6 | 6.6 | 7.1 | 5.7 | **6.4** | 6.5 | 1.03 | 1.01 | 1.10 |
+| o | 32 | 6.8 | 6.6 | 7.3 | 5.7 | **6.6** | 6.7 | 1.02 | 1.01 | 1.10 |
+| pooler (+router) | 1 | 18.4 | 19.0 | 19.3 | 15.4 | **16.7** | 17.5 | 1.10 | 1.05 | 1.16 |
+| pooler (+router) | 8 | 22.8 | 19.0 | 19.4 | 15.4 | **16.8** | 19.8 | 1.36 | 1.15 | 1.16 |
+| pooler cat | 16 | 24.2 | 19.0 | 19.5 | 15.2 | **16.8** | 20.5 | 1.45 | 1.18 | 1.16 |
+| pooler cat | 32 | 24.1 | 19.0 | 19.7 | 15.2 | **17.0** | 20.5 | 1.42 | 1.17 | 1.16 |
+| unpooler slice | 1 | 5.8 | 4.8 | 5.1 | 4.4 | **4.8** | 5.3 | 1.21 | 1.09 | 1.07 |
+| unpooler slice | 8 | 8.1 | 4.8 | 5.2 | 4.4 | **4.9** | 6.5 | 1.64 | 1.24 | 1.07 |
+| unpooler | 16 | 19.9 | 17.2 | 17.7 | 13.7 | **15.1** | 17.5 | 1.32 | 1.14 | 1.17 |
+| unpooler | 32 | 20.3 | 17.2 | 17.9 | 13.7 | **15.3** | 17.8 | 1.33 | 1.14 | 1.17 |
+
+**Layer** (lb10 judge-calibrated groups, gains × cal, verify 16/32 unchanged): 1.6123 → **1.694 central (+5.1%)** /
+**1.652 haircut (+2.5%)**. By projection (central): qkv +1.4%, pooler +2.1%, unpooler +1.3%, o +0.1%.
+
+**What the table says.**
+- About half the gain at T = 8–32 comes from the kernel structure beating cuBLAS: the "p1 on BF16" column, 1.12–1.54×.
+- Compression adds a uniform **1.14–1.17×** on the large matrices.
+- At T = 1, R1B is already at the formula, so compression must carry the whole gain: qkv 1.22, pooler 1.10 in-layer.
+- o_proj is ramp-bound. −25% of 16.8 MB is at most −0.9 µs of 6.6, so it cannot reach 1.15 without PDL overlap of its
+  3 µs fixed cost (§7 lever 1).
+- The lab measures the pooler alone, without the side-stream router. Standalone T = 1 central is about 1.15–1.20.
+
+## 7. Pod lab plan (one burst, ~10 min of GPU)
+
+```
+tools/box/box.sh sync
+tools/box/box.sh run   'python3 tools/box/sass_gate.py kernels/muse_bf16_proj/p1_lab.py --json box_out/p1_gate.json 2>&1 | tee box_out/p1_gate.log'
+tools/box/box.sh timed 'python3 kernels/muse_bf16_proj/p1_lab.py 2>&1 | tee box_out/p1_lab.log'
+tools/box/box.sh pull
+```
+
+1. **Compile gate** (no GPU time). Expect PASS: 20 instantiations, no wgmma, 0 spills. Read the registers per
+   instantiation. If the `minb = 2` variants spill, lower `Occ<>::regs`' threshold. If the source fails to compile, fix it
+   from nvcc.log; the source has never seen nvcc.
+2. **Lab, in one process.**
+   - Build: about 2–4 min, plus about 1 min for R1B.
+   - Weights from `reference.generate_weights(5353)`, falling back to the same recipe.
+   - **PACK + VERIFY** on qkv, o, cat [pooler; hi; lo], unpooler, plus two stress matrices. Unpack mismatches must be 0;
+     the negative control without patches must show > 0. The RAW-BF16 packs are checked too.
+   - **GEMM CHECKS**:
+     - a one-hot probe through every escape column and 64 random ones, at M = 32 and 8. Outputs must equal the weights
+       bit for bit; tensor-core subnormal flushes are counted apart;
+     - random x at M ∈ {1, 2, 5, 8, 9, 16, 24, 32} over every geometry, against FP64 (BF16 out < 4e-3, FP32 out < 2e-5),
+       with repeat calls bit-identical;
+     - M = 33 must be refused.
+   - **TIMING** per (projection, T ∈ {1, 8, 16, 32}):
+     - today's k3_v12 path (R1B GEMV at T = 1, cuBLAS via SGLang's dispatch, the cat FP32 GEMM at T ≥ 16, the slice into
+       zbuf at T ≤ 8);
+     - a sweep of packed geometries and of "p1 on BF16" geometries;
+     - the best of each re-timed with 41 paired reps;
+     - CUDA graph per call, 256 MB flush before every replay, alternating order, median of paired ratios;
+     - "net" ratios subtract the measured one-kernel replay floor.
+   - **PDL**: producer `x.copy_` → p1, with and without programmatic serialization, at T = 1 and 32.
+   - **SUMMARY** table and the GATE line.
+3. **Gate for the pod phase** (as briefed): bit-exact unpack on all weights, **and** packed ≥ 1.15× net vs today on
+   pooler, unpooler, qkv and o_proj at T ≤ 32, in the same process.
+   - Expected outcome: qkv, pooler, unpooler PASS on central numbers (borderline on the haircut); **o_proj FAILS**.
+   - Recommended reading if o fails alone: keep o on cuBLAS. That costs 0.1% of layer and does not block integration.
+     Or retry o with PDL from K1, its predecessor, which is our own kernel and can trigger early.
+4. **Kill.** Decode-bound below 10% gain at T = 1 after one optimization round, i.e. "compression alone" (packed vs p1 on
+   BF16, same process) < 1.10 on qkv and pooler at T = 1 after round 2 → drop P12.
+   - If "p1 on BF16" itself beats today at T ≥ 8, keep that kernel as the uncompressed skinny GEMM: it is worth about
+     half the predicted gain by itself.
+   - Round-2 levers, in order:
+     1. PDL with an early trigger in the producers we own (K1 → o, K2A → unpooler);
+     2. D = 4 / ROWT = 2 at T = 1;
+     3. x staged in halves at T = 32;
+     4. `ld.global.nc.L1::no_allocate` / L2 256B prefetch hints;
+     5. 2 row tiles per warp sharing B at NT = 4.
+
+## 8. After the gate: integration (k3_v13, not started)
+
+- Generator `tools/gen_k3_v13.py` (the gen_k3_v1x pattern): add P1_CUDA_SRC to the combined build, with **only the
+  winning instantiations** (about 6). The prepare budget is 300 s, and K2A/K1 already compile there; record the measured
+  p1 compile time first.
+- prepare():
+  - `pack_p12` on qkv, o, the cat matrix and the unpooler (GPU, under 1 s each);
+  - bit-exact unpack check;
+  - one-hot probe of the escape columns;
+  - a random-x check per routed (projection, T bucket).
+  Any failure → the incumbent path for that projection (print one `[p1]` line).
+- kernel_fn: route by `_k2a_bucket_of(tokens)` ≤ 32 (shape-only branches; no syncs, no allocation by value).
+- The judge's held-out weights are repacked by the same data-adaptive packer. Correctness never depends on the escape
+  count: a heavy-tailed or sparse checkpoint degrades to RAW groups, at BF16 speed with the same kernel.
+- Layer A/B with `tools/box/layer_ab2.py`, k3_v13 vs k3_v12, judge clone, paired. Ship bar as usual (+3% box).
+
+## 9. Risks and open questions
+
+1. **Never compiled.** No nvcc on the laptop and no stub compile (no clang either). Main suspects:
+   - `cudaLaunchKernelEx` with cluster + PDL attributes inside graph capture;
+   - `__grid_constant__` together with `cg::this_cluster()` in a non-cluster launch (S = 1);
+   - template-dependent `__launch_bounds__`.
+   The compile gate exists for this.
+2. **Cluster scheduling.** 8-CTA clusters at 1 CTA/SM need 8 free SMs in one GPC. If occupancy drops, the sweep shows it.
+   S ∈ {1, 2, 4} avoids the problem; the atomics fallback is not implemented.
+3. **x staging at T = 32**: 32 × K-slice × 2 B per CTA from L2 before the first mma. Modelled at +0.4 µs; could be +1 µs.
+   Lever: smaller slices or a two-phase stage.
+4. **Pooler at T ≤ 8 in the layer**: the FP32 router (8.4 MB) shares bandwidth on the side stream. The lab measures the
+   pooler alone, so only the k3_v13 A/B shows the joint effect. The router could be packed too (FP32 with a 4-bit
+   exponent offset = 28 bits, −12.5% of 8.4 MB ≈ 0.2 µs). Not worth it now.
+5. **Tensor-core subnormal handling.** If mma flushes bf16 subnormal inputs, a packed or RAW subnormal weight
+   contributes 0, exactly as it would through cuBLAS on raw BF16. Exactness of the storage is unaffected. The lab counts
+   these flushes.
+6. **Rules reading** (conservative, A-list candidate): the packed copy is lossless and verified bit-exact in prepare();
+   escape weights reach the tensor core as their exact value × 2^j; the output scale is an exact power of two. No
+   precision change. Packing in prepare() is allowed ("Repack them in prepare()").
+7. **PDL in the real layer** depends on the predecessor. SGLang's JIT boundaries do not trigger early, so the gain there
+   is only launch-gap overlap. K1 and K2A are ours and can call `griddepcontrol.launch_dependents`.
+8. **Prepare compile time** with 20 instantiations is probably 2–4 min. That is fine for the lab; the layer must instantiate
+   only the winners.
