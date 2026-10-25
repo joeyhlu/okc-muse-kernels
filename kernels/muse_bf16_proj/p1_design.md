@@ -42,9 +42,19 @@ PDL changed nothing (0.99–1.02×), because a torch copy kernel as producer giv
   its own contiguous run of super-blocks.
 - **S = 1 wherever there are at least 144 row tiles** (qkv, o, pooler). Then nothing crosses CTAs: the CTA's W partials
   meet in 4·W·128 B of shared memory, behind one `__syncthreads`, and are stored as BF16 straight away.
-- S ∈ {2, 4, 8} only for the 64-tile unpooler slice. There each CTA adds its 16×T partial into a self-cleaning FP32
-  workspace with `red.global.add.f32`. The last CTA of the row tile (one counter `atomicAdd`, no spinning) converts to
-  BF16, re-zeroes the workspace and resets the counter. This is the R1B fixup pattern; R9 holds, since nothing waits.
+- S ∈ {2, 4, 8} only for the 64-tile unpooler slice. There each CTA plain-stores its 16×T FP32 partial into its own
+  slot `ws[s][tok][N]`. The last CTA of the row tile (one counter `atomicAdd`, no spinning) sums the slots in rank
+  order q = 0..S−1, stores BF16 and resets the counter. It is bit-reproducible and there is nothing to re-zero. This is
+  the R1B fixup pattern; R9 holds, since nothing waits.
+- **Round-2b fix (pod run 2).** The first version added the partials with FP32 `atomicAdd`. The lab's repeat check failed
+  at M ≥ 2 for split 4/8, on packed and on raw.
+  - S = 2 is order-free (0 + a + b = 0 + b + a), but at S ≥ 3 the arrival order changes the FP32 sum. emulate.py §H
+    measures 68% of outputs at S = 4 and 94% at S = 8.
+  - That crosses a BF16 rounding boundary about 2e-4 of the time at S = 8: about 3.7 flips per qkv M=8 call pair, and
+    0.5 at M=1. That is why only M ≥ 2 failed.
+  - The S = 1 path never had shared-memory reuse or a race.
+  - The atomic version survives as `red_mode = 1`, the negative control of the lab's determinism stress: 8 repeats at
+    the largest split, M = 8. Rank-ordered must give 1 distinct result; atomics are expected to give more than 1.
 
 **Streaming.**
 - Per super-block, a lane issues 3 × `ld.global.nc.L1::no_allocate.v4` (48 B of packed weights). It also issues the

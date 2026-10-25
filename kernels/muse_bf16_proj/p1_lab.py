@@ -27,9 +27,11 @@ Kernel p1s_kernel<D, MODE> (T <= 8): CTA = one 16-row tile x a K slice (grid nrt
 into contiguous SB runs; per SB a lane issues 3 x ld.global.nc.L1::no_allocate.v4 (weights) + 8 x 4-B ld.global.nc
 (its x B-fragment words, L1-cached, token g < T); D stages in flight per warp, each refilled right after use; per
 k-tile: decode (4 PRMT + 3 SHF + 4 LOP3) -> mma.m16n8k16 (FP32 accumulate) -> per-k-tile escape key compare.
-Epilogue: the W warp partials meet in 8 KB of smem (one barrier) -> x scale -> BF16 store (S = 1), or FP32
-red.global.add into a self-cleaning workspace + last-CTA fixup (S > 1; counter, no spin). No smem x stage, no cluster,
-no wgmma/TMA. MODE 0 = all tiles packed, 1 = all RAW (the uncompressed control), 2 = mixed (branch per CTA).
+Epilogue: the W warp partials meet in 8 KB of smem (one barrier) -> x scale -> BF16 store (S = 1), or each slice
+stores its FP32 partial to its own slot [s][tok][N] and the last CTA (counter, no spin) sums the slots in rank order
+q = 0..S-1 (S > 1; bit-reproducible). Round 2 used FP32 atomics there, which are order-dependent for S >= 3 and failed
+the repeat check at M >= 2; they survive only as red_mode = 1, the negative control of the determinism stress.
+No smem x stage, no cluster, no wgmma/TMA. MODE 0 = all tiles packed, 1 = all RAW (the uncompressed control), 2 = mixed.
 """
 
 import argparse
@@ -63,7 +65,8 @@ P1_CPP_SRC = r"""
 #include <vector>
 void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tensor scale, torch::Tensor eoff,
               torch::Tensor esc, torch::Tensor fmt, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t M,
-              int64_t N, int64_t K, int64_t ldo, int64_t warps, int64_t split, int64_t depth, int64_t mode, int64_t pdl);
+              int64_t N, int64_t K, int64_t ldo, int64_t warps, int64_t split, int64_t depth, int64_t mode, int64_t pdl,
+              int64_t red_mode);
 std::vector<int64_t> p1s_info(int64_t depth, int64_t mode, int64_t warps);
 void p1_unpack(torch::Tensor pk, torch::Tensor toff, torch::Tensor base, torch::Tensor fmt, torch::Tensor eoff,
                torch::Tensor esc, torch::Tensor out, int64_t N, int64_t K, int64_t use_esc);
@@ -91,7 +94,10 @@ struct Args {
   const __nv_bfloat16* x; int M; int ldx;             // x [M, K] bf16 row-major, 1 <= M <= 8
   const uint8_t* pk; const int64_t* toff; const float* scale; const int* eoff; const int2* esc; const uint8_t* fmt;
   __nv_bfloat16* out; int ldo; int N; int nsb_total;  // out [M, ldo] bf16, columns [0, N)
-  float* ws; int* cnt;                                 // split > 1: FP32 workspace [8][N] + counters [N/16], self-cleaning
+  float* ws; int* cnt;                                 // split > 1: FP32 workspace [9][8][N] + counters [N/16]
+  int red_mode;                                        // 0: deterministic slots [s][tok][N], summed q = 0..S-1 by the
+                                                       //    last CTA; 1: FP32 atomics into slot 8 (round 2's
+                                                       //    order-dependent reduction, kept as a negative control)
 };
 
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int r) { return __funnelshift_r(x, x, r); }
@@ -271,10 +277,12 @@ __global__ void __launch_bounds__(512, Bounds<D, MODE>::minb) p1s_kernel(const _
     for (int q = 0; q < nw; ++q) v += red[q][(tid & 15) * 8 + tok];
     v *= A.scale[rt];
     if (S == 1) A.out[(size_t)tok * A.ldo + row] = __float2bfloat16_rn(v);
-    else atomicAdd(A.ws + (size_t)tok * A.N + row, v);       // RED.E.ADD.F32 (result unused)
+    else if (A.red_mode == 0) __stcg(A.ws + ((size_t)sidx * 8 + tok) * A.N + row, v);   // this slice's slot
+    else atomicAdd(A.ws + ((size_t)64 + tok) * A.N + row, v);   // control: order-dependent FP32 sum (slot 8)
   }
   if (S == 1) return;
-  // split-K fixup: the last CTA of this row tile converts the FP32 sums, re-zeroes them and resets the counter
+  // split-K fixup: the last CTA of this row tile sums the S slots in rank order (bit-reproducible; nothing to
+  // re-zero) and resets the counter. No spin: the other CTAs just exit.
   __threadfence();
   __syncthreads();
   if (tid == 0) s_last = (atomicAdd(A.cnt + rt, 1) == S - 1);
@@ -282,9 +290,15 @@ __global__ void __launch_bounds__(512, Bounds<D, MODE>::minb) p1s_kernel(const _
   if (!s_last) return;
   __threadfence();
   if (mine) {
-    float* p = A.ws + (size_t)tok * A.N + row;
-    A.out[(size_t)tok * A.ldo + row] = __float2bfloat16_rn(__ldcg(p));
-    *p = 0.f;
+    float sum = 0.f;
+    if (A.red_mode == 0) {
+      for (int q = 0; q < S; ++q) sum += __ldcg(A.ws + ((size_t)q * 8 + tok) * A.N + row);
+    } else {
+      float* p = A.ws + ((size_t)64 + tok) * A.N + row;
+      sum = __ldcg(p);
+      *p = 0.f;                                                 // the atomic slot must start at zero next call
+    }
+    A.out[(size_t)tok * A.ldo + row] = __float2bfloat16_rn(sum);
   }
   if (tid == 0) A.cnt[rt] = 0;
 }
@@ -377,7 +391,8 @@ static std::vector<int64_t> info_t(int warps) {
 
 void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tensor scale, torch::Tensor eoff,
               torch::Tensor esc, torch::Tensor fmt, torch::Tensor out, torch::Tensor ws, torch::Tensor cnt, int64_t M,
-              int64_t N, int64_t K, int64_t ldo, int64_t warps, int64_t split, int64_t depth, int64_t mode, int64_t pdl) {
+              int64_t N, int64_t K, int64_t ldo, int64_t warps, int64_t split, int64_t depth, int64_t mode, int64_t pdl,
+              int64_t red_mode) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.is_contiguous(), "p1s: x bf16 contiguous");
   TORCH_CHECK(M >= 1 && M <= 8 && x.size(0) == M && x.size(1) == K, "p1s: 1 <= M <= 8 and x [M, K]");
   TORCH_CHECK(K % 64 == 0 && N % 16 == 0 && N >= 16, "p1s: K % 64, N % 16");
@@ -391,10 +406,12 @@ void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
               out.size(0) >= M && out.size(1) >= N, "p1s: out bf16 [M, >= N] with row stride ldo");
   TORCH_CHECK((warps == 4 || warps == 8 || warps == 16) && (depth == 1 || depth == 2) && mode >= 0 && mode <= 2,
               "p1s: warps in {4, 8, 16}, depth in {1, 2}, mode in {0, 1, 2}");
-  TORCH_CHECK(split >= 1 && split * warps <= nsb, "p1s: every warp needs >= 1 super-block (split * warps <= K / 64)");
+  TORCH_CHECK(split >= 1 && split <= 8 && split * warps <= nsb,
+              "p1s: 1 <= split <= 8 and every warp needs >= 1 super-block (split * warps <= K / 64)");
+  TORCH_CHECK(red_mode == 0 || red_mode == 1, "p1s: red_mode 0 (deterministic) or 1 (atomic control)");
   if (split > 1)
-    TORCH_CHECK(ws.scalar_type() == at::kFloat && ws.numel() >= 8 * N && cnt.scalar_type() == at::kInt &&
-                cnt.numel() >= nrt, "p1s: split-K workspace [8 * N] fp32 + counters [N / 16] int32 (zeroed)");
+    TORCH_CHECK(ws.scalar_type() == at::kFloat && ws.numel() >= 72 * N && cnt.scalar_type() == at::kInt &&
+                cnt.numel() >= nrt, "p1s: split-K workspace [9 * 8 * N] fp32 (slot 8 zeroed) + counters [N / 16] int32 (zeroed)");
   const c10::cuda::OptionalCUDAGuard guard(x.device());
   p1::Args A;
   A.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()); A.M = (int)M; A.ldx = (int)K;
@@ -402,6 +419,7 @@ void p1s_gemv(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
   A.eoff = eoff.data_ptr<int>(); A.esc = reinterpret_cast<const int2*>(esc.data_ptr<int>()); A.fmt = fmt.data_ptr<uint8_t>();
   A.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr()); A.ldo = (int)ldo; A.N = (int)N; A.nsb_total = nsb;
   A.ws = split > 1 ? ws.data_ptr<float>() : nullptr; A.cnt = split > 1 ? cnt.data_ptr<int>() : nullptr;
+  A.red_mode = (int)red_mode;
   const int w = (int)warps, S = (int)split, pd = (int)pdl;
   P1S_DISPATCH(1, 0, (p1::launch<1, 0>(A, w, S, nrt, pd)); return)
   P1S_DISPATCH(2, 0, (p1::launch<2, 0>(A, w, S, nrt, pd)); return)
@@ -555,7 +573,7 @@ def pack_p12(w, esc_max=P1_ESC_MAX, raw_group=P1_RAW_GROUP, name="w"):
         buf[toff_c[r]:toff_c[r] + src.numel()] = src
     n_esc_all = int(idx.shape[0])
     st = {"name": name, "N": N, "K": K, "nrt": nrt, "nsb": nsb, "buf": buf, "toff": toff, "scale": scale, "fmt": fmt,
-          "fmt_cpu": raw_c, "ws": torch.zeros(8 * N, dtype=torch.float32, device=dev),
+          "fmt_cpu": raw_c, "ws": torch.zeros(72 * N, dtype=torch.float32, device=dev),
           "cnt": torch.zeros(nrt, dtype=torch.int32, device=dev),
           "eoff": eoff, "esc": esc, "base": base_f.contiguous(), "bytes": total + nrt * 17 + 8 * int(keep.sum()),
           "n_esc": int(keep.sum()), "n_esc_all": n_esc_all, "n_raw_tiles": int(raw_tile.sum()),
@@ -717,10 +735,10 @@ def mode_of(P, n_rows):
     return 1 if all(f) else (0 if not any(f) else 2)
 
 
-def p1s_call(mod, P, x, out, n_rows, ldo, geo, pdl=0):
+def p1s_call(mod, P, x, out, n_rows, ldo, geo, pdl=0, red_mode=0):
     warps, split, depth = geo
     mod.p1s_gemv(x, P["buf"], P["toff"], P["scale"], P["eoff"], P["esc"], P["fmt"], out, P["ws"], P["cnt"],
-                 x.shape[0], n_rows, P["K"], ldo, warps, split, depth, mode_of(P, n_rows), pdl)
+                 x.shape[0], n_rows, P["K"], ldo, warps, split, depth, mode_of(P, n_rows), pdl, red_mode)
     return out
 
 
@@ -881,6 +899,36 @@ def main():
                     print(f"[p1] gemv {name} {var} M={m}: {len(errs)} geometries, worst rel-L2 vs fp64 {worst[0]:.2e} "
                           f"(tol 4e-3) at {worst[2]}, repeat bit-identical {all(er[1] for er in errs)} -> "
                           f"{'ok' if good else 'FAIL'}", flush=True)
+    # determinism stress (round 2 failed "repeat bit-identical" for M >= 2 at split 4/8: the FP32 atomic split-K sum
+    # is order-dependent once S >= 3). Largest split, M = 8, 8 repeats: red_mode 0 (rank-ordered slots) must give ONE
+    # result; red_mode 1 (round 2's atomics) is the negative control and is expected to give several.
+    for name in ("qkv", "cat", "unpooler", "o"):
+        for var, pv in (("packed", P[name]), ("raw", PR[name])):
+            n_rows = pv["N"]
+            geos = geometries(pv, n_rows)
+            smax = max(g[1] for g in geos)
+            geo = [g for g in geos if g[1] == smax and g[2] == 2][0]
+            x = torch.randn((8, pv["K"]), generator=gen, device=dev).to(torch.bfloat16)
+            distinct = {}
+            for rm in (0, 1):
+                res = []
+                for _ in range(8):
+                    out = torch.empty((8, n_rows), dtype=torch.bfloat16, device=dev)
+                    p1s_call(mod, pv, x, out, n_rows, n_rows, geo, red_mode=rm)
+                    res.append(out)
+                torch.cuda.synchronize()
+                uniq = []
+                for r_ in res:
+                    if not any(torch.equal(r_, u) for u in uniq):
+                        uniq.append(r_)
+                distinct[rm] = len(uniq)
+                if rm == 1:
+                    agree = float((res[0].float() - res[1].float()).abs().max())
+            good = distinct[0] == 1
+            gemm_ok &= good
+            print(f"[p1] determinism {name} {var} {geo} M=8 x8: rank-ordered split-K {distinct[0]} distinct result(s) "
+                  f"(must be 1) -> {'ok' if good else 'FAIL'} | negative control, FP32 atomics: {distinct[1]} distinct "
+                  f"(expected > 1; max |diff| {agree:.1e})", flush=True)
     try:
         x9 = torch.randn((9, 8192), device=dev).to(torch.bfloat16)
         p1s_call(mod, P["qkv"], x9, torch.empty((9, 2304), dtype=torch.bfloat16, device=dev), 2304, 2304, (8, 1, 2))
