@@ -392,3 +392,77 @@ P1 + P4 + P5 fit one pod burst (one build, ~10 min of runs).
 - Per R7, team predictions have run 2–3× optimistic.
 - The remaining gap is spread out (MoE ~60%, attention ~25%, projections/glue ~15%; top teams also pack BF16
   projections losslessly), and no single route closes it.
+
+## 9. P1 gate: built and laptop-checked (2026-10-25)
+
+**Files.** Both are new; the shipped path (k2a_v37.py, k3_*) is untouched:
+- `kernels/lab/hot_p1_lab.py` (generator);
+- `tools/box/hot_p1.py` (driver).
+
+**The lab copy.** The lab is v3.7's CUDA source read via ast and patched at 30 region-checked anchors.
+- Each patch must match exactly once, or the generator raises.
+- It is emitted in 4 namespace copies, one per compile-time consumer mask: 0, hot-MMA-off, hot-dequant-off, null.
+- The masks sit behind `if constexpr`, so the wgmma path never gets a runtime branch (C75xx).
+- Producer and launch bits are runtime:
+  - hot-X off, cold-X off;
+  - re-pass weights off;
+  - K2 skips griddepcontrol.wait (the fusion ceiling);
+  - P0 skipped.
+- Each K1/K2 CTA records clock64/%globaltimer marks: chip work = Σ busy / G, per-role spans, and MHz per CTA and
+  per SM.
+- No new wait loop (R9): hp_null uses the bounded mbar_wait.
+
+**Laptop checks only — nothing has been compiled.**
+- Generation works, every anchor is unique, braces balance, and all placeholders are filled.
+- Every patched function was reviewed in the generated source.
+- `decide()` was exercised on synthetic summaries for both readings.
+- No `-std` flag is added (the CFLAGS are the shipped ones).
+
+**Rows.**
+- T=256 (vid 2) and T=128 (vid 5), against `base` = copy 0, which must match `ship` (the k2a_v37 module, k3_v18 plan):
+  `nop0` (T=256), `xhot`, `xall`, `rpw`, `mmaoff`, `deqoff`, `null`, `nullx`, `nullxr`, `nowait`.
+- bs 1/8/16/32: `base` / `nowait` on vid 0.
+
+**Correction to §3.** vid 2's cold role is NC2 (16 tokens per pass). At T=256 the cold experts (≤ 16 tokens) take one
+pass each. The re-reads are hot-only: 57 MB (the 122- and 83-token experts), not the 3 cold re-passes §3 counted. The
+script's model column uses the corrected count.
+
+**Command** (one burst; ~3–5 min cold build + ~6–8 min run; use `--routings=2` if the 1200 s budget is tight):
+
+    bash tools/box/burst.sh 'python3 tools/box/hot_p1.py run 2>&1 | tee box_out/hot_p1.log' 1200
+
+Output: `box_out/hot_p1.log` and `box_out/hot_p1/summary.json`. `python3 tools/box/hot_p1.py decide
+box_out/hot_p1/summary.json` re-prints the split and the decision without a GPU.
+
+**Decision rule** (printed as DECISION; medians over 3 layer routings). d = total µs/call vs base; dW = chip-work µs vs
+base.
+
+0. **Validity.** Every one of these must hold, or the run is LAB INVALID and gives no decision:
+   - base within 3% of ship (except bs16/32, where ship runs vid 3);
+   - base output within 2e-3 of ship and 1e-2 of the FP32 reference;
+   - no timeout flag on ship or base;
+   - lab grids equal the shipped grids.
+1. **Measured value of H** (only its byte levers are credited; the consumer rewrite gets nothing):
+   - H_est256 = −(0.5·dW_X + dW_R) − d_P0 − 9, with dW_X = dW(xhot) − dW(nop0), dW_R = dW(rpw), d_P0 = d(nop0);
+   - H_est128 = −(0.5·dW_X + 0.5·dW_M + dW_R) − 9, where dW_M = dW(mmaoff): HK3's mma.sync hot math, half of it
+     credited to wgmma.
+   - The 0.5 is R = 256's halving of X; the 9 µs is H's own structure (§4.1).
+2. **GREEN → write P2:** H_est256 ≥ 32 µs/call (the study's planning number). T=128 joins H only if H_est128 ≥ 15.
+3. **AMBER → P2 with only its MMA-efficiency gate:** H_est256 < 32 but dW(mmaoff) at T=256 ≤ −30 µs. The bytes fall
+   short, but the hot consumer itself holds the time; H is then a consumer rewrite with the K2b v2/v3 risk.
+4. **KILL:** anything else. The MoE structure route closes for the kernel track.
+
+**Readings printed beside the decision.**
+
+| reading | rule |
+|---|---|
+| mechanism | ingest-bound if dW_X ≤ −40 and dW_M > −20; MMA-bound if dW_X > −20 and dW_M ≤ −40; else mixed |
+| small-T fusion (F) | design it only if the mean d(nowait) at bs 1/8/16 ≤ −6 µs; else F is closed |
+| clock (P5) | hot (wgmma) vs cold (mma.sync) CTA MHz, plus cold CTAs on SMs with vs without a hot CTA; a difference ≥ ~80 MHz means a per-SM clock (reopens wgmma for cold work); else chip-wide is confirmed |
+
+Model expectations at seed-like routing:
+
+| T | hot X | dW_X if ingest-bound (0 if X is free) | re-pass bytes | dW_R |
+|---|---|---|---|---|
+| 256 | 289 MB | −72 | 57 MB | −13 |
+| 128 | 119 MB | −30 | 28 MB | −6 |
