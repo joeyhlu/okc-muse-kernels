@@ -190,3 +190,55 @@ lazy prepare on the first eager call):
   | ver32 full | 390.1 | 263.8 | x1.48 |
 
 - For the attention-problem submission, the route should be combined with k1_v4's decode kernels.
+
+## 9. v4: FP8 PV with E4M3 P (`k1_fa4v4.py`, `k1_fa4v4_route.py`; 2026-10-25)
+
+**Kernel.** v2 with the PV wgmma in E4M3 x E4M3 with both operands K-major.
+- **P.** Converted with `cvt.rn.satfinite.e4m3x2.f32` straight from the S accumulator, with a static register
+  selection.
+- **Key permutation.** Inside each 32-key block, virtual key 16 kh + 4 q + i ↔ actual key 16 kh + 2 q + (0, 1, 8, 9)[i].
+  This makes the C-layout values the thread already holds a valid FP8 A fragment, so no shuffles are needed.
+- **V.** Stored transposed (Vt[d][key], 128B swizzle, FP8), built by the producer:
+  - Each thread gathers its own key quad: 4 x 16 B cp.async into a private raw slot, with page indices prefetched
+    one tile ahead.
+  - 4 LDS.128, then a per-lane byte rotation and a 4x4 PRMT transpose, then 16 STS.32. There are no barriers.
+- **Lane mapping.** 4 lanes per 64 B key row, so DRAM requests are full rows. The warp's key quads differ in bits
+  0, 1 and 4 of the quad index, and the stored dim is rotated by the lane's chunk. Together these make the
+  swizzled stores bank-conflict free.
+
+The intermediate builds show what mattered (ver32 full core, µs):
+
+| build | ver32 full core | L2-resident |
+|---|---|---|
+| 16 B per lane, one warp per 16 B chunk | 396 | — |
+| page-index prefetch added | 396 | 255 |
+| lane pairs per 32 B sector | 273.5 | 233 |
+| **full 64 B rows, conflict-free stores (shipped)** | **245.0** | 230 |
+
+**Measurements** (`box_out/fa4v4_job5_*.log`, `fa4v4_job6_*.log`; same process as v2):
+
+| shape | v2 | v4 (raw ring 2) | v4 vs v2 |
+|---|---|---|---|
+| ver16 full, core | 132.4 | **125.1** (126.1) | −5.5% |
+| ver32 full, core | 260.5 | **245.0** (244.6) | −5.9% |
+| ver16 full, kernel_fn | 137.0 / 136.2 | **129.5 / 129.6** | −5.2% |
+| ver32 full, kernel_fn | 262.4 / 262.5 | **251.7 / 249.0** | −4.1% / −5.1% |
+| ver1 sliding | 13.55 / 13.47 | 13.58 / 13.47 | 0 |
+| ver16 sliding | 18.00 / 18.02 | 17.68 / 17.66 | −2% |
+| ver32 sliding | 22.46 / 22.27 | 22.10 / 22.14 | −1% |
+
+- The raw ring at depth 3 (V transposed two tiles behind the gather) is the same on full layers (250.7; 247.4
+  with K/V depth 4) and worse on sliding (19.2 / 23.6), so depth 2 is the default.
+- **Numerics.** Rel L2 vs exact FP32 is 4.7e-2 / 6.7e-2. Stock FA3 is 4.4e-2 / 6.8e-2 and v2 2.3e-2 / 1.9e-2: the
+  E4M3 P puts v4 at stock's level.
+- **Self-test.** 9/9 PASS with raw 3 (job 6) and with raw 2 on the earlier loop form (job 5). Every timed variant,
+  including the raw-2 build of the final code, passed `check_implementation` on the scored shapes.
+
+**Gate** (≥ 5% at ver32 full vs v2, sliding not slower): **met on the attention core** (−5.9%). It sits **at the
+line on the full kernel_fn** (−4.1% / −5.1% in two runs). Sliding is 0 to −2%. The targets ≤ 240 / ≤ 125 were
+missed by 5 µs and 0.1 µs.
+
+**Route recommendation.** v4 is a drop-in replacement for v2 on the same routes: L=8 full at B ≥ 16, L=8 sliding at
+all B, sliding B16 at 4 splits. It is never slower, about 12 µs faster per ver32 full call, and has stock numerics.
+Adopt it if the in-layer A/B (`tools/box/layer_ab2.py`, v2 vs v4) shows ≥ +0.3% per layer. Otherwise keep v2, which
+has 3x lower attention error.

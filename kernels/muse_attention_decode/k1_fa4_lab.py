@@ -177,6 +177,15 @@ say(f"BENCH empty-graph replay {floor:.2f} us (subtracted)")
 POOL = 16384
 _K1MOD = []
 _K2MOD = []
+_K4MOD = []
+
+
+def get_k4():
+    if not _K4MOD:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import k1_fa4v4
+        _K4MOD.append(k1_fa4v4)
+    return _K4MOD[0]
 
 
 def get_k2():
@@ -222,6 +231,9 @@ VARIANTS = [
     ("st3_noOL_l2", "fa4", {"tile": (64, 128), "patch": {"stages": 3}, "iwo": False, "l2": True}),
     ("p2st3_noOL", "fa4", {"tile": (64, 128), "patch": dict(P2, stages=3), "split_mul": 2, "iwo": False}),
     ("p2st3_noOL_l2", "fa4", {"tile": (64, 128), "patch": dict(P2, stages=3), "split_mul": 2, "iwo": False, "l2": True}),
+    ("k4", "k4", {}),
+    ("k4_l2", "k4", {"l2": True}),
+    ("k4_st4", "k4", {"stages": 4}),
     ("k2", "k2", {}),
     ("k2_l2", "k2", {"l2": True}),
     ("k2_half", "k2", {"half": True}),
@@ -302,6 +314,14 @@ for i in [int(x) for x in args.shapes.split(",")]:
                                               window_size=(-1, -1))
                 return (out[0] if isinstance(out, tuple) else out).view(B, L, hq, 64)
             return fn, None
+        if kind == "k4":
+            k4 = get_k4()
+            k4.set_stages(o.get("stages", 3), "full")
+            ns4 = min(k4.MAX_SPLITS, k4.num_splits_for(B, hkv, mk_) * o.get("split_mul", 1))
+
+            def fn4():
+                return k4.fwd(q8b, kc, vc, ptab, sls, mk_, scale, ns4)
+            return fn4, ns4
         if kind == "k2":
             k2 = get_k2()
             k2.set_stages(o.get("stages", 2))
