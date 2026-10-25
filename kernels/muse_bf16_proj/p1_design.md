@@ -163,6 +163,56 @@ tools/box/box.sh pull
   - High in-flight with low TB/s means the decode, mma or issue path, so compare against p1s on BF16.
   - Low in-flight means a different geometry (W, S) or D = 2.
 
+### R.6 Round 3 (kernel in `p1_module.py`; the lab imports it)
+
+**Round 2b measured** (net × vs today):
+
+| shape | T=1 | T=8 |
+|---|---|---|
+| qkv | 1.066 | 1.237 |
+| o | 1.108 | 1.000 |
+| pooler | 1.143 | 1.481 |
+| unpooler slice | 0.856 | 1.086 |
+
+Achieved only 1.0–3.1 TB/s, with waves 0.24–0.97 and 12–52 KB/SM in flight; every sweep picked S=1 / 16 warps. The cause
+is register-limited residency: at about 70 registers, any candidate with more CTAs than 132 × (CTAs/SM) ran a second wave.
+
+**Changes:**
+1. **Single-wave sweep.** W ∈ {2, 4, 6, 8, 12, 16}, S ∈ 1..8, D ∈ 1..3. A candidate is kept only if every CTA is resident
+   at once (from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`) with 0 local bytes. Candidates are ranked by weight
+   bytes in flight per SM; the round-2b incumbent is always kept.
+2. **Ring refill before the HMMA batch.** Decode the SB → copy its x words → reload the stage with SB s + D → escape
+   patch → 4 HMMA. D SBs stay in flight continuously instead of D − 1 while the HMMA chain runs.
+3. **Two accumulators** (k-tiles 0, 2 / 1, 3), so a chain is 2 dependent HMMAs, not 4.
+4. **k-permuted lane map**, the only layout change. Lane t owns the 16 contiguous k `[64 sb + 16 t, +16)`, with
+   `k = 64 sb + 16 t + 4 kt + 2 (i >> 1) + h`. Its x B-fragment is then 2 × `ld.global.nc.v4`, replacing 8 × 4-B loads.
+   The mma contraction is unchanged because the same slot→k map is used on A and B (emulate.py check A).
+5. **Stream probe** (MODE 3): the same loads at the same grid with an XOR consume, timed next to every packed winner.
+   It gives the ceiling per shape. The scout note asks for ≥ 4.2 TB/s on the big shapes.
+6. **Cheaper fixup.** Barrier, then one thread fences and increments the counter (CUTLASS-semaphore order). The
+   rank-ordered slot sum is unchanged.
+7. **10 instantiations:** MODE 0/1 at D 1–3, MODE 2 at D 1–2, MODE 3 at D 2–3.
+
+**Predicted net µs** (central; the floor is round 2b's measured number). The table header gives the coordinator's target.
+
+| shape | 2b measured | round 3 central | × vs today | probe ceiling |
+|---|---|---|---|---|
+| qkv T1 | 11.8 | 9.0 | 1.40 | 7.5 |
+| qkv T8 | 13.2 | 9.4 | 1.74 | – |
+| o T1 | 6.4 | 5.0 | 1.43 | 4.3 |
+| o T8 | 7.2 | 5.3 | 1.36 | – |
+| pooler T1 | 16.5 | 14.0 | 1.35 | 12.5 |
+| pooler T8 | 17.1 | 14.5 | 1.75 | – |
+| slice T1 (needs S 4–8) | 5.9 | 3.8 | 1.32 | 2.8 |
+| slice T8 | 6.6 | 4.0 | 1.78 | – |
+
+qkv T1 at 9.0 µs is 3.15 TB/s including a 1 µs ramp, so it reaches the 3.5 TB/s target only if the ramp falls to about
+0.5 µs. Pooler T1 at 14.0 µs is 3.6 TB/s.
+
+**Layer integration.** Use `p1_prepare` / `p1_route` / `p1_gemv` from `p1_module.py`. Geometry is hard-coded per
+(projection, T bucket) from the lab's paste-ready `P1_GEOMETRY` / `P1_ROUTE`. Routes need ≥ 1.03× net, otherwise
+today's path is kept.
+
 ### R.5 Round 3 sketch (T = 16/32, not started)
 The CTA would cover 4–8 row tiles over a K chunk, with x chunks of 512 k double-buffered in smem (one barrier per chunk),
 B fragments from ldmatrix shared by all the CTA's warps, and split-K S = 2–4 via `red.global.add.v2.f32` plus last-CTA
