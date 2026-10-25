@@ -242,3 +242,59 @@ missed by 5 µs and 0.1 µs.
 all B, sliding B16 at 4 splits. It is never slower, about 12 µs faster per ver32 full call, and has stock numerics.
 Adopt it if the in-layer A/B (`tools/box/layer_ab2.py`, v2 vs v4) shows ≥ +0.3% per layer. Otherwise keep v2, which
 has 3x lower attention error.
+
+## 10. v5: fused prologue + FA4 v2 core + fused combine/norm-gate, PDL-chained (`k1_fa4v5.py`, `k1_fa4v5_route.py`)
+
+Each call is three launches instead of the v2 route's five:
+
+1. **Prologue (Triton).** SGLang FusedQKNorm's arithmetic, verbatim, writing the E4M3 q and storing the FP8 K/V
+   straight into `cache_loc`. Unlike SGLang it also stores cache row 0; the judge's inputs can use that row, which
+   is why r1 stages. It calls `gdc_wait` and `gdc_launch_dependents`.
+2. **FA4 v2 core.** Unchanged kernel code, launched with `use_pdl`. The producer runs `griddepcontrol.wait`
+   before its first read. The dependents are triggered after the consumer main loop (`epi`); triggering at the
+   producer start was 1–1.5 µs slower on sliding decode. The interface returns the split partials.
+3. **Combine + RMS-norm + sigmoid gate (Triton, PDL secondary).** One program per (token, head) loads all splits
+   as one [S, 64] tile. A serial loop over splits was slower than FA4's combine at B=1 (S=32).
+   - Splits: FA4 heuristic x2; B=1 sliding uses 32.
+
+**Correctness** (13 checks + the timed scored shapes): all PASS.
+- The attention problem's check passes.
+- The stock-relative rule holds: v5's error is ≤ 1.25x r1's error + 5e-3. The errors are equal to r1's within
+  ±2%, because both use the E4M3 query.
+- New cache bytes are bit-exact with r1, including a case whose new token lives in cache row 0. K1 v4's stored
+  bytes differ from r1's (K1 v4 rounds differently), so v5 matches r1, not v4.
+
+**Full kernel_fn** (µs, same process, graph replay, cold L2; `box_out/fa4v5_job4.log`, 50 reps; job 3 agrees within
+about 0.3 µs):
+
+| shape | r1 | K1 v4 | v2 route / FA4+r1 I/O | **v5** | v5 vs incumbent |
+|---|---|---|---|---|---|
+| dec1 sliding | 17.41 | 12.67 | 12.35 | **8.16** | −35.6% vs v4 |
+| dec16 sliding | 21.70 | 15.65 | 15.92 | **12.48** | **−20.3%** vs v4 |
+| dec32 sliding | 25.70 | 19.09 | 19.23 | **16.16** | **−15.3%** vs v4 |
+| dec1 full | 28.03 | 24.11 | 27.42 | **15.71** | −34.8% vs v4 |
+| dec16 full | 196.30 | **105.54** | 134.96 | 132.24 | +25% (keep v4) |
+| dec32 full | 377.60 | **199.39** | 258.37 | 253.70 | +27% (keep v4) |
+| ver1 sliding | 17.70 | — | 13.49 | **9.89** | −3.6 µs vs v2 |
+| ver16 sliding | 23.71 | — | 17.98 | **16.40** | −1.6 µs |
+| ver32 sliding | 29.28 | — | 22.27 | **20.58** | −1.7 µs |
+| ver1 full | 31.28 | — | 30.42 (r1 is routed) | **19.41** | −11.9 µs vs r1 |
+| ver16 full | 194.98 | — | 137.15 | **133.68** | −3.5 µs |
+| ver32 full | 382.96 | — | 261.86 | **260.98** | −0.9 µs (−1.8 without trigger) |
+
+- **Gate** (≥ 12% on dec16 and dec32 sliding vs K1 v4): **met**, at 20.3% and 15.3%.
+- **Targets:** dec1 ≤ 10.5 met (8.2); dec16 ≤ 13.0 met (12.5); dec32 ≤ 16.0 missed by 0.16 µs.
+- **≥ 2 µs per L=8 call:** met at ver1 sliding, ver1 full and ver16 full; not at ver16 / ver32 sliding (1.6–1.7) or
+  ver32 full (0.9–1.8).
+
+**Routes for k3_v15:**
+- v5 replaces K1 v4 on decode sliding (L=1, all B) and on decode full at B=1.
+- v5 replaces the v2 route on verify sliding (L=8, all B) and verify full B≥16, and r1 on verify full B=1.
+- K1 v4 stays on decode full B16/32.
+
+**Judge clone, attention problem** (`box_out/fa4v5_judge.log/.json`; `k1_fa4v5_route.py` as the submission; lazy
+`prepare()` passed; decode full B16/32 fall back to r1):
+- **16/16 tests pass. Speedup x1.7198 [1.694, 1.746].** Earlier routes: v2 x1.3226; the judge best is k1_v4 at 1.414.
+- Per load: decode x2.76 / 1.24 / 1.14, verify x2.58 / 1.64 / 1.57.
+- An attention-problem submission should also route decode full B16/32 to K1 v4. Those two shapes run at
+  x1.03 / 1.02 on r1 here.
