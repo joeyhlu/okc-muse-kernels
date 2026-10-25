@@ -272,3 +272,44 @@ python tools/serverless/sls.py run 'python3 tools/box/sass_gate.py kernels/muse_
 - **Lever 3 lab.** Add `fmode`-style probes to `hc_item` (math off / no mma / no decode / B from registers / K1 hot X
   copies off) and run v36_all and r12 at bs16/32. That finds what makes a 4-chunk hot stage cost 3.25×. Hot-stage X
   (16.5 KB per stage from L2, i.e. candidate a) is one of the probes.
+
+## 8. Build status (2026-10-25 evening): built, NOT yet compiled or measured
+
+The two serverless attempts on account A (jobs `7f026d42…-u2` and `49cd53a5…-u1`) were both cancelled after 20 min
+`IN_QUEUE` because no H200 capacity was free. The endpoint was paused after each attempt (workersMax 0, 0 workers).
+Nothing ran, so there is no measured number for v3.8 yet.
+
+Built on the laptop and ready for one job:
+
+| file | what it is | checked locally |
+|---|---|---|
+| `tools/gen_k2a_v38.py` → `kernels/muse_moe_w4a16/k2a_v38.py` | k2a_v37 plus B1 (own and assist L2 prefetch before `griddepcontrol.wait`, vid 0 and vid 3 K2), B2 (`my_range2t` tilt in `gemm` and `ranges36`/`segs36c`), B3 (`S.gs` for vid 0's cold flush), B4 (K2 `route` returns before the scatter). 20 anchored patches; switches in probe bits 8..28 through `v38_call` / `v38_code`; all 0 = v3.7's arithmetic | Python parses; `sass_gate --list-src` extracts `KERNEL_SRC_V3`; tilt coverage emulation: 68,768 configs (S ≤ 40,000, n ∈ {1 … 264}, a 0..31), 0 failures, a = 0 equals `my_range2`, non-monotone control caught. **Not compiled: there is no nvcc on this PC** |
+| `tools/box/k38_bench.py` | check (k2a_v38 self-test cases ≤ 48 plus 1 layer and 1 moe routing per bs, two calls, `==ship` marks bit-identical rows) and run (12 rows; per-bs gate and kill as in §5) | parses |
+| `tools/box/a2_lab.py` | J1 rows `base_k1`, `f6`, `f6T`, `f6_k1`, `f7`. h / cnt / cnt2 are re-zeroed after the timing-only probes | selftest PASS |
+
+B5 (dual epilogue warps) is not built yet: it changes the thread count and launch config of the vid 0 kernels.
+
+Rerun, the whole batch as one job, ~15–20 min of GPU (order: v3.8 gate, check, bench, then J1):
+
+```
+python tools/serverless/endpoint_ctl.py up a
+timeout 1800 python tools/serverless/sls.py run 'mkdir -p box_out/k38_gate; python3 tools/box/sass_gate.py kernels/muse_moe_w4a16/k2a_v38.py --src KERNEL_SRC_V3 --subst "@CASES3@=call:_gate_cases" "@ATTRS3@=call:_gate_attrs" "@WGSPECS@=call:_wg_specs" --allow C7519 --json box_out/k38_gate/gate.json > box_out/k38_gate.log 2>&1; grep -E "^\[|ptxas|RESULT|error" box_out/k38_gate.log | head -80; python3 tools/box/k38_bench.py check --bs=1,8,16,32 > box_out/k38_check.log 2>&1; grep -E "regs|WARNING|CHECK|Error|error" box_out/k38_check.log | tail -40; python3 tools/box/k38_bench.py run --bs=1,8,16,32 --routings=2 --rounds=20 > box_out/k38_run.log 2>&1; grep -E "^SUMMARY|^  bs=|^GATE|^BEST|TIMEOUT|correctness|Error" box_out/k38_run.log; python3 tools/box/a2_lab.py run --bs=1,8,16,32 --src=layer --routings=2 --rounds=20 --traces=1 --soak=0 --save-traces=none --rows=ship,base,baseT,base_k1,f6,f6T,f6_k1,f7 > box_out/a2b_lab.log 2>&1; grep -A20 "^WASTE" box_out/a2b_lab.log' --timeout 1500
+python tools/serverless/endpoint_ctl.py down a
+```
+
+Readings:
+- **Gate.** Register counts must equal v3.7's (`box_out/k37_gate4.log`), or stay ≤ 96 for HK2 K2, with 0 spills and no C75xx.
+- **Check.** Rows with only B1, B3 or B4 must print `==ship`. Tilt rows must stay within tolerance.
+- **Bench.** The `GATE <row>` lines carry the §5 gate.
+- **J1.** f6 / f7 against base give the v3.9 decision.
+
+**k3_v20 integration (only after the bench passes).** Follow the `tools/gen_k3_v17.py` pattern:
+- `K2A33_KERNEL_SRC` becomes k2a_v38's `KERNEL_SRC_V3` byte for byte. Vids are unchanged, so `K2A33_VARIANTS` and
+  the gate cases are too.
+- Add a `K2A38_PLAN = {rep: (P, H, a2, a1, b3, b4)}` from the bench's best layer row per bucket. Buckets 1/8 go to
+  vid 0 and 16/32 to vid 3; bucket 128 stays on v3.7's vid 5.
+- `_v11_k2a33_call` and `_k2a36_call` OR `_k2a38_code(K2A38_PLAN[rep])` into their `probe` argument, read at call
+  time behind `K2A38_ENABLE`.
+- A prepare self-test per bucket: the bucket's k2a_v38 cases, two calls each, with the plan's bits on. A failure
+  clears that bucket's entry, which falls back to the v3.7 code path.
+- Then `layer_ab2` k38_all ≥ ×1.004 and the judge clone.
