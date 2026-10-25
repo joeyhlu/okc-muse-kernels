@@ -1,0 +1,71 @@
+okc run 33f4094c012744e1 on muse_moe_w4a16
+submission  <home>/Documents/development/okc-muse/kernels/muse_moe_w4a16/k2a_v3.py
+status      ok
+passed      true
+speedup     1.754559468541348
+speedup_ci  [1.7282410765132277 1.780877860569468]
+score_us    7664.886965148239
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               80.00      39.07   2.048x      11.42  
+bs=16 load=decode 16 sharding=ep8                            187.12     104.89   1.784x      52.52  
+bs=32 load=decode 32 sharding=ep8                            203.89     141.39   1.442x      70.76  
+bs=8 load=verify 1 sharding=ep8                              150.53      81.41   1.849x      37.32  
+bs=128 load=verify 16 sharding=ep8                           457.22     258.06   1.772x     101.34  
+bs=256 load=verify 32 sharding=ep8                           626.75     370.71   1.691x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<1, 4>(k3::Params)                              26.2 µs  38.8%      1
+void k3::k2_kernel<1, 4>(k3::Params)                              24.2 µs  35.7%      1
+k3::k3_kernel(k3::Params)                                         17.2 µs  25.5%      1
+total                                                             67.6 µs
+GPU busy (kernels overlap: PDL or streams)                        43.5 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<1, 4>(k3::Params)                              62.5 µs  40.9%      1
+void k3::k2_kernel<1, 4>(k3::Params)                              52.6 µs  34.4%      1
+k3::k3_kernel(k3::Params)                                         37.8 µs  24.7%      1
+total                                                            152.8 µs
+GPU busy (kernels overlap: PDL or streams)                       100.2 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<1, 4>(k3::Params)                             106.0 µs  43.8%      1
+void k3::k2_kernel<1, 4>(k3::Params)                              81.2 µs  33.5%      1
+k3::k3_kernel(k3::Params)                                         55.2 µs  22.8%      1
+total                                                            242.4 µs
+GPU busy (kernels overlap: PDL or streams)                       161.2 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<1, 4>(k3::Params)                              38.2 µs  40.5%      1
+void k3::k2_kernel<1, 4>(k3::Params)                              32.4 µs  34.3%      1
+k3::k3_kernel(k3::Params)                                         23.7 µs  25.2%      1
+total                                                             94.2 µs
+GPU busy (kernels overlap: PDL or streams)                        61.9 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<2, 3>(k3::Params)                             173.7 µs  51.5%      1
+void k3::k2_kernel<2, 3>(k3::Params)                             128.3 µs  38.0%      1
+k3::k3_kernel(k3::Params)                                         35.3 µs  10.5%      1
+total                                                            337.2 µs
+GPU busy (kernels overlap: PDL or streams)                       262.1 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void k3::k1_kernel<2, 3>(k3::Params)                             330.9 µs  51.7%      1
+void k3::k2_kernel<2, 3>(k3::Params)                             251.8 µs  39.3%      1
+k3::k3_kernel(k3::Params)                                         57.6 µs   9.0%      1
+total                                                            640.3 µs
+GPU busy (kernels overlap: PDL or streams)                       489.4 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
