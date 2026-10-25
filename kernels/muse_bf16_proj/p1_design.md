@@ -1,11 +1,164 @@
 # P1: lossless 12-bit BF16 weights + fused decode/skinny-GEMM for the layer projections at T <= 32
 
-Status: laptop phase only. Nothing has been compiled or run on a GPU, and nothing has been submitted.
-- Lab: `kernels/muse_bf16_proj/p1_lab.py`. It runs on the pod and is never a submission.
-- CPU emulation: `scratchpad/p1/emulate.py`. This is the session scratchpad, not the repo. It needs only the standard
-  library, because the laptop has no numpy.
+Status:
+- Round 1 ran on the H200 (`box_out/p1_lab.log`). **The format passes and the kernel fails.** Unpack is bit-exact on
+  every projection and on both stress matrices; the one-hot probes have 0 mismatches. But the gate failed 0/16: the
+  kernel streamed at 0.7–2.2 TB/s.
+- **Round 2 (§R below) replaces the kernel.** The format, packer and unpack are unchanged. It is laptop-only again:
+  never compiled, never submitted.
+- Lab: `kernels/muse_bf16_proj/p1_lab.py`. CPU emulation of the format: `scratchpad/p1/emulate.py`, standard library only.
 
-## 0. Decision summary
+## R. Round 2: a pure streaming kernel for T ≤ 8 (plan, written before the code)
+
+### R.1 What round 1 measured, and why it was slow
+
+| shape | today net µs | round-1 packed net µs | packed TB/s | best geometry |
+|---|---|---|---|---|
+| qkv T=1 | 12.6 (R1B, 3.0 TB/s BF16) | 18.3 | 1.55 | (8 warps, 1 tile, **S=8**, D=3): 144 CTAs |
+| pooler T=1 | 18.9 (R1B) | 23.7 | 2.16 | (4, 1, **8**, 2) |
+| o T=1 | 7.1 (cuBLAS) | 8.6 | 1.46 | (4, 1, 4, 2) |
+| unpooler slice T=1 | 5.0 (R1B) | 9.1 | 0.69 | (4, 1, **8**, 3) |
+
+"Net" means event time minus the measured 5.25 µs graph floor. "Compression alone" (the same kernel on packed vs on BF16)
+was only 1.02–1.10×, and the BF16 version of the kernel was itself slower than today. So the kernel was not
+decode-bound. It was latency-bound, for four reasons:
+
+1. **Too few bytes in flight.** Every sweep chose the largest split (more CTAs). qkv ran 144 CTAs × 8 warps, about 9
+   warps per SM. Each warp held at most D = 3 super-blocks (4.5 KB) of a 16-SB K slice, so it made about 5
+   dependent DRAM round trips. In flight per SM: about 36 KB peak, much lower on average. The consumer probe
+   (`box_out/consumer_probe.log`) shows what works: decode + 4 mma per 16 B reaches **3.92 TB/s** with 32 warps per SM,
+   4 independent 16-B loads per lane and 53 registers.
+2. **Registers.** Round 1 used 86–174 registers. That capped occupancy at 8–16 warps per SM.
+3. **Per-CTA fixed work.** Each CTA staged x in shared memory (8 token rows even at T = 1) and synced, and ran two
+   cluster barriers plus a DSMEM reduce.
+4. **Per-CTA work too small for that fixed cost.** 16 SBs per warp.
+
+PDL changed nothing (0.99–1.02×), because a torch copy kernel as producer gives no early trigger. That lever is parked.
+
+### R.2 New kernel `p1s_kernel<D, RAW>` (T ≤ 8; one launch; no smem staging of x, no cluster, no wgmma/TMA)
+
+**Work unit.**
+- CTA = one 16-row tile × a K slice (grid = nrt × S). Its W warps (W ∈ {4, 8, 16}) split the slice. Each warp streams
+  its own contiguous run of super-blocks.
+- **S = 1 wherever there are at least 144 row tiles** (qkv, o, pooler). Then nothing crosses CTAs: the CTA's W partials
+  meet in 4·W·128 B of shared memory, behind one `__syncthreads`, and are stored as BF16 straight away.
+- S ∈ {2, 4, 8} only for the 64-tile unpooler slice. There each CTA adds its 16×T partial into a self-cleaning FP32
+  workspace with `red.global.add.f32`. The last CTA of the row tile (one counter `atomicAdd`, no spinning) converts to
+  BF16, re-zeroes the workspace and resets the counter. This is the R1B fixup pattern; R9 holds, since nothing waits.
+
+**Streaming.**
+- Per super-block, a lane issues 3 × `ld.global.nc.L1::no_allocate.v4` (48 B of packed weights). It also issues the
+  super-block's 8 B-fragment words of x: 8 × 4-B `ld.global.nc`, L1-cached, predicated on token g < T. The x loads
+  replace shared-memory staging: there is no CTA barrier before the stream, and the CTAs on an SM share x through L1
+  (16 KB at T = 1, 128 KB at T = 8).
+- **D stages rolling.** Stage d is refilled with super-block s + D right after s is consumed, so each warp always has D
+  super-blocks requested.
+- The first D stages and the escape list are issued before `griddepcontrol.wait` (no-op without PDL).
+- Consume: per k-tile, `dec_kt` (4 PRMT + 3 SHF + 4 LOP3 → 4 bf16x2 A registers), then 1 × mma.m16n8k16 against x as B
+  (T ≤ 8 tokens = one n8 group), with FP32 accumulation in 4 registers.
+
+**Escapes.**
+- The format is the same; the patch moves to **per-k-tile granularity**. The warp's in-range entries (≤ 32, one per
+  lane) are keyed by (local SB · 4 + k-tile). There is one warp-uniform compare per k-tile.
+- On a hit, the owning lane rewrites one bf16 half of one of the k-tile's 4 A registers. That removes round 1's
+  16-register slow path.
+- Rows whose 256-row group is RAW stream 4 × v4 per super-block with no decode: the `RAW = true` instantiation,
+  selected per CTA.
+
+**Registers (target ≤ 64, so that 2 × 512-thread CTAs or 4 × 256-thread CTAs fit per SM, i.e. 32 warps).**
+- D = 1: 12 weights + 8 x + 4 acc + 4 A + 5 escape + about 10 addressing ≈ 45. It gets `__launch_bounds__(512, 2)`,
+  a hard cap of 64.
+- D = 2: about 65–70 registers, so `__launch_bounds__(512, 1)` (cap 128, no spills). The sweep keeps the grid resident:
+  for qkv, W = 8 and S = 2 give 288 CTAs at 3 × 256 threads per SM.
+- The lab prints registers, local bytes and CTAs/SM per instantiation via `p1s_info`.
+- **6 instantiations**: D ∈ {1, 2} × MODE ∈ {packed, RAW (the BF16 control), mixed (CTA-uniform branch for matrices
+  with RAW groups)}. Compile time is a fraction of round 1's 51 s, which keeps the layer's prepare budget safe; the layer
+  needs only 1–2 of them.
+
+**Bytes in flight per SM.**
+
+| shape | grid | warps total | warps/SM | in flight/SM (D=2) | serial rounds per warp |
+|---|---|---|---|---|---|
+| qkv | 144 × 16 warps | 2304 | about 17.5 (16 or 32) | about 54 KB | 4 (8 SBs, D=2) |
+| pooler | 256 × 16 | 4096 | 31 | about 95 KB | 4 |
+| o (16 SBs per tile) | 512 × 8, 2 SBs per warp | 4096 | 31 | about 95 KB | 1: all of o is requested at once |
+| unpooler slice | 64 × S=4 × 8 warps, 2 SBs per warp | 2048 | 15.5 | about 48 KB | 1 |
+
+All of these exceed lessons §5's 32 KiB/SM. The lab sweeps W, S and D per shape and prints achieved TB/s and bytes in
+flight per SM, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor` and the registers per thread.
+
+**ALU per super-block per warp.** 44 INT + 4 HMMA + 3 + 8 loads + 4 escape compares + about 6 loop ≈ 69 warp-instructions.
+At 4.4 TB/s of packed bytes that is 0.86 of the 4 warp-instructions/clk/SM (21%), and the INT pipe runs at 27%.
+Unchanged from round 1: the redesign targets latency, not ALU.
+
+**T = 16/32 stay on cuBLAS in round 2.** Per-warp B fragments from global would re-read x once per 16-row tile: 1.3×
+(T = 16) or 2.7× (T = 32) the weight bytes in L2 traffic. A skinny GEMM that shares x across row tiles needs smem
+chunks plus barriers, or split-K atomics of T × N × S. That is a separate round-3 design (§R.5).
+
+### R.3 Predicted (net µs = event − 5.25 µs floor; today = round-1 log, same process)
+
+Model: net = 1.0 µs ramp + MB / BW + epilogue. BW = 3.9 TB/s packed (consumer probe w2v) or 4.2 TB/s for BF16 (probe w0:
+4.33). Epilogue = 0.2 µs (S = 1) or 0.8 µs (atomics + fixup). Add 0.2 µs at T = 8 for x. Haircut = today − 0.5 × gain
+(R7).
+
+| proj | T | today | p1s on BF16 | **p1s packed** | × vs today | haircut | haircut × | packed TB/s |
+|---|---|---|---|---|---|---|---|---|
+| qkv | 1 | 12.6 | 10.2 | **8.5** | 1.49 | 10.5 | 1.20 | 3.35 |
+| qkv | 8 | 16.3 | 10.4 | **8.7** | 1.88 | 12.5 | 1.31 | 3.27 |
+| o | 1 | 7.1 | 5.2 | **4.4** | 1.61 | 5.8 | 1.23 | 2.84 |
+| o | 8 | 7.2 | 5.4 | **4.6** | 1.55 | 5.9 | 1.22 | 2.72 |
+| pooler (alone) | 1 | 18.9 | 17.2 | **14.1** | 1.34 | 16.5 | 1.15 | 3.57 |
+| pooler (alone) | 8 | 25.3 | 17.4 | **14.3** | 1.77 | 19.8 | 1.28 | 3.52 |
+| unpooler slice | 1 | 5.0 | 3.8 | **3.4** | 1.47 | 4.2 | 1.19 | 1.84 |
+| unpooler slice | 8 | 7.1 | 4.0 | **3.6** | 1.97 | 5.4 | 1.33 | 1.74 |
+
+- Coordinator target: qkv ≤ 7.5 µs net (≥ 3.8 TB/s including ramp). The model gives 8.5 central, so reaching 7.5 needs
+  a ramp of about 0.3 µs or 4.3 TB/s steady state.
+- **Layer** (lb10 calibrated; only decode 1 and verify 1 change; the pooler's in-layer gain is reduced by the
+  side-stream FP32 router's 8.4 MB): **+4.6% central, +2.2% haircut**.
+- About two thirds of the gain is structure. The control (p1s on BF16) already beats R1B and cuBLAS. Compression adds
+  about 1.15–1.2× on top.
+
+### R.4 Lab changes, gate and kill
+- Timing is now T ∈ {1, 8} × {qkv, o, pooler (= cat rows 0–4095), unpooler slice into zbuf}: 8 shapes. Correctness also
+  covers T ∈ {2, 5}. The host refuses T > 8.
+- Variants per shape: today, p1s on BF16 (all tiles RAW) and p1s packed, each swept over (W, S, D) then re-timed with 41
+  paired reps.
+- The summary adds the columns **achieved TB/s** (packed MB / net µs) and **bytes in flight per SM** (occupancy × warps ×
+  D × bytes per SB, with the registers per thread printed).
+- Bit-exact unpack, the negative controls, the one-hot probes (every escape column, through p1s at T = 8 and T = 1) and
+  the random-x checks against FP64 (repeat calls bit-identical) are kept.
+- **Gate:** bit-exact unpack, plus packed ≥ 1.15× net vs today on all 8 T ≤ 8 shapes, in the same process.
+- **Kill:** packed below 3.0 TB/s net on qkv and pooler at T = 1 after this round, **or** "compression alone" below
+  1.10× there.
+  - In the second case, keep p1s-BF16 as an uncompressed streaming GEMV if it beats today.
+  - In the first, the streaming premise itself failed; check the probe numbers before any round 3.
+
+**Pod commands (round 2).** Compile time is small and the timing is about 2–3 min.
+
+```
+tools/box/box.sh sync
+tools/box/box.sh run   'python3 tools/box/sass_gate.py kernels/muse_bf16_proj/p1_lab.py --json box_out/p1_gate2.json 2>&1 | tee box_out/p1_gate2.log'
+tools/box/box.sh timed 'python3 kernels/muse_bf16_proj/p1_lab.py 2>&1 | tee box_out/p1_lab2.log'
+tools/box/box.sh pull
+```
+
+**What to read in the log.**
+- The `p1s_kernel<D, MODE>` lines: registers, local bytes, CTAs/SM. Expect D = 1 at ≤ 64 registers with 0 local bytes,
+  and D = 2 at ≤ 80.
+- The PACK + VERIFY block: everything PASS, with "entries key-sorted True".
+- The GEMV CHECKS block: one-hot probes with 0 mismatches. They cover mode 0 (qkv, o, unpooler), mode 1 (stress) and
+  mode 2 (the cat matrix's RAW lo rows, stress_mild), each through split 1 and split > 1.
+- The SUMMARY: the achieved TB/s and KB/SM-in-flight columns explain any miss.
+  - High in-flight with low TB/s means the decode, mma or issue path, so compare against p1s on BF16.
+  - Low in-flight means a different geometry (W, S) or D = 2.
+
+### R.5 Round 3 sketch (T = 16/32, not started)
+The CTA would cover 4–8 row tiles over a K chunk, with x chunks of 512 k double-buffered in smem (one barrier per chunk),
+B fragments from ldmatrix shared by all the CTA's warps, and split-K S = 2–4 via `red.global.add.v2.f32` plus last-CTA
+fixup. Atomic volume T × N × S (≤ 0.6 M at T = 32), and an x reuse ratio of 1.33·T / rows per CTA.
+
+## 0. Decision summary (round 1; format sections 2–3 still apply, the kernel sections 4–7 are superseded by §R)
 
 | item | choice / number |
 |---|---|
@@ -130,7 +283,7 @@ The router lo plane only rides in the T ≥ 16 "cat" GEMM. It stays BF16 (4.2 MB
   - one flipped code bit: 1 mismatch;
   - the 11-bit window escapes 1.34%.
 
-## 4. Kernel `p1_gemm_kernel<NT, ROWT, D, F32>` (p1_lab.py)
+## 4. Kernel `p1_gemm_kernel<NT, ROWT, D, F32>` (round 1; replaced by `p1s_kernel`, §R.2)
 
 **Mapping.**
 - `out[t, n] = Σ_k x[t,k] W[n,k]` for t < M ≤ 32. NT = ⌈M/8⌉ ∈ {1, 2, 4} n8 token groups. M ≤ 8 uses NT = 1 and
