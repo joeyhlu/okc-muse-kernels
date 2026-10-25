@@ -521,7 +521,7 @@ def p1_build():
     mod = load_inline(
         name=f"p1_lab_{tag}", cpp_sources=P1_CPP_SRC, cuda_sources=P1_CUDA_SRC,
         functions=["p1_gemm", "p1_unpack"],
-        extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90a,code=sm_90a", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90a,code=sm_90a"],
         verbose=True)
     print(f"[p1] compiled in {time.time() - t0:.1f}s", flush=True)
     return mod
