@@ -466,3 +466,105 @@ Model expectations at seed-like routing:
 |---|---|---|---|---|
 | 256 | 289 MB | −72 | 57 MB | −13 |
 | 128 | 119 MB | −30 | 28 MB | −6 |
+
+## 10. P1 reread and P2 (2026-10-25, after the burst; lead: the H256 gate is dropped)
+
+### What `null` −86.5 is made of, and why `mmaoff` −11.6 understates the MMA cost
+
+The reading uses the per-role chip work from the P1 marks (`box_out/hot_p1/summary.json`), T=256, median of 3
+routings, in µs of chip work. Base is K1 hot 71.0 / K1 cold 73.1 / K2 hot 56.7 / K2 cold 50.7.
+
+| row | K1 hot | K1 cold | K2 hot | K2 cold |
+|---|---|---|---|---|
+| null | −26.7 | −22.3 | −20.2 | −19.2 |
+| mmaoff | −21.5 | — | +9.9 | — |
+| deqoff | −10.8 | — | +5.1 | — |
+| nowait | — | — | −24.6 | −18.8 |
+
+1. **The null delta splits about evenly between the roles:** hot −46.9, cold −41.5.
+2. **K2 chip work is mostly waiting.** About 43 µs of it is waiting for the last K1 CTA, as nowait shows.
+   - Any row that speeds the hot K1 role makes the hot K2 CTAs start earlier and wait longer. That is the +9.9 that
+     hides mmaoff's real −21.5 in the total.
+   - The same artifact made most of P1's xhot/xall K2 savings. Their deferred X copies took away the wait; in K1 the
+     X copies cost +1.2 / −0.2, i.e. they are free.
+3. **The clean K1 numbers.** The hot consumer (−26.7) is wgmma (−21.5) plus dequant (−10.8), and the two overlap.
+   - So the hot role's own feeding (weight LDS, flush, hand-off) is ≤ ~5 µs.
+   - The other ~22 µs of K1 consumer cost is the cold role (NC2 mma.sync: X-fragment LDS, decode, 8 HMMA per 16 B,
+     epilogue). It is unmasked, so its parts are not separated.
+4. **T=128 (mixed CTAs):** null K1 −34.0, K2 −7.4; mma.sync hot −11.9; dequant −7.2 / −6.3; nowait K2 −11.0.
+5. **A 5-minute extra probe would split the cold consumer.** It needs one rebuild of hot_p1_lab with 3 more
+   compile-time copies:
+   - cold mma off;
+   - cold B fragments from registers, i.e. no X LDS (v3.7's `consume_kb_breg` path);
+   - split-item epilogue and hand-off off (fmode-6-like).
+   - That is about 1 min of build plus 2 min of rows.
+6. **H256 under this reading** (×0.5 on the consumer savings):
+   - **Hot experts only:** ≈ 0.5 × (26.7 + ~13 for K2) + 10 (P0) − 9 ≈ **21 µs**. That is below 32 on its own.
+   - **Every expert at T=256 on the new consumer:** add 0.5 × the cold bound (22.3 + ~11) and 0.5 × the 21.5 µs
+     K1→K2 hand-off. That gives ≈ **48 µs**.
+   - So the structure that pays is the all-experts weight-stationary kernel, not a hot-only add-on.
+   - Per the lead, P2 is built regardless of the number. The old kernel's probes no longer gate the new structure.
+
+### P2 as built
+
+Files: `kernels/lab/hot_p2_lab.py` and `tools/box/hot_p2.py`. Laptop-checked only:
+- generation works, braces balance, the sass_gate substitution equals the build source;
+- the planner and `decide()` were run on synthetic routings;
+- no nvcc, torch or GPU here.
+
+**Kernel `p2_gemm<MODE>`:**
+- One CTA per SM, 384 threads, setmaxnreg 56/224 (K2b v2's validated numbers).
+- Producer: one lane issues two `cp.async.bulk` per 64-k stage, 9216 B of NVFP4 and N×128 B of tokens, into a
+  4-slot ring with one expect_tx barrier.
+- 3 dequant warps: K2A v3's exact `deq4`/`bmul2` → BF16 A tile in smem (K2b v1's IL layout), double-buffered, with
+  `fence.proxy.async` before the arrive.
+- 2 consumer WGs: each owns 128 rows, as 2 × wgmma m64nNk16 **SS**, N ∈ {8,16,32,48,64,96,128}.
+  - Every expert of ≤ 128 tokens is read once.
+  - Accumulators are the only register operands.
+  - K2b v1's fence_acc / wait_group 1 / deferred-release discipline: no RS operands, so no C7513 pattern.
+- Bounded waits only (R9). No PDL in the lab, so no stale-read hazard.
+
+**Repack:** lossless, the same codes and re-encoded scales as K2A, with 8 consecutive k per BITPOS3 word.
+
+**Host side:**
+- Items are (pass, 256-row block), assigned by host-side LPT. This is lab-only; a real kernel plans on device.
+- The token gather and SwiGLU pack run as separate prep kernels. The `p2gemm` row isolates the GEMMs.
+- Projected real-kernel time = p2all + 12 µs (routing compaction, post-norm + weighted sum, launches).
+
+**Correctness, every routing:**
+- W13 and W2 outputs vs the FP32 dequantised reference (≤ 1e-4);
+- SwiGLU mismatch ≤ 1e-3;
+- the MoE output (P2 outputs + K3's post-norm / weighted sum in torch) vs the shipped K2A output (≤ 3e-3) and vs the
+  FP32 reference (≤ 1e-2).
+
+sass_gate runs on the lab at the start of every run (`--allow C7519`).
+
+**Command** (≈ 8–12 min; the timeout guard skips P2 rows if a bounded wait fires):
+
+    bash tools/box/burst.sh 'python3 tools/box/hot_p2.py run 2>&1 | tee box_out/hot_p2.log' 1800
+
+**Report.** Per T it prints:
+- ship µs and ship ÷ floor;
+- P2 µs → projected µs, projected ÷ floor (floor = 2 × 3.05 + touched × 28.31 MB / 4.74 TB/s: 143.5 µs at T=256);
+- gain vs ship, the correctness figures, the sass_gate exit code;
+- a `next:` list read off the diagnostic rows (p2gemm, p2nodeq, p2nomma).
+
+Verdicts:
+
+| verdict | condition | what follows |
+|---|---|---|
+| ON TARGET | projected ≤ 1.2 × floor at both T | build the real fused kernel |
+| AHEAD OF SHIP | beats ship, not yet on target | iterate on the `next:` items |
+| BEHIND SHIP | slower than ship at some T | iterate before building anything |
+| INCORRECT | correctness checks fail | read no timing |
+
+**What I'd iterate on next, in order:**
+1. **W2 load balance.** 368 items over 132 CTAs, LPT imbalance 1.19 vs 1.08 for W13. Split W2 items along K, or use
+   128-row W2 items.
+2. **Fuse the prep.** Gather tokens in the producer (cp.async 16 B, as K2b v1), SwiGLU in the W13 epilogue, and
+   W13 → W2 in one launch with per-(expert, k-stage) flags. That removes 3 launches and the global K1→K2 wait, which
+   P1 measured at 21.5 µs at T=256.
+3. **If p2nodeq shows the dequant WG binding:** 2 dequant WGs (512 threads), or RS consumers that dequantise for
+   N ≥ 64.
+4. **Small-N passes (N = 8/16) are ingest-bound by construction.** Check them against the weights-only model and
+   batch two cold experts per CTA item if the ramp shows.
