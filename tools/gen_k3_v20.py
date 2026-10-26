@@ -20,11 +20,12 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v28.py"   # v28 = v27 + K1 SECT + PAIR (decode full B32 -7.6 us, bitwise)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v29.py"   # v29 = v28 + P1M qkv/o at T=16 (ab_v28p) + K2A v4.7 K1 PDL (T <= 32)
+# v28 = v27 + K1 SECT + PAIR (decode full B32 -7.6 us, bitwise)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v28-1"
+NONCE = "k3-v29-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -34,7 +35,8 @@ check, patch, sha = G18.G.check, G18.G.patch, G18.G.sha
 # box sweep winners (box_out/p1m_iso2.log / iso3: >= 1.06x vs today's cuBLAS path in 2+ runs); everything else keeps today's path
 # in-layer A/B (box_out/ab_v20c.log): cat 16 + unpool 16 -> decode 16 load x1.039; + unpool 32 -> decode 32 x1.028 / x1.007;
 # qkv 16 / o 16 neutral (+0.1..0.3%), qkv 32 / o 32 / cat 32 slower: left on today's path
-V20_ROUTE = {("cat", 16): (8, 1, 1, 2, 1, 0), ("unpooler", 16): (8, 1, 1, 2, 2, 1), ("unpooler", 32): (8, 1, 1, 4, 2, 1)}
+# ab_v28p (P1M with PDL + early trigger): qkv 16 x1.007 / o 16 x1.004 on decode 16 sliding -> on; T = 32 routes still lose
+V20_ROUTE = {("qkv", 16): (8, 2, 1, 2, 1, 0), ("o", 16): (8, 1, 1, 2, 2, 1), ("cat", 16): (8, 1, 1, 2, 1, 0), ("unpooler", 16): (8, 1, 1, 2, 2, 1), ("unpooler", 32): (8, 1, 1, 4, 2, 1)}
 # candidate routes for the in-layer A/B (--candidates): the lab's best register-ring geometry per (projection, bucket)
 V20_CANDIDATES = {("qkv", 16): (8, 2, 1, 2, 1, 0), ("o", 16): (8, 1, 1, 2, 2, 1), ("cat", 16): (8, 1, 1, 2, 1, 0),
                   ("unpooler", 16): (8, 1, 1, 2, 2, 1), ("qkv", 32): (8, 1, 1, 4, 1, 1), ("o", 32): (8, 1, 1, 4, 2, 1),
@@ -192,6 +194,8 @@ K2A43_FILE = ROOT / "tools/k2a_v43_patches.py"   # WSK hot weight 72 + rows (T=2
 USE_K2A43 = True
 K1V24_FILE = ROOT / "tools/k1_v24_patches.py"    # K1 decode full: SECT (whole-sector cp.async map) + PAIR (warp-pair named barrier); bitwise
 USE_K1V24 = True
+K2A47_FILE = ROOT / "tools/k2a_v47_patches.py"   # K1 PDL secondary of the tail on vid 0 / 3 (agent: T=8 x1.005-1.009)
+USE_K2A47 = True
 USE_K2A42 = True    # v4.2 WSK byte-weighted work split at T=256 (agent: -24.3 us median vs ship, x1.085)
 
 
@@ -237,6 +241,11 @@ def generate():
         _sk1.loader.exec_module(K1V24)
         for what, old, new in K1V24.PATCHES:
             text = patch(text, old, new, "K1 v24 " + what)
+    if USE_K2A47 and K2A47_FILE.exists():   # scoped patches (the layer embeds four K2A sources with identical K1 text)
+        _s47 = importlib.util.spec_from_file_location("k2a_v47_patches", K2A47_FILE)
+        K2A47 = importlib.util.module_from_spec(_s47)
+        _s47.loader.exec_module(K2A47)
+        text = K2A47.apply(text)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
     check(set(got) == set(P1M_KEEP), f"p1m nodes {sorted(set(P1M_KEEP) ^ set(got))}")
