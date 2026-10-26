@@ -31,7 +31,19 @@ Per copy (compile-time):
                     decode + mma (v3.1's V3_EARLY idea for NC 2): same mma order, bitwise.
            32 DUAL  with COLD1, nch 1: kb 0-1 and kb 2-3 on two accumulator chains (acc[0], acc[1]), summed before the
                     flush: FP32 summation order changes (not bitwise; tolerance checks).
-Runtime (all copies, pick_role): hot_w4 >= 50 = fine role-split weight (hot_w4 - 50) / 32 (ship: 8 / 8 = 1.0).
+           64 HANDOFF (with FLUSH2) per-(expert, pass) K1 -> K2 hand-off instead of K2's grid-wide griddepcontrol.wait:
+                    Params.rdy[e * 64 + j] counts K1 warps done with pass j of expert e's SwiGLU rows (whole items: each of
+                    the 8 consumer warps +1 after its xw2 / inter stores; split items: the finalizing epilogue warp +8), target
+                    64 row blocks x 8 = 512; rdy[2048] counts K1 consumer warps done zeroing y / ss (target 8 x grid). Release
+                    = __syncwarp + __threadfence + atomicAdd by lane 0 (the shipped split-item pattern). K2's producer lane 0
+                    polls with ld.acquire.gpu (bounded, error flag err[0] / err[3], no trap) before the first X copy of a pass,
+                    then fence.proxy.async; the first NST stages' weight copies are issued before the first poll (the shipped
+                    deferral). K2 never takes griddepcontrol.wait; K3 (after its wait on K2) zeroes rdy for the next call.
+          128 WSK   Stream-K ranges of the v3.3 gemm (both roles, K1 and K2) cut at equal *byte-model weight*
+                    (pick_role's model: a stage of a pass with n token rows weighs 36 + n (hot: n rounded up to 8)) instead
+                    of equal stage counts: a 64-token hot stage costs more than a 32-token one. Only cut points move.
+Runtime (all copies, pick_role): hot_w4 >= 50 = fine role-split weight (hot_w4 - 50) / 32 (ship: 8 / 8 = 1.0); K2 uses
+  Params.hot_mode as its own weight when > 0 (run3 hot_t = hot_t + 1000 * w4(K1) + 100000 * w4(K2)).
 Waits stay v3.7's bounded mbar_wait (R9); no new wait loop.
 """
 import hashlib
@@ -45,19 +57,18 @@ if str(HERE) not in sys.path:
 import hot_p1_lab as H  # noqa: E402
 
 V40_LEAN, V40_DEFER, V40_FLUSH2, V40_COLD1, V40_EARLY, V40_DUAL = 1, 2, 4, 8, 16, 32
+V40_HANDOFF = 64   # needs FLUSH2 (the hot whole-item signal lives in FLUSH2's flush)
+V40_WSK = 128      # byte-weighted Stream-K ranges inside a role
 # name -> (HP_LAB, V40_PROF, V40_VAR, vids built)
 COPIES = {
     "base":    (0, 0, 0, (2, 5)),
-    "prof":    (0, 1, 0, (2,)),
-    "lean":    (0, 0, V40_LEAN, (2,)),
     "lf":      (0, 0, V40_LEAN | V40_FLUSH2, (2,)),
-    "c1":      (0, 0, V40_COLD1, (2,)),
-    "ce":      (0, 0, V40_COLD1 | V40_EARLY, (2,)),
-    "cd":      (0, 0, V40_COLD1 | V40_DUAL, (2,)),
-    "alle":    (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY, (2,)),
-    "alled":   (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_DUAL, (2,)),
-    "profe":   (0, 1, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY, (2,)),
+    "hoe":     (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_HANDOFF, (2,)),
+    "lw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_WSK, (2,)),
+    "aw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_WSK, (2,)),
+    "hw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_HANDOFF | V40_WSK, (2,)),
 }
+# earlier batches also built: prof (PROF), lean, c1, ce, cd, alle, alled, profe, ho (see notes/lab.md 10-26 K2A v4.0 rows)
 NWARP = 10
 NCNT = 8
 
@@ -103,6 +114,74 @@ __device__ __forceinline__ void v40_dump(const Params& P, int k) {   // each war
     __syncwarp();
     if (lane < 8) P.v40p[(((size_t)k * 1024 + blockIdx.x) * 10 + warp) * 8 + lane] = v40s[warp * 8 + lane];
   }
+}
+"""
+HO_HELPERS = r"""
+// v4.0 HANDOFF: per-(expert, pass) readiness of K1's SwiGLU rows for K2 (lab)
+__device__ __forceinline__ int v40_ld_acq(const int* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void v40_poll(const int* p, int target, int* err) {   // bounded (R9), flag, no trap
+  if (v40_ld_acq(p) >= target) return;
+  const long long t0 = clock64();
+  while (v40_ld_acq(p) < target) {
+    __nanosleep(64);
+    if (clock64() - t0 > WAIT_BUDGET) { atomicExch(err, 1); atomicExch(err + 3, 1); return; }
+  }
+}
+// K2 producer lane 0, before an X copy of (expert, pass) key: K1's y / ss zeroing (once), then the key's 512 warps
+__device__ __forceinline__ void v40_ready(const Params& P, int key, int& rkey, bool& zok) {
+  if (!zok) { v40_poll(P.rdy + 2048, 8 * (int)gridDim.x, P.err); zok = true; }
+  if (key != rkey) {
+    v40_poll(P.rdy + key, 512, P.err);
+    asm volatile("fence.proxy.async;\n" ::: "memory");   // generic-proxy K1 stores -> async-proxy bulk copy reads
+    rkey = key;
+  }
+}
+// all lanes, after this warp's stores: release n counts on rdy[key] (cumulative over the warp's stores via __syncwarp)
+__device__ __forceinline__ void v40_signal(const Params& P, int key, int n) {
+  __syncwarp();
+  if ((threadIdx.x & 31) == 0) { __threadfence(); atomicAdd(P.rdy + key, n); }
+}
+"""
+WSK_HELPERS = r"""
+// v4.0 WSK: stage index of this role's sequence where the byte-model weight prefix reaches T
+template <bool HOT, int NC, int NRB>
+__device__ __forceinline__ long long v40_wpass(int c, int jj) {
+  constexpr int TP = HOT ? 64 : 8 * NC;
+  const int nt = min(TP, c - jj * TP);
+  return 36 + (HOT ? ((nt + 7) & ~7) : nt);
+}
+template <bool HOT, int NC, int NRB>
+__device__ __forceinline__ int v40_wpos(const Route& S, long long T) {
+  for (int e = 0; e < 32; ++e) {
+    if (S.sb[e + 1] == S.sb[e]) continue;
+    const int np = S.np[e], c = S.cnt[e];
+    long long wrb = 0;
+    for (int jj = 0; jj < np; ++jj) wrb += 16 * v40_wpass<HOT, NC, NRB>(c, jj);
+    if (T >= wrb * NRB) { T -= wrb * NRB; continue; }
+    const int rb = (int)(T / wrb);
+    T -= rb * wrb;
+    for (int jj = 0; jj < np; ++jj) {
+      const long long w = v40_wpass<HOT, NC, NRB>(c, jj);
+      if (T >= 16 * w) { T -= 16 * w; continue; }
+      return S.sb[e] + (rb * np + jj) * 16 + (int)(T / w);
+    }
+    return S.sb[e] + (rb + 1) * np * 16;
+  }
+  return S.sb[32];
+}
+template <bool HOT, int NC, int NRB>
+__device__ __forceinline__ void v40_wrange(const Route& S, int cta, int ncta, int& beg, int& end) {
+  long long W = 0;
+  for (int e = 0; e < 32; ++e) {
+    if (S.sb[e + 1] == S.sb[e]) continue;
+    for (int jj = 0; jj < S.np[e]; ++jj) W += 16LL * NRB * v40_wpass<HOT, NC, NRB>(S.cnt[e], jj);
+  }
+  beg = v40_wpos<HOT, NC, NRB>(S, W * cta / ncta);
+  end = (cta + 1 == ncta) ? S.sb[32] : v40_wpos<HOT, NC, NRB>(S, W * (cta + 1) / ncta);
 }
 """
 COLD_HELPERS = r"""
@@ -339,11 +418,13 @@ K237_REGION = ("k2_kernel37(const Params P) {", "// K1: route + W13 (+ SwiGLU)."
 # (name, region, old, new): old must occur exactly once in the region (applied after hot_p1's PATCHES)
 PATCHES = [
     ("v40 constants", None, "constexpr int HP_LAB = @HPLAB@;\n",
-     "constexpr int HP_LAB = @HPLAB@;\nconstexpr int V40_PROF = @V40PROF@;\nconstexpr int V40_VAR = @V40VAR@;\n"),
+     "constexpr int HP_LAB = @HPLAB@;\nconstexpr int V40_PROF = @V40PROF@;\nconstexpr int V40_VAR = @V40VAR@;\n"
+     "constexpr bool HANDOFF = (V40_VAR & 64) != 0;\nconstexpr bool WSK = (V40_VAR & 128) != 0;\n"),
     ("v40 params", None, "  int hp; long long* hpclk;",
-     "  int hp; long long* hpclk;\n  unsigned* v40p;   // k2a_v40 lab: per-warp phase counters"),
+     "  int hp; long long* hpclk;\n  unsigned* v40p;   // k2a_v40 lab: per-warp phase counters\n"
+     "  int* rdy;   // v4.0 HANDOFF: [32 experts][64 passes] K1 readiness, [2048] K1 y / ss zeroing count"),
     ("v40 helpers", None, "// v3.3 warm-expert item (all of its stages s0..s1)",
-     HELPERS + "@WGSPECS2@\n" + COLD_HELPERS + "// v3.3 warm-expert item (all of its stages s0..s1)"),
+     HELPERS + HO_HELPERS + WSK_HELPERS + "@WGSPECS2@\n" + COLD_HELPERS + "// v3.3 warm-expert item (all of its stages s0..s1)"),
     ("hot flush end", HOT_REGION,
      "  if (!whole) asm volatile(\"bar.arrive %0, 288;\\n\" :: \"r\"(2 + npart) : \"memory\");\n}\n",
      "  V40_ACC(4, vt);\n  V40_CNT(6);\n"
@@ -431,13 +512,83 @@ PATCHES = [
     # ---- host ----
     ("run3 v40p", None, "  p.hp = (int)hp;\n",
      "  p.hp = (int)hp;\n"
-     "  p.v40p = v40p.numel() >= 2 * 1024 * 10 * 8 ? reinterpret_cast<unsigned*>(v40p.data_ptr()) : nullptr;\n"),
+     "  p.v40p = v40p.numel() >= 2 * 1024 * 10 * 8 ? reinterpret_cast<unsigned*>(v40p.data_ptr()) : nullptr;\n"
+     "  p.rdy = rdy.numel() >= 2049 ? rdy.data_ptr<int>() : nullptr;\n"),
     ("run3 args", None, "int64_t hp,\n          torch::Tensor hpclk) {\n",
-     "int64_t hp,\n          torch::Tensor hpclk, torch::Tensor v40p) {\n"),
+     "int64_t hp,\n          torch::Tensor hpclk, torch::Tensor v40p, torch::Tensor rdy) {\n"),
 ]
 
-RUN_ARGS = H.RUN_ARGS + ", torch::Tensor v40p"
-RUN_NAMES = H.RUN_NAMES + ", v40p"
+
+# v4.0 HANDOFF patches (compile-time `HANDOFF`; applied after FLUSH2)
+HO_PATCHES = [
+    ("ho prod init", GEMM_REGION, "    uint32_t vt = V40_PROF ? v40_clk() : 0u;\n    int it = 0, e = 0;\n    bool waited = !pdl",
+     "    uint32_t vt = V40_PROF ? v40_clk() : 0u;\n    int dKey[NST], rkey = -1;\n    bool zok = false;\n"
+     "    int it = 0, e = 0;\n    bool waited = !pdl"),
+    ("ho prod lazy", GEMM_REGION,
+     "          V40_ACC(1, vt);\n          pdl_wait();\n          V40_ACC(2, vt);\n"
+     "          asm volatile(\"fence.proxy.async;\\n\" ::: \"memory\");\n          waited = true;\n"
+     "          if (lane == 0) {\n#pragma unroll\n            for (int d = 0; d < NST; ++d)\n"
+     "              if (d < nd) bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]);\n          }\n          nd = 0;\n",
+     "          V40_ACC(1, vt);\n"
+     "          if constexpr (HANDOFF && MODE == 2) {\n"
+     "            if (lane == 0) {\n#pragma unroll\n              for (int d = 0; d < NST; ++d)\n"
+     "                if (d < nd) { v40_ready(P, dKey[d], rkey, zok); bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]); }\n"
+     "            }\n            V40_ACC(2, vt);\n"
+     "          } else {\n            pdl_wait();\n            V40_ACC(2, vt);\n"
+     "            asm volatile(\"fence.proxy.async;\\n\" ::: \"memory\");\n"
+     "            if (lane == 0) {\n#pragma unroll\n              for (int d = 0; d < NST; ++d)\n"
+     "                if (d < nd) bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]);\n            }\n          }\n"
+     "          waited = true;\n          nd = 0;\n"),
+    ("ho prod copy", GEMM_REGION,
+     "          if (waited) {\n            if (lane == 0) bulk_g2s(dst + SW, src, xbytes, fb);\n          } else {\n"
+     "#pragma unroll\n            for (int d = 0; d < NST; ++d)\n"
+     "              if (d == nd) { dDst[d] = dst + SW; dBar[d] = fb; dSrc[d] = src; dB[d] = xbytes; }\n",
+     "          if (waited) {\n            if (lane == 0) {\n"
+     "              if constexpr (HANDOFF && MODE == 2) v40_ready(P, e * 64 + j, rkey, zok);\n"
+     "              bulk_g2s(dst + SW, src, xbytes, fb);\n            }\n          } else {\n"
+     "#pragma unroll\n            for (int d = 0; d < NST; ++d)\n"
+     "              if (d == nd) { dDst[d] = dst + SW; dBar[d] = fb; dSrc[d] = src; dB[d] = xbytes; dKey[d] = e * 64 + j; }\n"),
+    ("ho prod end", GEMM_REGION,
+     "    if (!waited) {\n      pdl_wait();\n      asm volatile(\"fence.proxy.async;\\n\" ::: \"memory\");\n"
+     "      if (lane == 0) {\n#pragma unroll\n        for (int d = 0; d < NST; ++d)\n"
+     "          if (d < nd) bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]);\n      }\n    }\n",
+     "    if (!waited) {\n      if constexpr (HANDOFF && MODE == 2) {\n        if (lane == 0) {\n#pragma unroll\n"
+     "          for (int d = 0; d < NST; ++d)\n"
+     "            if (d < nd) { v40_ready(P, dKey[d], rkey, zok); bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]); }\n"
+     "        }\n      } else {\n      pdl_wait();\n      asm volatile(\"fence.proxy.async;\\n\" ::: \"memory\");\n"
+     "      if (lane == 0) {\n#pragma unroll\n        for (int d = 0; d < NST; ++d)\n"
+     "          if (d < nd) bulk_g2s(dDst[d], dSrc[d], dB[d], dBar[d]);\n      }\n      }\n    }\n"),
+    ("ho k1 zeroing done", GEMM_REGION,
+     "    for (int i = blockIdx.x * 256 + tid; i < S.R; i += gridDim.x * 256) P.ss[i] = 0.f;\n  }\n",
+     "    for (int i = blockIdx.x * 256 + tid; i < S.R; i += gridDim.x * 256) P.ss[i] = 0.f;\n  }\n"
+     "  if constexpr (HANDOFF && MODE == 1) v40_signal(P, 2048, 1);   // this warp's y / ss zeroing is done\n"),
+    ("ho cold whole", GEMM_REGION, "        if (!whole && fmode != 7) {\n",
+     "        if constexpr (HANDOFF) { if (whole) v40_signal(P, e * 64 + j, 1); }   // cold whole item: inter rows written\n"
+     "        if (!whole && fmode != 7) {\n"),
+    ("ho split finalized", GEMM_REGION,
+     "                  *reinterpret_cast<float2*>(hp + KDIM) = make_float2(0.f, 0.f);\n                }\n              }\n            }\n",
+     "                  *reinterpret_cast<float2*>(hp + KDIM) = make_float2(0.f, 0.f);\n                }\n              }\n            }\n"
+     "            if constexpr (HANDOFF) v40_signal(P, e * 64 + j, 8);   // split item finalized: its 8 warps' share\n"),
+    ("ho hot whole", HOT_REGION,
+     "              xb[2048 * q + 8 * hh] = __float2bfloat16_rn(swiglu(hacc[4 * q + hh] * gs, hacc[4 * q + 2 + hh] * gs));\n"
+     "      } else {\n",
+     "              xb[2048 * q + 8 * hh] = __float2bfloat16_rn(swiglu(hacc[4 * q + hh] * gs, hacc[4 * q + 2 + hh] * gs));\n"
+     "        if constexpr (HANDOFF) v40_signal(P, e * 64 + j, 1);   // hot whole item: xw2 rows written\n"
+     "      } else {\n"),
+    ("ho k3 reset", None, "k3_kernel(const Params P) {\n  __shared__ int s_fc[8];\n  __shared__ float s_fr[8];\n  pdl_wait();\n",
+     "k3_kernel(const Params P) {\n  __shared__ int s_fc[8];\n  __shared__ float s_fr[8];\n  pdl_wait();\n"
+     "  if constexpr (HANDOFF) {   // K2 (and every rdy poll) is complete: counters back to 0 for the next call\n"
+     "    if (P.rdy != nullptr)\n"
+     "      for (int i = blockIdx.x * 256 + threadIdx.x; i < 2049; i += gridDim.x * 256) P.rdy[i] = 0;\n  }\n"),
+    ("wsk range", GEMM_REGION, "  int beg, end;\n  my_range2(Stot, cta, ncta, beg, end);\n",
+     "  int beg, end;\n  if constexpr (WSK) v40_wrange<HOTCAP, NC, NRB>(S, cta, ncta, beg, end);\n"
+     "  else my_range2(Stot, cta, ncta, beg, end);\n"),
+    ("k2 own weight", K2_REGION, "    const bool hr = pick_role<NC>(S, P.hot_w4, P.hot_t, cta, ncta);\n",
+     "    const bool hr = pick_role<NC>(S, P.hot_mode > 0 ? P.hot_mode : P.hot_w4, P.hot_t, cta, ncta);\n"),
+]
+
+RUN_ARGS = H.RUN_ARGS + ", torch::Tensor v40p, torch::Tensor rdy"
+RUN_NAMES = H.RUN_NAMES + ", v40p, rdy"
 
 
 def _apply(src, name, region, old, new):
@@ -469,6 +620,8 @@ def patched_source():
     ia = src.index(FLUSH_A, a)
     ib = src.index(FLUSH_B, ia)
     src = src[:ia] + FLUSH2 + src[ia:ib] + "  }\n" + src[ib:]
+    for name, region, old, new in HO_PATCHES:
+        src = _apply(src, name, region, old, new)
     return src.replace("@WGSPECS2@", _wg_specs2())
 
 
