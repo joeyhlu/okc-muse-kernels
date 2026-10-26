@@ -3,7 +3,7 @@
 cd "<repo>" || exit 1
 for i in $(seq 1 40); do
   out=$(python3 -I tools/okc_wave.py poll 2>&1)
-  if echo "$out" | grep "$1" | grep -q -i -E "running|queued|pending|started"; then sleep 30; else break; fi
+  if echo "$out" | grep "$1" | grep -q -i -E "running|queued|pending|started|received|submitted"; then sleep 30; else break; fi
 done
 echo "$out" | tail -8
 ls kernels/results/ | grep "$1" && python3 - "$1" <<'PY'
