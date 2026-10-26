@@ -20,11 +20,11 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v27.py"   # v27 = v25 + K2A v4.3 WSK72 only (DYN128 dropped: seed-overfit)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v28.py"   # v28 = v27 + K1 SECT + PAIR (decode full B32 -7.6 us, bitwise)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v27-1"
+NONCE = "k3-v28-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -190,6 +190,8 @@ USE_K2A41 = False
 K2A42_FILE = ROOT / "tools/k2a_v42_patches.py"   # per-expert K1 -> K2 hand-off (agent), on top of v4.0
 K2A43_FILE = ROOT / "tools/k2a_v43_patches.py"   # WSK hot weight 72 + rows (T=256 ~ -2 us) + bucket-128 K2 tail pool 8/64 (-7.1 us)
 USE_K2A43 = True
+K1V24_FILE = ROOT / "tools/k1_v24_patches.py"    # K1 decode full: SECT (whole-sector cp.async map) + PAIR (warp-pair named barrier); bitwise
+USE_K1V24 = True
 USE_K2A42 = True    # v4.2 WSK byte-weighted work split at T=256 (agent: -24.3 us median vs ship, x1.085)
 
 
@@ -229,6 +231,12 @@ def generate():
             if what.startswith("DYN128"):   # overfit to the public router seed: verify16 -0.6..-1.5% under secret seeds (jsec_v26_*)
                 continue
             text = patch(text, old, new, "K2A v4.3 " + what)
+    if USE_K1V24 and K1V24_FILE.exists():
+        _sk1 = importlib.util.spec_from_file_location("k1_v24_patches", K1V24_FILE)
+        K1V24 = importlib.util.module_from_spec(_sk1)
+        _sk1.loader.exec_module(K1V24)
+        for what, old, new in K1V24.PATCHES:
+            text = patch(text, old, new, "K1 v24 " + what)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
     check(set(got) == set(P1M_KEEP), f"p1m nodes {sorted(set(P1M_KEEP) ^ set(got))}")
