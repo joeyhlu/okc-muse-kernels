@@ -26,7 +26,17 @@ P1 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(P1)
 
 # (depth, mt, rt) instantiated in the lab build; the layer builds only its routed winners
-P1M_INST = ((1, 1, 1), (2, 1, 1), (1, 1, 2), (2, 1, 2), (1, 2, 1), (2, 2, 1), (1, 2, 2), (2, 2, 2), (1, 4, 1), (2, 4, 1), (1, 4, 2))
+# depth code: D = weight ring depth (x one step ahead), 10 + D = x loaded at use, 20 + D = x at use and <= 64 registers
+# (__launch_bounds__(512, 2): 32 warps / SM)
+P1M_INST = ((1, 1, 1), (11, 1, 1), (21, 1, 1), (2, 1, 1), (12, 1, 1), (22, 1, 1), (13, 1, 1), (23, 1, 1), (1, 1, 2), (12, 1, 2),
+            (1, 2, 1), (2, 2, 1), (11, 2, 1), (12, 2, 1), (21, 2, 1), (22, 2, 1), (13, 2, 1), (23, 2, 1), (1, 2, 2), (12, 2, 2),
+            (1, 4, 1), (11, 4, 1), (12, 4, 1), (21, 4, 1), (22, 4, 1), (13, 4, 1), (1, 4, 2), (11, 4, 2), (12, 4, 2))
+P1K_INST = ((1, 1, 1), (12, 1, 1), (1, 2, 1), (12, 2, 1), (1, 4, 1), (12, 4, 1))
+# 30 + D: per-warp cp.async smem ring of D SBs (x at use, <= 64 registers); the lab's T = 1..32 sweep set
+P1M_CPA_INST = ((32, 1, 1), (34, 1, 1), (36, 1, 1), (34, 1, 2), (32, 2, 1), (34, 2, 1), (36, 2, 1), (34, 2, 2),
+                (32, 4, 1), (34, 4, 1), (36, 4, 1), (34, 4, 2))
+# what the lab builds and sweeps: the register-ring winners so far + the cp.async ring set
+P1M_LAB_INST = ((1, 1, 1), (21, 1, 1), (1, 1, 2), (1, 2, 1), (11, 2, 1), (1, 2, 2), (1, 4, 1), (12, 4, 1), (1, 4, 2)) + P1M_CPA_INST
 
 P1M_CPP_ADD = r"""
 void p1m_gemm(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tensor scale, torch::Tensor eoff,
@@ -67,6 +77,17 @@ __device__ __forceinline__ uint4 ldx4(const uint4* p) {
   asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
   return r;
 }
+// per-warp cp.async weight ring (depth code 30 + D): each lane copies its own 16-B chunks of D SBs into shared memory
+// and later reads back only those, so no cross-lane barrier is needed (cp.async.wait_group is per thread). Bytes in
+// flight = warps x D x 1.5 KB per SM without holding them in registers (notes/lessons.md section 6: the register ring is
+// what capped stream + dequant + mma at ~3 TB/s).
+__device__ __forceinline__ void cpa16(void* sdst, const void* g) {
+  const uint32_t sa = (uint32_t)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(g) : "memory");
+}
+__device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory"); }
+
 __device__ __forceinline__ void ldb(uint32_t (&b)[8], const uint4* p) {
   const uint4 q0 = ldx4(p), q1 = ldx4(p + 1);
   b[0] = q0.x; b[1] = q0.y; b[2] = q0.z; b[3] = q0.w; b[4] = q1.x; b[5] = q1.y; b[6] = q1.z; b[7] = q1.w;
@@ -88,8 +109,16 @@ struct MArgs {
 
 // One warp streams SBs [sb_lo, sb_lo + nsb) of row tiles rt0 .. rt0 + RT - 1 (all packed, or all RAW: KM 1) for MT token
 // groups. acc[r][m]: rows 16 r + g (+8), tokens 8 m + 2 t (+1).
-template <int D, int MT, int RT, int KM>
+extern __shared__ uint4 p1m_dsm[];   // CPA rings (dynamic shared memory; 0 bytes for the other depth codes)
+
+// DD = weight ring depth D (1..4), + 10 = x loaded at use (top of each step, latency behind the decode) instead of one
+// step ahead: the weight ring is the bytes-in-flight lever, the x registers are what limit occupancy (r1_c item 2 / 4).
+template <int DD, int MT, int RT, int KM>
 __device__ __forceinline__ void mstream(const MArgs& A, int rt0, int gw, int lane, int sb_lo, int nsb, float (&acc)[RT][MT][4]) {
+  constexpr int D = DD % 10;
+  constexpr bool XAU = DD >= 10;
+  constexpr bool CPA = DD >= 30;      // weights through the per-warp cp.async smem ring (x at use)
+  constexpr int WD = CPA ? 1 : D;     // weight register slots
   constexpr bool RAW = KM == 1;
   constexpr int NCH = RAW ? 4 : 3;
   constexpr int SBB = RAW ? SBR : SBP;
@@ -107,17 +136,32 @@ __device__ __forceinline__ void mstream(const MArgs& A, int rt0, int gw, int lan
     const int tok = min(g + 8 * m, A.M - 1);
     xq[m] = reinterpret_cast<const uint4*>(A.x + (size_t)tok * A.ldx + (size_t)sb_lo * 64 + 16 * t);
   }
-  uint4 w[D][RT][NCH];
-  uint32_t b[D][MT][8];
+  uint4 w[WD][RT][NCH];
+  uint4* ring = p1m_dsm + (size_t)(threadIdx.x >> 5) * (D * RT * 4 * 32);   // CPA: this warp's [D][RT][4 chunks][32 lanes]
+  constexpr int XD = XAU ? 1 : D;   // x ring: D deep with the weights (refilled together), or one slot loaded at use
+  uint32_t xb[XD][MT][8];
   // 1. weights of the first D SBs: prepare()-time data, issued before the PDL wait
+  if constexpr (CPA) {
 #pragma unroll
-  for (int d = 0; d < D; ++d)
-    if (d < nsb) {
+    for (int d = 0; d < D; ++d) {
+      if (d < nsb) {
 #pragma unroll
-      for (int r = 0; r < RT; ++r)
+        for (int r = 0; r < RT; ++r)
 #pragma unroll
-        for (int c = 0; c < NCH; ++c) w[d][r][c] = ldw(wp[r] + d * step + c * 512);
+          for (int c = 0; c < NCH; ++c) cpa16(&ring[((d * RT + r) * 4 + c) * 32 + lane], wp[r] + d * step + c * 512);
+      }
+      cpa_commit();   // one group per slot, empty or not: the wait count stays uniform
     }
+  } else {
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+      if (d < nsb) {
+#pragma unroll
+        for (int r = 0; r < RT; ++r)
+#pragma unroll
+          for (int c = 0; c < NCH; ++c) w[d][r][c] = ldw(wp[r] + d * step + c * 512);
+      }
+  }
   // 2. escape entries of each row tile (one per lane; in-range ones contiguous: the list is key-sorted)
   uint32_t em[RT], ev[RT];
   int cur[RT], end[RT], nkey[RT];
@@ -142,28 +186,43 @@ __device__ __forceinline__ void mstream(const MArgs& A, int rt0, int gw, int lan
   }
   // 3. PDL: x (and the output) belong to the predecessor kernel. A no-op without programmatic serialization.
   asm volatile("griddepcontrol.wait;" ::: "memory");
+  if constexpr (!XAU) {
 #pragma unroll
-  for (int d = 0; d < D; ++d)
-    if (d < nsb) {
+    for (int d = 0; d < D; ++d)
+      if (d < nsb) {
 #pragma unroll
-      for (int m = 0; m < MT; ++m) ldb(b[d][m], xq[m] + d * 8);
-    }
+        for (int m = 0; m < MT; ++m) ldb(xb[d][m], xq[m] + d * 8);
+      }
+  }
   // 4. rolling stream
   for (int s0 = 0; s0 < nsb; s0 += D) {
 #pragma unroll
     for (int d = 0; d < D; ++d) {
       const int s = s0 + d;
       if (s < nsb) {
+        if constexpr (XAU) {
+#pragma unroll
+          for (int m = 0; m < MT; ++m) ldb(xb[0][m], xq[m] + s * 8);
+        }
+        uint32_t (&b)[MT][8] = xb[XAU ? 0 : d];
+        if constexpr (CPA) {
+          cpa_wait<D - 1>();   // this lane's copies of SB s have landed
+#pragma unroll
+          for (int r = 0; r < RT; ++r)
+#pragma unroll
+            for (int c = 0; c < NCH; ++c) w[0][r][c] = ring[((d * RT + r) * 4 + c) * 32 + lane];
+        }
+        uint4 (&wc)[RT][NCH] = w[CPA ? 0 : d];
         if constexpr (KM == 3) {
           uint32_t px = 0u;
 #pragma unroll
           for (int r = 0; r < RT; ++r)
 #pragma unroll
-            for (int c = 0; c < NCH; ++c) px ^= w[d][r][c].x ^ w[d][r][c].y ^ w[d][r][c].z ^ w[d][r][c].w;
+            for (int c = 0; c < NCH; ++c) px ^= wc[r][c].x ^ wc[r][c].y ^ wc[r][c].z ^ wc[r][c].w;
 #pragma unroll
           for (int m = 0; m < MT; ++m)
 #pragma unroll
-            for (int j = 0; j < 8; ++j) px ^= b[d][m][j];
+            for (int j = 0; j < 8; ++j) px ^= b[m][j];
           acc[0][0][0] += __uint_as_float(px & 0x007FFFFFu);   // finite, keeps the loads live
         } else {
 #pragma unroll
@@ -172,24 +231,34 @@ __device__ __forceinline__ void mstream(const MArgs& A, int rt0, int gw, int lan
             for (int r = 0; r < RT; ++r) {
               uint32_t a[4];
               if constexpr (RAW) {
-                a[0] = w[d][r][kt].x; a[1] = w[d][r][kt].y; a[2] = w[d][r][kt].z; a[3] = w[d][r][kt].w;
+                a[0] = wc[r][kt].x; a[1] = wc[r][kt].y; a[2] = wc[r][kt].z; a[3] = wc[r][kt].w;
               } else {
-                dec_kt(w[d][r], kt, a);
+                dec_kt(wc[r], kt, a);
                 const int key = s * 4 + kt;
                 if (key == nkey[r]) esc_patch4(a, key, sb_lo, lane, em[r], ev[r], cur[r], end[r], nkey[r]);
               }
 #pragma unroll
-              for (int m = 0; m < MT; ++m) mma16816(acc[r][m], a, b[d][m][2 * kt], b[d][m][2 * kt + 1]);
+              for (int m = 0; m < MT; ++m) mma16816(acc[r][m], a, b[m][2 * kt], b[m][2 * kt + 1]);
             }
           }
         }
-        if (s + D < nsb) {
+        if constexpr (CPA) {
+          if (s + D < nsb) {
+#pragma unroll
+            for (int r = 0; r < RT; ++r)
+#pragma unroll
+              for (int c = 0; c < NCH; ++c) cpa16(&ring[((d * RT + r) * 4 + c) * 32 + lane], wp[r] + (s + D) * step + c * 512);
+          }
+          cpa_commit();
+        } else if (s + D < nsb) {
 #pragma unroll
           for (int r = 0; r < RT; ++r)
 #pragma unroll
             for (int c = 0; c < NCH; ++c) w[d][r][c] = ldw(wp[r] + (s + D) * step + c * 512);
+          if constexpr (!XAU) {
 #pragma unroll
-          for (int m = 0; m < MT; ++m) ldb(b[d][m], xq[m] + (s + D) * 8);
+            for (int m = 0; m < MT; ++m) ldb(xb[d][m], xq[m] + (s + D) * 8);
+          }
         }
       }
     }
@@ -203,7 +272,7 @@ __device__ __forceinline__ void mstore(const MArgs& A, int tok, int row, float v
 
 // out[t, row] = scale[row / 16] * sum_k x[t, k] W''[row, k], t < M <= 8 MT. grid = (N / (16 RT), S), block = 32 W.
 template <int D, int MT, int RT>
-__global__ void __launch_bounds__(512, 1) p1m_kernel(const __grid_constant__ MArgs A) {
+__global__ void __launch_bounds__(512, (D >= 20 ? 2 : 1)) p1m_kernel(const __grid_constant__ MArgs A) {
   constexpr int TT = 8 * MT, RS = TT + 1, ROWS = 16 * RT;
   __shared__ float red[MaxW<MT, RT>::v][ROWS * RS];   // [warp][row * RS + token]
   __shared__ int s_last;
@@ -264,11 +333,16 @@ __global__ void __launch_bounds__(512, 1) p1m_kernel(const __grid_constant__ MAr
 }
 
 template <int D, int MT, int RT>
+static size_t dyn_smem(int warps) { return D >= 30 ? (size_t)warps * (D % 10) * RT * 4 * 512 : 0; }
+
+template <int D, int MT, int RT>
 static void launch(const MArgs& A, int warps, int S, int pdl) {
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((unsigned)(A.N / (16 * RT)), (unsigned)S, 1);
   cfg.blockDim = dim3((unsigned)(warps * 32), 1, 1);
-  cfg.dynamicSmemBytes = 0;
+  cfg.dynamicSmemBytes = dyn_smem<D, MT, RT>(warps);
+  if (cfg.dynamicSmemBytes > 0)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(p1m_kernel<D, MT, RT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cfg.dynamicSmemBytes));
   cfg.stream = at::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -283,7 +357,10 @@ static std::vector<int64_t> info_t(int warps) {
   cudaFuncAttributes fa;
   C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, p1m_kernel<D, MT, RT>));
   int occ = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, p1m_kernel<D, MT, RT>, warps * 32, 0));
+  const size_t dyn = dyn_smem<D, MT, RT>(warps);
+  if (dyn > 0)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(p1m_kernel<D, MT, RT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, p1m_kernel<D, MT, RT>, warps * 32, dyn));
   return {(int64_t)fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)occ};
 }
 
@@ -296,7 +373,7 @@ struct KArgs { float* ws; int* cnt; int kmax; };
 __device__ __forceinline__ int k_owner(long long X, long long U, int G) { return (int)(((X + 1) * G + U - 1) / U) - 1; }
 
 template <int D, int MT, int RT>
-__global__ void __launch_bounds__(512, 1) p1k_kernel(const __grid_constant__ MArgs A, const __grid_constant__ KArgs Kp) {
+__global__ void __launch_bounds__(512, (D >= 20 ? 2 : 1)) p1k_kernel(const __grid_constant__ MArgs A, const __grid_constant__ KArgs Kp) {
   constexpr int ROWS = 16 * RT;
   const int lane = (int)threadIdx.x & 31, warp = (int)threadIdx.x >> 5, nw = (int)(blockDim.x >> 5);
   const int G = (int)gridDim.x * nw, gw = (int)blockIdx.x * nw + warp;
@@ -484,15 +561,16 @@ std::vector<int64_t> p1k_info(int64_t depth, int64_t mt, int64_t rt, int64_t war
 _P1M_MOD = {}
 
 
-def p1m_build(inst=P1M_INST, verbose=False):
+def p1m_build(inst=None, verbose=False):
     """One extension with P1's p1s (lab instantiations) + P1M's (depth, mt, rt) instantiations. Prepare-time only."""
+    inst = P1M_LAB_INST if inst is None else inst
     key = tuple(inst)
     if key in _P1M_MOD:
         return _P1M_MOD[key]
     from torch.utils.cpp_extension import load_inline
     flags = ["-O3", "-lineinfo", "-Xptxas=-v", "-gencode=arch=compute_90a,code=sm_90a", "-DP1_LAYER_ONLY=1"]
     cpp = P1.P1_CPP_SRC + P1M_CPP_ADD
-    cuda = P1.P1_CUDA_SRC + p1m_cuda_src(inst)
+    cuda = P1.P1_CUDA_SRC + p1m_cuda_src(inst, P1K_INST)
     tag = hashlib.sha1((cpp + cuda + " ".join(flags)).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(name=f"p1m_mod_{tag}", cpp_sources=cpp, cuda_sources=cuda,
