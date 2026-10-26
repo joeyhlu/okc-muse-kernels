@@ -134,21 +134,94 @@ static std::vector<int64_t> attrsfz() {
 VIDS = {0: (1, 3, 2, 0), 3: (1, 3, 2, 2, 4)}
 
 
+FX_HELPERS = r"""
+// v5 step 2 (FZX): per-(expert, pass) W13 readiness in P.xw (int view; HK3 never uses xw): [e * 64 + j] = W13 items done
+// (target 64 row blocks), [2048] = consumer warps done zeroing y / ss (target 8 x grid). Zeroed by CTA 0 after the last sync.
+__device__ __forceinline__ int fx_ld(const int* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void fx_poll(const int* p, int target, int* err) {
+  if (fx_ld(p) >= target) return;
+  const long long t0 = clock64();
+  while (fx_ld(p) < target) {
+    __nanosleep(64);
+    if (clock64() - t0 > WAIT_BUDGET) { atomicExch(err, 1); atomicExch(err + 3, 1); return; }
+  }
+}
+__device__ __forceinline__ void fx_ready(const Params& P, int key, int& rkey, bool& zok) {   // W2 producer lane 0
+  const int* rdy = reinterpret_cast<const int*>(P.xw);
+  if (!zok) { fx_poll(rdy + 2048, 8 * (int)gridDim.x, P.err); zok = true; }
+  if (key != rkey) {
+    fx_poll(rdy + key, 64, P.err);
+    asm volatile("fence.proxy.async;\n" ::: "memory");
+    rkey = key;
+  }
+}
+"""
+
+# (region, old, new) applied to the gemm37 source in every copy; gated by `if constexpr (FZX)` / FZX != 0
+G37 = ("__device__ void gemm37(", "// K1 / K2 of the HK3 variants")
+FX_PATCHES = [
+    (None, "constexpr int HP_LAB = @HPLAB@;\n", "constexpr int HP_LAB = @HPLAB@;\nconstexpr int FZX = @FZX@;\n"),
+    (None, "// v3.3 warm-expert item (all of its stages s0..s1)", FX_HELPERS + "// v3.3 warm-expert item (all of its stages s0..s1)"),
+    (G37, "int* dq = P.meta + DQ37 + ((MODE == 1) ? 0 : 2);\n",
+     "int* dq = P.meta + DQ37 + ((MODE == 1) ? 0 : 2);\n    int fx_rkey = -1;\n    bool fx_zok = false;\n"),
+    (G37, "if (lane == 0) bulk_g2s(dst + SW, src, xbytes, fb);",
+     "if (lane == 0) {\n                if constexpr (FZX != 0) fx_ready(P, e * 64 + j, fx_rkey, fx_zok);\n"
+     "                bulk_g2s(dst + SW, src, xbytes, fb);\n              }"),
+    (G37, "    for (int i = blockIdx.x * 256 + tid; i < S.R; i += gridDim.x * 256) P.ss[i] = 0.f;\n  }\n",
+     "    for (int i = blockIdx.x * 256 + tid; i < S.R; i += gridDim.x * 256) P.ss[i] = 0.f;\n  }\n"
+     "  if constexpr (FZX != 0) {\n    if (MODE == 1) {\n      __syncwarp();\n"
+     "      if (lane == 0) { __threadfence(); atomicAdd(reinterpret_cast<int*>(P.xw) + 2048, 1); }\n    }\n  }\n"),
+    (G37, "if (!(s0 == 0 && s1 == 16) || ho) post(e, rb, j, s1 - s0, ntok, c0);",
+     "if (!(s0 == 0 && s1 == 16) || ho) post(e, rb, j, s1 - s0, ntok, c0);\n"
+     "        else if (FZX != 0 && MODE == 1) post(e, rb, j, 32, ntok, c0);   // FZX: whole item -> readiness via the epilogue"),
+    (G37, "if (!(t0 == 0 && t1 == 16) || ho2) post(e, rb2, j2, t1 - t0, nt2, S.off[e] + j2 * tp2);",
+     "if (!(t0 == 0 && t1 == 16) || ho2) post(e, rb2, j2, t1 - t0, nt2, S.off[e] + j2 * tp2);\n"
+     "        else if (FZX != 0 && MODE == 1) post(e, rb2, j2, 32, nt2, S.off[e] + j2 * tp2);"),
+    (G37, "      if (e < 0) break;\n      __threadfence();   // cumulative over the consumers' h / y reds (ordered before us by the mailbox barrier)\n",
+     "      if (e < 0) break;\n      __threadfence();   // cumulative over the consumers' h / y reds (ordered before us by the mailbox barrier)\n"
+     "      if (FZX != 0 && MODE == 1 && ns == 32) {   // whole item flushed by all 8 consumer warps: W13 item done\n"
+     "        if (lane == 0) atomicAdd(reinterpret_cast<int*>(P.xw) + e * 64 + j, 1);\n        continue;\n      }\n"),
+    (G37, "              *reinterpret_cast<float2*>(hp + KDIM) = make_float2(0.f, 0.f);\n            }\n          }\n        }\n      }\n",
+     "              *reinterpret_cast<float2*>(hp + KDIM) = make_float2(0.f, 0.f);\n            }\n          }\n        }\n      }\n"
+     "      if (FZX != 0 && MODE == 1 && last) {   // split / hand-off item finalized: W13 item done\n"
+     "        __syncwarp();\n        if (lane == 0) { __threadfence(); atomicAdd(reinterpret_cast<int*>(P.xw) + e * 64 + j, 1); }\n      }\n"),
+    (None, "  fz_sync(P);\n  setup_bars37<NST>(bars);\n",
+     "  if constexpr (FZX == 0) fz_sync(P);\n  else __syncthreads();   // FZX: no grid sync, W2 units gated per expert\n"
+     "  setup_bars37<NST>(bars);\n"),
+    (None, "  fz_sync(P);\n  if (threadIdx.x == 0) fb_ev(P, 2, 3);\n",
+     "  fz_sync(P);\n  if constexpr (FZX != 0) {\n    if (blockIdx.x == 0)\n"
+     "      for (int i = threadIdx.x; i <= 2048; i += blockDim.x) reinterpret_cast<int*>(P.xw)[i] = 0;\n  }\n"
+     "  if (threadIdx.x == 0) fb_ev(P, 2, 3);\n"),
+]
+
+
 def lab_source():
     src = FB.patched_source()
     src = FB._sub_once(src, None, "}  // namespace k3\n", FZ + "}  // namespace k3\n", "fz kernel")
     src = FB._sub_once(src, None, "void run3(int64_t vid,", HOST + "\nvoid run3(int64_t vid,", "fz host")
+    for i, (reg, old, new) in enumerate(FX_PATCHES):
+        src = FB._sub_once(src, reg, old, new, f"fx patch {i}")
     k = src.index("namespace k3 {")
     head, body = src[:k], src[k:]
     cs = [FB._case(v) for v in (0, 3)]
     cases = "\n".join(c[0] for c in cs) + "\n    case 40: launchfz<1, 3>(p, (int)G); break;\n    case 45: launchfz<4, 3>(p, (int)G); break;"
     attrs = "\n".join(c[1] for c in cs) + "\n    case 40: return attrsfz<1, 3>();\n    case 45: return attrsfz<4, 3>();"
-    copy = body.replace("@HPLAB@", "0").replace("@CASES3@", cases).replace("@ATTRS3@", attrs)
-    cuda = (head + f"\nnamespace fzL {{\n{copy}\n}}  // namespace fzL\n"
-            f"\nvoid fzrun({H.RUN_ARGS}) {{\n  fzL::run3({H.RUN_NAMES});\n}}\n"
-            "std::vector<int64_t> fzattrs(int64_t vid) { return fzL::attrs3v(vid); }\n")
+    parts = [head]
+    for ns, fzx in (("fzL", 0), ("fxL", 1)):
+        copy = (body.replace("@HPLAB@", "0").replace("@FZX@", str(fzx)).replace("@CASES3@", cases)
+                .replace("@ATTRS3@", attrs))
+        parts.append(f"\nnamespace {ns} {{\n{copy}\n}}  // namespace {ns}\n")
+    cuda = ("".join(parts) + f"\nvoid fzrun({H.RUN_ARGS}) {{\n  fzL::run3({H.RUN_NAMES});\n}}\n"
+            f"void fxrun({H.RUN_ARGS}) {{\n  fxL::run3({H.RUN_NAMES});\n}}\n"
+            "std::vector<int64_t> fzattrs(int64_t vid) { return fzL::attrs3v(vid); }\n"
+            "std::vector<int64_t> fxattrs(int64_t vid) { return fxL::attrs3v(vid); }\n")
     cpp = ("#include <torch/extension.h>\n#include <vector>\n"
-           f"void fzrun({H.RUN_ARGS});\nstd::vector<int64_t> fzattrs(int64_t vid);\n")
+           f"void fzrun({H.RUN_ARGS});\nvoid fxrun({H.RUN_ARGS});\nstd::vector<int64_t> fzattrs(int64_t vid);\n"
+           "std::vector<int64_t> fxattrs(int64_t vid);\n")
     return cuda, cpp
 
 
@@ -157,7 +230,7 @@ def build(name="k2a_v5_fused_lab", verbose=False):
     cuda, cpp = lab_source()
     tag = hashlib.sha1((cpp + cuda).encode()).hexdigest()[:10]
     t0 = time.time()
-    mod = load_inline(name=f"{name}_{tag}", cpp_sources=cpp, cuda_sources=cuda, functions=["fzrun", "fzattrs"],
+    mod = load_inline(name=f"{name}_{tag}", cpp_sources=cpp, cuda_sources=cuda, functions=["fzrun", "fxrun", "fzattrs", "fxattrs"],
                       extra_cuda_cflags=H.CFLAGS, verbose=verbose)
     return mod, time.time() - t0
 
