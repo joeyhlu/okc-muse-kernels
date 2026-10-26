@@ -20,11 +20,11 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v26.py"   # v26 = v25 + K2A v4.3 (WSK72, bucket-128 K2 tail pool)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v27.py"   # v27 = v25 + K2A v4.3 WSK72 only (DYN128 dropped: seed-overfit)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v26-1"
+NONCE = "k3-v27-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -226,6 +226,8 @@ def generate():
         K2A43 = importlib.util.module_from_spec(_s43)
         _s43.loader.exec_module(K2A43)
         for what, old, new in K2A43.PATCHES:
+            if what.startswith("DYN128"):   # overfit to the public router seed: verify16 -0.6..-1.5% under secret seeds (jsec_v26_*)
+                continue
             text = patch(text, old, new, "K2A v4.3 " + what)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
