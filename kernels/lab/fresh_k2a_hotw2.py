@@ -319,7 +319,8 @@ def _repack(ws2):
     return torch.cat((w, sf), dim=-1).contiguous()
 
 
-def prepare(weights, incumbent_module, incumbent_state):
+def prepare(weights, incumbent_module, incumbent_state, *, source_factory=None):
+    """Optional LAB source factory; the default emits the frozen original source."""
     import torch
     from torch.utils.cpp_extension import load_inline
     st = incumbent_state.get("st", incumbent_state)
@@ -347,7 +348,7 @@ def prepare(weights, incumbent_module, incumbent_state):
     grid = int(st["grid"][5])
     if grid < 2:
         raise ValueError("hotW2 mixed scheduler needs grid>=2")
-    cuda, cpp = source(incumbent_module)
+    cuda, cpp = (source if source_factory is None else source_factory)(incumbent_module)
     digest = hashlib.sha256((cuda + cpp).encode()).hexdigest()
     with torch.cuda.device(dev), torch.no_grad():
         mod = load_inline(name="fresh_hotw2_" + digest[:16], cpp_sources=cpp, cuda_sources=cuda,
