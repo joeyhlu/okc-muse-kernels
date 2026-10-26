@@ -20,13 +20,14 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v30.py"   # v30 = v29 + P1 o at T=8 (ab_o8: verify 1 load x1.0089)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v31.py"   # v31 = v30 + KS1 one-launch sliding attention T=1/8 (agent: -4.2 / -5.9 us in-layer)
+# v30 = v29 + P1 o at T=8 (ab_o8: verify 1 load x1.0089)
 # v29 = v28 + P1M qkv/o at T=16 (ab_v28p) + K2A v4.7 K1 PDL (T <= 32)
 # v28 = v27 + K1 SECT + PAIR (decode full B32 -7.6 us, bitwise)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v30-1"
+NONCE = "k3-v31-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -197,6 +198,8 @@ K1V24_FILE = ROOT / "tools/k1_v24_patches.py"    # K1 decode full: SECT (whole-s
 USE_K1V24 = True
 K2A47_FILE = ROOT / "tools/k2a_v47_patches.py"   # K1 PDL secondary of the tail on vid 0 / 3 (agent: T=8 x1.005-1.009)
 USE_K2A47 = True
+KS1_FILE = ROOT / "tools/ks1_patches.py"   # one-launch sliding attention at T = 1 / 8 (box_out/ks1/ab3.log)
+USE_KS1 = True
 USE_K2A42 = True    # v4.2 WSK byte-weighted work split at T=256 (agent: -24.3 us median vs ship, x1.085)
 
 
@@ -260,6 +263,11 @@ def generate():
     gtxt = gtxt.replace("V20_P1M_ROUTE = {}\n", route)
     section = BANNER + "".join(t.rstrip("\n") + "\n\n\n" for _, t in p1m) + v20_pack_text(base).rstrip("\n") + "\n\n\n" + gtxt
     text = patch(text, ANCHOR, section + ANCHOR, "V20 section")
+    if USE_KS1 and KS1_FILE.exists():   # scoped patches against the full layer text (agent export vs k3_v29)
+        _sks = importlib.util.spec_from_file_location("ks1_patches", KS1_FILE)
+        KS1 = importlib.util.module_from_spec(_sks)
+        _sks.loader.exec_module(KS1)
+        text = KS1.apply(text)
     return text, base
 
 
