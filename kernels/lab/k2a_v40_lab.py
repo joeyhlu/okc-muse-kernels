@@ -59,16 +59,14 @@ import hot_p1_lab as H  # noqa: E402
 V40_LEAN, V40_DEFER, V40_FLUSH2, V40_COLD1, V40_EARLY, V40_DUAL = 1, 2, 4, 8, 16, 32
 V40_HANDOFF = 64   # needs FLUSH2 (the hot whole-item signal lives in FLUSH2's flush)
 V40_WSK = 128      # byte-weighted Stream-K ranges inside a role
+V40_WSKP = 256     # WSK weights A + B * rows from Params.rdy[3000 + (MODE - 1) * 4 + (cold ? 2 : 0) + {0, 1}] (runtime)
 # name -> (HP_LAB, V40_PROF, V40_VAR, vids built)
 COPIES = {
     "base":    (0, 0, 0, (2, 5)),
     "lf":      (0, 0, V40_LEAN | V40_FLUSH2, (2,)),
-    "hoe":     (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_HANDOFF, (2,)),
-    "lw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_WSK, (2,)),
-    "aw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_WSK, (2,)),
-    "hw":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_COLD1 | V40_EARLY | V40_HANDOFF | V40_WSK, (2,)),
+    "lp":      (0, 0, V40_LEAN | V40_FLUSH2 | V40_WSK | V40_WSKP, (2,)),   # = v4.0 + v4.2 with runtime WSK weights
 }
-# earlier batches also built: prof (PROF), lean, c1, ce, cd, alle, alled, profe, ho (see notes/lab.md 10-26 K2A v4.0 rows)
+# earlier batches also built: prof (PROF), lean, c1, ce, cd, alle, alled, profe, ho, hoe, lw, aw, hw (see notes/lab.md 10-26 K2A v4.0 rows)
 NWARP = 10
 NCNT = 8
 
@@ -148,24 +146,26 @@ __device__ __forceinline__ void v40_signal(const Params& P, int key, int n) {
 """
 WSK_HELPERS = r"""
 // v4.0 WSK: stage index of this role's sequence where the byte-model weight prefix reaches T
+// weight of a stage of pass jj = A + B * rows (rows = ntok, hot: rounded up to 8); wm = {A, B} (runtime, WSKP) or null (36, 1)
 template <bool HOT, int NC, int NRB>
-__device__ __forceinline__ long long v40_wpass(int c, int jj) {
+__device__ __forceinline__ long long v40_wpass(int c, int jj, const int* wm) {
   constexpr int TP = HOT ? 64 : 8 * NC;
   const int nt = min(TP, c - jj * TP);
-  return 36 + (HOT ? ((nt + 7) & ~7) : nt);
+  const int rows = HOT ? ((nt + 7) & ~7) : nt;
+  return wm ? (long long)wm[0] + (long long)wm[1] * rows : 36 + rows;
 }
 template <bool HOT, int NC, int NRB>
-__device__ __forceinline__ int v40_wpos(const Route& S, long long T) {
+__device__ __forceinline__ int v40_wpos(const Route& S, long long T, const int* wm) {
   for (int e = 0; e < 32; ++e) {
     if (S.sb[e + 1] == S.sb[e]) continue;
     const int np = S.np[e], c = S.cnt[e];
     long long wrb = 0;
-    for (int jj = 0; jj < np; ++jj) wrb += 16 * v40_wpass<HOT, NC, NRB>(c, jj);
+    for (int jj = 0; jj < np; ++jj) wrb += 16 * v40_wpass<HOT, NC, NRB>(c, jj, wm);
     if (T >= wrb * NRB) { T -= wrb * NRB; continue; }
     const int rb = (int)(T / wrb);
     T -= rb * wrb;
     for (int jj = 0; jj < np; ++jj) {
-      const long long w = v40_wpass<HOT, NC, NRB>(c, jj);
+      const long long w = v40_wpass<HOT, NC, NRB>(c, jj, wm);
       if (T >= 16 * w) { T -= 16 * w; continue; }
       return S.sb[e] + (rb * np + jj) * 16 + (int)(T / w);
     }
@@ -174,14 +174,14 @@ __device__ __forceinline__ int v40_wpos(const Route& S, long long T) {
   return S.sb[32];
 }
 template <bool HOT, int NC, int NRB>
-__device__ __forceinline__ void v40_wrange(const Route& S, int cta, int ncta, int& beg, int& end) {
+__device__ __forceinline__ void v40_wrange(const Route& S, int cta, int ncta, int& beg, int& end, const int* wm = nullptr) {
   long long W = 0;
   for (int e = 0; e < 32; ++e) {
     if (S.sb[e + 1] == S.sb[e]) continue;
-    for (int jj = 0; jj < S.np[e]; ++jj) W += 16LL * NRB * v40_wpass<HOT, NC, NRB>(S.cnt[e], jj);
+    for (int jj = 0; jj < S.np[e]; ++jj) W += 16LL * NRB * v40_wpass<HOT, NC, NRB>(S.cnt[e], jj, wm);
   }
-  beg = v40_wpos<HOT, NC, NRB>(S, W * cta / ncta);
-  end = (cta + 1 == ncta) ? S.sb[32] : v40_wpos<HOT, NC, NRB>(S, W * (cta + 1) / ncta);
+  beg = v40_wpos<HOT, NC, NRB>(S, W * cta / ncta, wm);
+  end = (cta + 1 == ncta) ? S.sb[32] : v40_wpos<HOT, NC, NRB>(S, W * (cta + 1) / ncta, wm);
 }
 """
 COLD_HELPERS = r"""
@@ -581,7 +581,8 @@ HO_PATCHES = [
      "    if (P.rdy != nullptr)\n"
      "      for (int i = blockIdx.x * 256 + threadIdx.x; i < 2049; i += gridDim.x * 256) P.rdy[i] = 0;\n  }\n"),
     ("wsk range", GEMM_REGION, "  int beg, end;\n  my_range2(Stot, cta, ncta, beg, end);\n",
-     "  int beg, end;\n  if constexpr (WSK) v40_wrange<HOTCAP, NC, NRB>(S, cta, ncta, beg, end);\n"
+     "  int beg, end;\n  if constexpr (WSK) v40_wrange<HOTCAP, NC, NRB>(S, cta, ncta, beg, end,\n"
+     "      ((V40_VAR & 256) != 0 && P.rdy != nullptr) ? P.rdy + 3000 + (MODE - 1) * 4 + (HOTCAP ? 0 : 2) : nullptr);\n"
      "  else my_range2(Stot, cta, ncta, beg, end);\n"),
     ("k2 own weight", K2_REGION, "    const bool hr = pick_role<NC>(S, P.hot_w4, P.hot_t, cta, ncta);\n",
      "    const bool hr = pick_role<NC>(S, P.hot_mode > 0 ? P.hot_mode : P.hot_w4, P.hot_t, cta, ncta);\n"),

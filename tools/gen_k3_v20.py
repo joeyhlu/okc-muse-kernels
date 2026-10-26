@@ -20,11 +20,11 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v25.py"   # v25 = v23 + K2A v4.2 WSK final (constexpr NC == 2 gate)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v26.py"   # v26 = v25 + K2A v4.3 (WSK72, bucket-128 K2 tail pool)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v25-1"
+NONCE = "k3-v26-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -188,6 +188,8 @@ USE_K2A40 = True
 K2A41_FILE = ROOT / "tools/k2a_v41_patches.py"
 USE_K2A41 = False
 K2A42_FILE = ROOT / "tools/k2a_v42_patches.py"   # per-expert K1 -> K2 hand-off (agent), on top of v4.0
+K2A43_FILE = ROOT / "tools/k2a_v43_patches.py"   # WSK hot weight 72 + rows (T=256 ~ -2 us) + bucket-128 K2 tail pool 8/64 (-7.1 us)
+USE_K2A43 = True
 USE_K2A42 = True    # v4.2 WSK byte-weighted work split at T=256 (agent: -24.3 us median vs ship, x1.085)
 
 
@@ -219,6 +221,12 @@ def generate():
         _s42.loader.exec_module(K2A42)
         for what, old, new in K2A42.PATCHES:
             text = patch(text, old, new, "K2A v4.2 " + what)
+    if USE_K2A43 and K2A43_FILE.exists():
+        _s43 = importlib.util.spec_from_file_location("k2a_v43_patches", K2A43_FILE)
+        K2A43 = importlib.util.module_from_spec(_s43)
+        _s43.loader.exec_module(K2A43)
+        for what, old, new in K2A43.PATCHES:
+            text = patch(text, old, new, "K2A v4.3 " + what)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
     check(set(got) == set(P1M_KEEP), f"p1m nodes {sorted(set(P1M_KEEP) ^ set(got))}")
