@@ -184,6 +184,11 @@ _s40 = importlib.util.spec_from_file_location("k2a_v40_patches", ROOT / "tools/k
 K2A40 = importlib.util.module_from_spec(_s40)
 _s40.loader.exec_module(K2A40)
 USE_K2A40 = True
+# K2A v4.1 small-T consumer diet (tools/k2a_v41_patches.py, agent; applied after v4.0 when the file exists and USE_K2A41)
+K2A41_FILE = ROOT / "tools/k2a_v41_patches.py"
+USE_K2A41 = False
+K2A42_FILE = ROOT / "tools/k2a_v42_patches.py"   # per-expert K1 -> K2 hand-off (agent), on top of v4.0
+USE_K2A42 = False
 
 
 def generate():
@@ -202,6 +207,18 @@ def generate():
     if USE_K2A40:
         for what, old, new in K2A40.PATCHES:
             text = patch(text, old, new, "K2A v4.0 " + what)
+    if USE_K2A41 and K2A41_FILE.exists():
+        _s41 = importlib.util.spec_from_file_location("k2a_v41_patches", K2A41_FILE)
+        K2A41 = importlib.util.module_from_spec(_s41)
+        _s41.loader.exec_module(K2A41)
+        for what, old, new in K2A41.PATCHES:
+            text = patch(text, old, new, "K2A v4.1 " + what)
+    if USE_K2A42 and K2A42_FILE.exists():
+        _s42 = importlib.util.spec_from_file_location("k2a_v42_patches", K2A42_FILE)
+        K2A42 = importlib.util.module_from_spec(_s42)
+        _s42.loader.exec_module(K2A42)
+        for what, old, new in K2A42.PATCHES:
+            text = patch(text, old, new, "K2A v4.2 " + what)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
     check(set(got) == set(P1M_KEEP), f"p1m nodes {sorted(set(P1M_KEEP) ^ set(got))}")
