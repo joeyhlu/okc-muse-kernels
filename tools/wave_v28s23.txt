@@ -1,0 +1,2 @@
+muse_decode_layer kernels/muse_decode_layer/k3_v28_s2.py
+muse_decode_layer kernels/muse_decode_layer/k3_v28_s3.py
