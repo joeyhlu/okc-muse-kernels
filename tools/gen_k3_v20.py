@@ -20,7 +20,8 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v33.py"   # v33 = v32 + KS3 (looping B>1 sliding decode, NS8: dec16 x1.02 / dec32 x1.017)
+OUT = ROOT / "kernels/muse_decode_layer/k3_v34.py"   # v34 = v33 + DG1 (swap-AB wgmma + DSMEM split-K + PDL) for cat/qkv at T=32: dec32 x1.009
+# v33 = v32 + KS3 (looping B>1 sliding decode, NS8: dec16 x1.02 / dec32 x1.017)
 # v32 = v31 + KS2 (KS1 at decode 16 sliding, folded new key: x1.026 in-layer)
 # v31 = v30 + KS1 one-launch sliding attention T=1/8 (agent: -4.2 / -5.9 us in-layer)
 # v30 = v29 + P1 o at T=8 (ab_o8: verify 1 load x1.0089)
@@ -29,7 +30,7 @@ OUT = ROOT / "kernels/muse_decode_layer/k3_v33.py"   # v33 = v32 + KS3 (looping 
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v33-1"
+NONCE = "k3-v34-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -206,6 +207,8 @@ KS2_FILE = ROOT / "tools/ks2_patches.py"   # box_out/ks2/ab*.log: decode 16 slid
 USE_KS2 = True
 KS3_FILE = ROOT / "tools/ks3_patches.py"   # box_out/ks3/ab*.log
 USE_KS3 = True
+DG1_FILE = ROOT / "tools/dg1_patches.py"   # box_out/dg1/ab1.log, ab2.log: decode 32 load x1.0099 / x1.0088
+USE_DG1 = True
 USE_K2A42 = True    # v4.2 WSK byte-weighted work split at T=256 (agent: -24.3 us median vs ship, x1.085)
 
 
@@ -284,6 +287,11 @@ def generate():
         KS3 = importlib.util.module_from_spec(_sk3)
         _sk3.loader.exec_module(KS3)
         text = KS3.apply(text)
+    if USE_DG1 and DG1_FILE.exists():   # DG1 dense GEMM (agent export vs k3_v33; built inside the KS1 extension)
+        _sdg = importlib.util.spec_from_file_location("dg1_patches", DG1_FILE)
+        DG1 = importlib.util.module_from_spec(_sdg)
+        _sdg.loader.exec_module(DG1)
+        text = DG1.apply(text)
     return text, base
 
 

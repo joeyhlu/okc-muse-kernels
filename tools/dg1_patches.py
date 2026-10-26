@@ -9,8 +9,8 @@ no workspace / atomics / 2nd kernel). PDL: weights of the first ST stages are re
 global store after it; launch_dependents at entry on one-wave grids. Bounded mbarrier waits (err flag, no trap).
 
 Layer glue: DG1_ENABLE / DG1_ROUTE {(projection, bucket): True} read at call time (A/B variants switch routes off without a new
-prepare); DG1_GEOMETRY {(projection, bucket): (T, NWG, MT, S)}; every DG1_ROUTE key is built (one small load_inline holding only
-the routed instantiations) and self-tested in prepare: random x at T = bucket and bucket - 3 vs FP64 (rel-L2 < 4e-3 bf16 /
+prepare); DG1_GEOMETRY {(projection, bucket): (T, NWG, MT, S)}; every DG1_ROUTE key is built (DG1_FOLD_KS1: the routed
+instantiations ride in KS1's load_inline, +~1 s; else DG1's own small build, +~38 s cold) and self-tested in prepare: random x at T = bucket and bucket - 3 vs FP64 (rel-L2 < 4e-3 bf16 /
 1e-4 fp32 out) and vs today's torch.mm (< 1e-2), NaN-prefilled output fully written, repeat bit-identical, no timeout flag. A
 failed self-test turns that route off; a host exception at call time disables DG1 for the run (_k3_disable).
 
@@ -24,11 +24,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 LAYER = ROOT / "kernels/muse_decode_layer/k3_v33.py"
 LAB = ROOT / "kernels/lab/dg1_lab.py"
 
-# Routed (projection, bucket) -> geometry (T, NWG, MT, S). DG1 was KILLED at the lab gate (2026-10-26, notes/lab.md DG1 row): the
-# one-launch bulk weight stream alone only matches cuBLAS (W-only, no compute: cat T=32 x1.03, qkv T=32 x1.10), so NOTHING is
-# routed and this patch is not applied to any layer. GEOMETRY = the lab's best per (projection, bucket), kept for a faster primitive.
-ROUTE = {}
-GEOMETRY = {("qkv", 32): (32, 2, 1, 4), ("cat", 32): (32, 2, 1, 3), ("qkv", 128): (128, 2, 1, 5), ("cat", 128): (128, 2, 1, 3)}
+# Routed (projection, bucket) -> geometry (T, NWG, MT, S). Standalone DG1 missed the x1.10 lab gate (it only matches cuBLAS), but
+# in-layer at T = 32 the PDL weight prefetch wins (box_out/dg1/ab1.log, layer_ab2 shapes 4,5 x 3 seeds, checks pass): decode-32
+# load x1.0077 (cat) / x1.0099 (cat + qkv); sliding x1.012 / x1.018, full x1.002 / x0.998. T = 128 / 256 lose -> not routed.
+ROUTE = {("cat", 32): True, ("qkv", 32): True}
+GEOMETRY = {("cat", 32): (32, 2, 1, 3), ("qkv", 32): (32, 2, 1, 4)}
 
 
 def _lab_block():
@@ -136,7 +136,9 @@ def layer_py():
         "    t1 = time.time()\n"
         "    insts = tuple(sorted({DG1_GEOMETRY[k][:3] for k in keys}))\n"
         "    try:\n"
-        "        mod = _dg1_build(insts)\n"
+        '        ks = _KS1.get("mod")\n'
+        '        folded = ks is not None and _KS1.get("dg1_insts") == insts and hasattr(ks, "dg1_run")\n'
+        "        mod = ks if folded else _dg1_build(insts)   # folded: built inside KS1's extension (DG1_FOLD_KS1)\n"
         "    except Exception as ex:  # noqa: BLE001\n"
         '        print(f"[dg1] build FAILED -> today\'s path: {ex!r}", flush=True)\n'
         "        return None\n"
@@ -178,6 +180,23 @@ def layer_py():
     )
 
 
+FOLD_PY = (
+    "DG1_FOLD_KS1 = True   # DG1's kernels ride in KS1's extension (no 2nd torch-header compile: -30 s cold prepare); else own build\n"
+    "\n\n"
+    "def _dg1_insts():\n"
+    "    return tuple(sorted({DG1_GEOMETRY[k][:3] for k in DG1_ROUTE if k in DG1_GEOMETRY}))\n"
+    "\n\n"
+    "def _dg1_fold_on():\n"
+    "    return bool(DG1_ENABLE and DG1_FOLD_KS1 and _dg1_insts())\n"
+    "\n\n"
+    "def _dg1_fold(part):\n"
+    '    """What _ks1_build adds for DG1: "cuda" source, "cpp" declarations, "fns" exports (empty when the fold is off)."""\n'
+    "    if not _dg1_fold_on():\n"
+    '        return [] if part == "fns" else ""\n'
+    '    return {"cuda": "\\n" + dg1_cuda_src(list(_dg1_insts())), "cpp": DG1_CPP_SRC, "fns": ["dg1_run", "dg1_info"]}[part]\n'
+    "\n\n"
+)
+KS1B = ("def _ks1_build():", "\ndef ")
 FN = ("def kernel_fn(data, state):", "\n    return next_attn_input")
 PREP = ("def prepare(weights):", "\n    occ = ")
 DISABLE = "def _k3_disable(state, key, value, piece, ex):\n"
@@ -187,6 +206,16 @@ def patches():
     return [
         ("PY: DG1 block", ("# ---------------------------------------------------------------- KS1 (tools/ks1_patches.py)", None),
          DISABLE, layer_py() + DISABLE),
+        ("PY: DG1 fold helpers", ("# ---------------------------------------------------------------- KS1 (tools/ks1_patches.py)", None),
+         '_DG1 = {"mod": None, "insts": None, "build_s": 0.0}\n', FOLD_PY + '_DG1 = {"mod": None, "insts": None, "build_s": 0.0}\n'),
+        ("KS1 build: DG1 cuda", KS1B, '    cuda = KS1_CUDA_SRC.replace("@INSTS@", insts)\n',
+         '    cuda = KS1_CUDA_SRC.replace("@INSTS@", insts) + _dg1_fold("cuda")   # DG1 (tools/dg1_patches.py) rides in this build\n'),
+        ("KS1 build: DG1 cpp + exports", KS1B,
+         'cpp_sources=KS1_CPP_SRC, cuda_sources=cuda,\n                              functions=["ks1_forward", "ks1_info", "ks3_forward", "ks3_info"],',
+         'cpp_sources=KS1_CPP_SRC + _dg1_fold("cpp"), cuda_sources=cuda,\n'
+         '                              functions=["ks1_forward", "ks1_info", "ks3_forward", "ks3_info"] + _dg1_fold("fns"),'),
+        ("KS1 build: DG1 insts", KS1B, '    _KS1["build_s"] = time.time() - t0\n',
+         '    _KS1["build_s"] = time.time() - t0\n    _KS1["dg1_insts"] = _dg1_insts() if _dg1_fold_on() else None\n'),
         ("PREP: DG1 prepare", PREP,
          "    _ks1_prepare(state, t0)   # KS1: one-launch B = 1 sliding attention (FA4 v8 stays on failure)\n",
          "    _ks1_prepare(state, t0)   # KS1: one-launch B = 1 sliding attention (FA4 v8 stays on failure)\n"
