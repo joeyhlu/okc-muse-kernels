@@ -23,13 +23,24 @@ if str(HERE) not in sys.path:
 import hot_p1_lab as H  # noqa: E402
 
 REC = 16
-VIDS = {0: (1, 3, 2, 0), 3: (1, 3, 2, 2, 4)}
+VIDS = {0: (1, 3, 2, 0), 3: (1, 3, 2, 2, 4), 5: (1, 3, 2, 3, 4)}
 
 FB_HELPERS = r"""
 // ======== fused-bound lab helpers (kernels/lab/k2a_fb_lab.py) ========
 __device__ __forceinline__ void fb_ev(const Params& P, int k, int i) {
   if (P.hpclk == nullptr || blockIdx.x >= 1024) return;
   P.hpclk[((size_t)k * 1024 + blockIdx.x) * 16 + i] = hp_gt();
+}
+// per-CTA work mix (consumer thread 0, every item): [9] hot stages, [10] cold stages, [11] gt start of the last item,
+// [12] last item 100 * hot + nch, [13] hot stages with nch >= 3, [14] sum of nch * stages
+__device__ __forceinline__ void fb_item(const Params& P, int k, bool hk, int nch, int ns) {
+  if (P.hpclk == nullptr || blockIdx.x >= 1024 || threadIdx.x != 0) return;
+  long long* h = P.hpclk + ((size_t)k * 1024 + blockIdx.x) * 16;
+  h[hk ? 9 : 10] += ns;
+  h[11] = hp_gt();
+  h[12] = (hk ? 100 : 0) + nch;
+  if (hk && nch >= 3) h[13] += ns;
+  h[14] += (long long)nch * ns;
 }
 """
 
@@ -116,6 +127,7 @@ def patched_source():
     src = _sub_once(src, None, "// v3.3 warm-expert item (all of its stages s0..s1)",
                     "__device__ __forceinline__ void hp_mark(const Params& P, int k, int slot, int role);\n"
                     "__device__ __forceinline__ void fb_ev(const Params& P, int k, int i);\n"
+                    "__device__ __forceinline__ void fb_item(const Params& P, int k, bool hk, int nch, int ns);\n"
                     "// v3.3 warm-expert item (all of its stages s0..s1)", "forward decls")
     for reg in (("__device__ void gemm(const Params& P, Route& S,", "__device__ __forceinline__ void setup_bars("),
                 ("__device__ void gemm36(", "k1_kernel36(const Params P) {")):
@@ -127,6 +139,12 @@ def patched_source():
         if n1 != 1 or n2 < 1:
             raise RuntimeError(f"k2a_fb producer marks in {reg[0]!r}: {n1} copy / {n2} wait anchors")
         src = src[:a] + seg3 + src[b:]
+    src = _sub_once(src, ("__device__ void gemm36(", "k1_kernel36(const Params P) {"),
+                    "        if (nch <= 1) {\n          cold_item<",
+                    "        fb_item(P, MODE - 1, hk, nch, s1 - s0);\n        if (nch <= 1) {\n          cold_item<", "item36")
+    src = _sub_once(src, ("__device__ void gemm37(", "// K1 / K2 of the HK3 variants"),
+                    "      if (nch <= 1) {\n        cold_item<",
+                    "      fb_item(P, MODE - 1, hk, nch, s1 - s0);\n      if (nch <= 1) {\n        cold_item<", "item37")
     # vid 3 kernels: entry / gemm start / gemm end marks (role 3 = HK2 mixed)
     for k, kern, nxt, call in ((0, "k1_kernel36(const Params P) {", "k2_kernel36(const Params P) {",
                                 "  gemm36<NCH, NST, 1>(P, S, s_list, smem, bars, false, s_pr);\n"),
@@ -143,6 +161,26 @@ def patched_source():
     k3e = "    *reinterpret_cast<uint2*>(P.out + (size_t)tok * KDIM + col) = o;\n    __syncthreads();\n  }\n}\n"
     src = _sub_once(src, None, k3e, k3e[:-2] + "  if (threadIdx.x == 0) fb_ev(P, 2, 5);\n}\n", "k3 end")
     src = _sub_once(src, None, "}  // namespace k3\n", STREAM + "}  // namespace k3\n", "stream kernel")
+    # SMT (copy fbL1): role by per-SM arrival ticket (vid 3 / 5 kernels); fbL0 keeps blockIdx (= shipped)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("patch_smt_helpers", str(HERE / "k2a_fb_smt.py"))
+    M = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(M)
+    src = _sub_once(src, None, "constexpr int HP_LAB = @HPLAB@;\n", "constexpr int HP_LAB = @HPLAB@;\nconstexpr int SMT = @SMT@;\n", "smt c")
+    src = _sub_once(src, None, "// v3.3 warm-expert item (all of its stages s0..s1)",
+                    M.SMT_HELPERS + "// v3.3 warm-expert item (all of its stages s0..s1)", "smt helpers")
+    assert src.count("const int G = (int)gridDim.x, c = (int)blockIdx.x;") == 2
+    src = src.replace("const int G = (int)gridDim.x, c = (int)blockIdx.x;", "const int G = (int)gridDim.x, c = fb_lcta;")
+    for k, kern, nxt, ent, call, role in (
+            (0, "k1_kernel36(const Params P) {", "k2_kernel36(const Params P) {", "  hp_mark(P, 0, 0, 3);\n",
+             "  hp_mark(P, 0, 2, 3);\n", None),
+            (1, "k2_kernel36(const Params P) {", "// ====", "  hp_mark(P, 1, 0, 3);\n", "  hp_mark(P, 1, 2, 3);\n", None),
+            (0, "k1_kernel37(const Params P) {", "k2_kernel37(const Params P) {", "  hp_mark(P, 0, 0, 2);\n",
+             "  hp_mark(P, 0, 2, 2);\n", None),
+            (1, "k2_kernel37(const Params P) {", "// K1: route + W13 (+ SwiGLU).", "  hp_mark(P, 1, 0, 2);\n",
+             "  hp_mark(P, 1, 2, 2);\n", None)):
+        src = _sub_once(src, (kern, nxt), ent, ent + f"  fb_sm_ticket(P, {k});\n", f"{kern} ticket")
+        src = _sub_once(src, (kern, nxt), call, call + f"  fb_sm_exit(P, {k});\n", f"{kern} exit")
     return src
 
 
@@ -151,6 +189,9 @@ def _case(vid):
     if hk == 2:
         return (f"    case {vid}: launch36<{nch}, {nst}>(p, (int)G, (int)G3, (int)mask); break;",
                 f"    case {vid}: return attrs36<{nch}, {nst}>();")
+    if hk == 3:
+        return (f"    case {vid}: launch37<{nch}, {nst}>(p, (int)G, (int)G3, (int)mask); break;",
+                f"    case {vid}: return attrs37<{nch}, {nst}>();")
     return (f"    case {vid}: launch3<{nc}, {nst}, {minb}, {hk}>(p, (int)G, (int)G3, (int)mask); break;",
             f"    case {vid}: return attrs3<{nc}, {nst}, {minb}, {hk}>();")
 
@@ -160,14 +201,19 @@ def lab_source():
     k = src.index("namespace k3 {")
     head, body = src[:k], src[k:]
     cs = [_case(v) for v in VIDS]
-    copy = (body.replace("@HPLAB@", "0").replace("@CASES3@", "\n".join(c[0] for c in cs))
-            .replace("@ATTRS3@", "\n".join(c[1] for c in cs)))
-    cuda = (head + f"\nnamespace fbL0 {{\n{copy}\n}}  // namespace fbL0\n"
-            f"\nvoid fbrun({H.RUN_ARGS}) {{\n  fbL0::run3({H.RUN_NAMES});\n}}\n"
+    parts = [head]
+    for ns, smt in (("fbL0", 0), ("fbL1", 1)):   # fbL1: roles by per-SM arrival ticket (SMT)
+        copy = (body.replace("@HPLAB@", "0").replace("@SMT@", str(smt)).replace("@CASES3@", "\n".join(c[0] for c in cs))
+                .replace("@ATTRS3@", "\n".join(c[1] for c in cs)))
+        parts.append(f"\nnamespace {ns} {{\n{copy}\n}}  // namespace {ns}\n")
+    cuda = ("".join(parts) + f"\nvoid fbrun({H.RUN_ARGS}) {{\n  fbL0::run3({H.RUN_NAMES});\n}}\n"
+            f"void fbrun1({H.RUN_ARGS}) {{\n  fbL1::run3({H.RUN_NAMES});\n}}\n"
             f"std::vector<int64_t> fbattrs(int64_t vid) {{ return fbL0::attrs3v(vid); }}\n"
+            f"std::vector<int64_t> fbattrs1(int64_t vid) {{ return fbL1::attrs3v(vid); }}\n"
             + STREAM_HOST.replace("k3::SW", "fbL0::k3::SW"))
     cpp = ("#include <torch/extension.h>\n#include <vector>\n"
-           f"void fbrun({H.RUN_ARGS});\nstd::vector<int64_t> fbattrs(int64_t vid);\n"
+           f"void fbrun({H.RUN_ARGS});\nvoid fbrun1({H.RUN_ARGS});\nstd::vector<int64_t> fbattrs(int64_t vid);\n"
+           "std::vector<int64_t> fbattrs1(int64_t vid);\n"
            "void fbstream_run(torch::Tensor ws13, torch::Tensor ws2, torch::Tensor elist, int64_t ne, torch::Tensor err, "
            "torch::Tensor marks, int64_t G, int64_t nst);\n")
     return cuda, cpp
@@ -179,7 +225,7 @@ def build(name="k2a_fb_lab", verbose=False):
     tag = hashlib.sha1((cpp + cuda).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(name=f"{name}_{tag}", cpp_sources=cpp, cuda_sources=cuda,
-                      functions=["fbrun", "fbattrs", "fbstream_run"], extra_cuda_cflags=H.CFLAGS, verbose=verbose)
+                      functions=["fbrun", "fbrun1", "fbattrs", "fbattrs1", "fbstream_run"], extra_cuda_cflags=H.CFLAGS, verbose=verbose)
     return mod, time.time() - t0
 
 
