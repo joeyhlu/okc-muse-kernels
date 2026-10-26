@@ -20,11 +20,11 @@ import py_compile
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "kernels/muse_decode_layer/k3_v22.py"   # v22 = v21 (v20 + early PDL triggers) + FA4 v7 FP8 PV
+OUT = ROOT / "kernels/muse_decode_layer/k3_v23.py"   # v23 = v21 + FA4 v8 (FP8 PV + fat combine) + K2A v4.0 (T=256)
 BASE = ROOT / "kernels/muse_decode_layer/k3_v19.py"   # v19 = v18 + the G2 riders (box +0.5..1% at verify 1)
 SRC_P1M = ROOT / "kernels/muse_bf16_proj/p1m_module.py"
 SRC_GLUE = ROOT / "kernels/muse_decode_layer/v20_p1m.py"
-NONCE = "k3-v22-1"
+NONCE = "k3-v23-1"
 
 _s18 = importlib.util.spec_from_file_location("gen_k3_v18", ROOT / "tools/gen_k3_v18.py")
 G18 = importlib.util.module_from_spec(_s18)
@@ -177,8 +177,13 @@ def v20_pack_text(base):
 
 
 FA4_V6 = ROOT / "kernels/muse_attention_decode/k1_fa4v6.py"
-FA4_V7 = ROOT / "kernels/muse_attention_decode/k1_fa4v7.py"   # v6 + FP8 PV (tools/gen_k1_fa4v7.py; box: ver32 full -7.0, ver16 -5.4 us)
+FA4_V7 = ROOT / "kernels/muse_attention_decode/k1_fa4v8.py"   # v6 + FP8 PV (v7: ver32 full -7.0, ver16 -5.4 us) + fat combine (v8: sliding -0.1..-2.4, full B16/32 -0.6/-1.9)
 USE_FA4_V7 = True
+# K2A v4.0 LEAN + FLUSH2 + fine role weight (tools/k2a_v40_patches.py; T=256 MoE -11.7 us median, bitwise except Stream-K cut points)
+_s40 = importlib.util.spec_from_file_location("k2a_v40_patches", ROOT / "tools/k2a_v40_patches.py")
+K2A40 = importlib.util.module_from_spec(_s40)
+_s40.loader.exec_module(K2A40)
+USE_K2A40 = True
 
 
 def generate():
@@ -193,7 +198,10 @@ def generate():
     for what, old, new in PATCHES:
         text = patch(text, old, new, what)
     if USE_FA4_V7:   # the vendored FA4 block, verbatim v6 -> verbatim v7 (same interface: k1fa4_run / fwd_partials / self_test ...)
-        text = patch(text, FA4_V6.read_text(encoding="utf-8"), FA4_V7.read_text(encoding="utf-8"), "FA4 v6 -> v7 (FP8 PV)")
+        text = patch(text, FA4_V6.read_text(encoding="utf-8"), FA4_V7.read_text(encoding="utf-8"), "FA4 v6 -> v8 (FP8 PV + fat combine)")
+    if USE_K2A40:
+        for what, old, new in K2A40.PATCHES:
+            text = patch(text, old, new, "K2A v4.0 " + what)
     p1m = node_texts(SRC_P1M, P1M_KEEP)
     got = [n for n, _ in p1m if n]
     check(set(got) == set(P1M_KEEP), f"p1m nodes {sorted(set(P1M_KEEP) ^ set(got))}")
