@@ -58,7 +58,7 @@ def _merge_partials(Hot, Cold, Out, N: tl.constexpr, B: tl.constexpr):
 
 
 @torch.no_grad()
-def prepare(weights, tokens, incumbent):
+def prepare(weights, tokens, incumbent, parallel=False):
     """Prepare Humming hot workspace and fixed buffers; callback owns v34 state."""
     if tokens not in (128, 256):
         raise ValueError("this single diagnostic targets T128/256")
@@ -71,6 +71,7 @@ def prepare(weights, tokens, incumbent):
     return {
         "tokens": tokens, "d": d, "experts": 32, "threshold": HOT_THRESHOLD,
         "hot": hot, "incumbent": incumbent,
+        "side_stream": torch.cuda.Stream(device=device) if parallel else None,
         "counts": torch.empty(32, dtype=torch.int32, device=device),
         "hot_ids": torch.empty((tokens, 8), dtype=torch.int32, device=device),
         "cold_ids": torch.empty((tokens, 8), dtype=torch.int32, device=device),
@@ -82,6 +83,7 @@ def prepare(weights, tokens, incumbent):
             "partial_dtype": "BF16", "merge_dtype": "FP32", "output_dtype": "BF16",
             "preserves_full_fp32_expert_combination": False,
             "filtering_and_merge_timed": True, "gpu_numerics_validated": False,
+            "execution": "fork_join" if parallel else "sequential",
         },
     }
 
@@ -110,8 +112,20 @@ def run(data, state):
     # Own dictionaries, shared live activations/weights; original data is untouched.
     hot_data = {**data, "topk_ids": state["hot_ids"]}
     cold_data = {**data, "topk_ids": state["cold_ids"]}
-    hot_out = H.run(hot_data, state["hot"])
-    cold_out = state["incumbent"](cold_data)
+    side = state["side_stream"]
+    if side is None:
+        hot_out = H.run(hot_data, state["hot"])
+        cold_out = state["incumbent"](cold_data)
+    else:
+        # Both branches depend on the timed split and rejoin before the merge.
+        # Humming and the callback have separate workspaces. The caller must
+        # serialize whole calls, as for the sequential implementation.
+        origin = torch.cuda.current_stream(x.device)
+        side.wait_stream(origin)
+        with torch.cuda.stream(side):
+            hot_out = H.run(hot_data, state["hot"])
+        cold_out = state["incumbent"](cold_data)
+        origin.wait_stream(side)
     if (not torch.is_tensor(cold_out) or tuple(cold_out.shape) != (t, d)
             or cold_out.dtype != torch.bfloat16 or cold_out.device != x.device
             or not cold_out.is_contiguous()):
