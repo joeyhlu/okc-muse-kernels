@@ -102,6 +102,7 @@ struct MArgs {
   void* out; int ldo; int N; int nsb_total; int f32;  // out [M, ldo] bf16 (f32 = 0) or fp32 (f32 = 1), columns [0, N)
   float* ws; int* cnt;                                 // split > 1: FP32 slots [S][M][N] + counters [N / (16 RT)]
   int probe;                                           // 1: stream probe (loads consumed by XOR, no decode / mma; timing only)
+  int trig;                                            // 1: griddepcontrol.launch_dependents at entry (one-wave grids only)
   long long il_step;                                   // 0: P1 layout (toff + sb * SB bytes); > 0: grid-interleaved stream
                                                        //    order (p1m_interleave): warp gw's step-s block of row tile r at
                                                        //    (gw * RT + r) * 1536 + s * il_step (every step one coherent front)
@@ -276,6 +277,9 @@ __global__ void __launch_bounds__(512, (D >= 20 ? 2 : 1)) p1m_kernel(const __gri
   constexpr int TT = 8 * MT, RS = TT + 1, ROWS = 16 * RT;
   __shared__ float red[MaxW<MT, RT>::v][ROWS * RS];   // [warp][row * RS + token]
   __shared__ int s_last;
+  // early PDL trigger: the next kernel's CTAs may launch into SMs our CTAs leave and run their pre-wait prologue under our
+  // tail (their griddepcontrol.wait still waits for this whole grid); the host sets it only when the grid is one wave
+  if (A.trig) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   const int tid = (int)threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = (int)(blockDim.x >> 5);
   const int rt0 = (int)blockIdx.x * RT, S = (int)gridDim.y, sidx = (int)blockIdx.y;
   const int c0 = (int)((long long)sidx * A.nsb_total / S), c1 = (int)((long long)(sidx + 1) * A.nsb_total / S);
@@ -498,6 +502,7 @@ void p1m_gemm(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
   A.ws = split > 1 ? ws.data_ptr<float>() : nullptr; A.cnt = split > 1 ? cnt.data_ptr<int>() : nullptr;
   A.il_step = il_step;
   A.probe = (int)((pdl >> 1) & 1);   // pdl bit 1: stream probe
+  A.trig = (int)((pdl >> 2) & 1);    // pdl bit 2: early launch_dependents
   pdl &= 1;
   if (il_step > 0) {
     TORCH_CHECK(ilbuf.scalar_type() == at::kByte && nsb % (split * warps) == 0 && il_step == (int64_t)(N / 16) * split * warps * 1536 &&
@@ -543,6 +548,7 @@ void p1k_gemm(torch::Tensor x, torch::Tensor pk, torch::Tensor toff, torch::Tens
   A.out = out.data_ptr(); A.ldo = (int)ldo; A.N = (int)N; A.nsb_total = nsb; A.f32 = f32 ? 1 : 0;
   A.ws = nullptr; A.cnt = nullptr; A.il_step = 0;
   A.probe = (int)((pdl >> 1) & 1);   // pdl bit 1: stream probe
+  A.trig = 0;
   pdl &= 1;
   p1m::KArgs Kp;
   Kp.ws = ws.data_ptr<float>(); Kp.cnt = cnt.data_ptr<int>(); Kp.kmax = (int)kmax;

@@ -8,6 +8,10 @@ V20_P1M_ENABLE = True   # master switch (read at call time; False also keeps P1M
 # (projection, bucket) -> (warps, split, depth code, mt, rt, interleaved): box sweep winners vs today's cuBLAS path
 V20_P1M_ROUTE = {}
 V20_P1M_TOL = (4e-3, 1e-2)   # self-test: rel-L2 vs FP64, vs today's path (P1's tolerances)
+V20_P1M_PDL = True    # P1M launched with programmatic stream serialization (weights + escapes before its wait; read at call time)
+V20_P1M_TRIG = True   # P1M executes griddepcontrol.launch_dependents at entry (one-wave grids; read at call time)
+V20_P1_TRIG = {'qkv': True, 'o': True, 'pooler': True, 'unpooler': True}   # same for P1 (T <= 8), per projection
+# (box A/B ab_v21a: P1 triggers x1.0074, + P1M PDL + trigger x1.0116 over the T = 1 / 8 / 16 / 32 loads)
 
 
 def _v20_inst():
@@ -39,7 +43,8 @@ def _v20_p1m(state, proj, x):
         return None
     try:
         out = torch.empty((T, P["N"]), dtype=torch.float32 if proj == "cat" else torch.bfloat16, device=x.device)
-        p1m_call(st["mod"], P, x, out, geo[:5], il=st["il"].get(key))
+        pdl = (1 if V20_P1M_PDL else 0) | (4 if V20_P1M_TRIG and st["wave1"].get(key) else 0)
+        p1m_call(st["mod"], P, x, out, geo[:5], il=st["il"].get(key), pdl=pdl)
         return out
     except Exception as ex:  # noqa: BLE001
         _k3_disable(state, "p1m", None, "P1M", ex)
@@ -108,7 +113,7 @@ def _v20_prepare(state):
         print("[v20] P1M: no P1 build with p1m_gemm -> today's path at T = 9..32", flush=True)
         return None
     t0 = time.time()
-    st = {"mod": mod, "proj": {}, "route": {}, "route_try": dict(V20_P1M_ROUTE), "il": {}}
+    st = {"mod": mod, "proj": {}, "route": {}, "route_try": dict(V20_P1M_ROUTE), "il": {}, "wave1": {}}
     try:
         gen = torch.Generator(device=state["dense"]["qkv_gate"].device).manual_seed(2020)
         for proj in sorted({k[0] for k in V20_P1M_ROUTE}):
@@ -135,6 +140,9 @@ def _v20_prepare(state):
                 print(f"[v20] P1M self-test {proj} T={key[1]} geo {geo}: {msg} -> {'ok' if ok else 'FAIL: route off'}", flush=True)
                 if ok:
                     st["route"][key] = geo
+                    occ = int(mod.p1m_info(geo[2], geo[3], geo[4], geo[0])[2])
+                    sms = torch.cuda.get_device_properties(w.device).multi_processor_count
+                    st["wave1"][key] = (P["N"] // (16 * geo[4])) * geo[1] <= occ * sms   # early trigger only for one-wave grids
                 else:
                     st["il"].pop(key, None)
     except Exception as ex:  # noqa: BLE001
@@ -152,3 +160,19 @@ def p1m_verify(mod, P, w):
     perm = torch.tensor(P1M_KPERM, device=w.device)
     cols = (torch.arange(K // 64, device=w.device).view(-1, 1) * 64 + perm.view(1, -1)).reshape(-1)
     return int((u.view(torch.int16) != w[:, cols].view(torch.int16)).sum())
+
+
+_V20_WAVE1 = {}
+
+
+def _v20_p1_trig(st, proj, geo, mode):
+    """2 (P1's launch_dependents bit) when V20_P1_TRIG is on for proj and the P1 grid (rows / 16 x split CTAs) fits in one wave
+    at its occupancy (cached per geometry); else 0. Shape-only; graph safe after the first (prepare-time) call per geometry."""
+    warps, split, depth = geo
+    P = st["proj"][proj]
+    key = (proj, warps, split, depth, mode, P["rows_t8"])
+    if key not in _V20_WAVE1:   # filled on the first call (P1's prepare self-tests), whatever the switch says
+        occ = int(st["mod"].p1s_info(depth, mode, warps)[2])
+        sms = torch.cuda.get_device_properties(P["buf"].device).multi_processor_count
+        _V20_WAVE1[key] = (P["rows_t8"] // 16) * split <= occ * sms
+    return 2 if (V20_P1_TRIG.get(proj) and _V20_WAVE1[key]) else 0

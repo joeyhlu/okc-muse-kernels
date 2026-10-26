@@ -1,0 +1,338 @@
+
+
+# ---- K1-FA4 v7: FP8 PV core (k1_fa4_design.md section 9, K1-FA4 v4's kernel on v6's PDL / prologue / combine path) ----
+# E4M3 P straight from the S accumulator with a static key permutation inside each 32-key block (virtual key
+# 16 kh + 4 q + i <-> actual key 16 kh + 2 q + (0, 1, 8, 9)[i]), so the C-layout values a thread holds form a valid FP8
+# A fragment without shuffles; V stored transposed (Vt[d][key], E4M3, 128B swizzle, K-major) by the producer: each thread
+# gathers its own key quad (4 x 16 B cp.async into a private raw slot, page indices one tile ahead), then 4 LDS.128, a
+# per-lane byte rotation, a 4x4 PRMT transpose and 16 STS.32. Selected per (layer, q_len) by K1FA4_PV8.
+# The vendored class reads k1fa4_K["pv8"] through the helpers below (V stage spec, Vt view, PV tiled-MMA types, P cvt).
+from cutlass._mlir.dialects import llvm as k1fa4_llvm
+from cutlass.cutlass_dsl import T as k1fa4_T
+from cutlass.cutlass_dsl import dsl_user_op as k1fa4_dsl_user_op
+from dataclasses import dataclass as k1fa4_dataclass
+
+
+def k1fa4_sv_spec(fa):
+    """(element type, shape, stages) of the V smem stage: E4M3 Vt (head dim x keys) for the FP8 core, else F16 V."""
+    if k1fa4_K["pv8"]:
+        return (cutlass.Float8E4M3FN, (fa.tile_hdimv, fa.tile_n), fa.num_stages)
+    return (fa.dtype, (fa.tile_n, fa.tile_hdimv), fa.num_stages)
+
+
+def k1fa4_vt_view(sV):
+    """The PV B operand: the stored Vt itself for the FP8 core (K-major), else FA4's transposed view of V."""
+    return sV if k1fa4_K["pv8"] else k1fa4_layout_utils.transpose_view(sV)
+
+
+def k1fa4_pv_dtype(dtype):
+    return cutlass.Float8E4M3FN if k1fa4_K["pv8"] else dtype
+
+
+def k1fa4_pv_major_b(mode):
+    return k1fa4_warpgroup.OperandMajorMode.K if k1fa4_K["pv8"] else mode
+
+
+@k1fa4_dsl_user_op
+def k1fa4_cvt_e4m3x4(a, b, c, d, *, loc=None, ip=None):
+    """Four F32 -> one 32-bit word of E4M3 bytes (a in byte 0), RN, satfinite."""
+    return cutlass.Uint32(k1fa4_llvm.inline_asm(
+        k1fa4_T.i32(),
+        [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip),
+         Float32(c).ir_value(loc=loc, ip=ip), Float32(d).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b16 lo, hi;\ncvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\ncvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
+        "mov.b32 $0, {lo, hi};\n}",
+        "=r,f,f,f,f", has_side_effects=False, is_align_stack=False, asm_dialect=k1fa4_llvm.AsmDialect.AD_ATT))
+
+
+@cute.jit
+def k1fa4_cvt_p8(acc_S, tOrP):
+    """S accumulator (F32, C layout of m64nN) -> E4M3 P in the FP8 A-fragment registers, keys permuted per block:
+    A value v = i + 4 rs + 8 kh of k-block kb takes C value c + 2 rs + 4 j, c = i % 2, j = 4 kb + 2 kh + i // 2."""
+    nkb = cute.size(acc_S) // 16
+    words = cute.make_tensor(cute.recast_ptr(tOrP.iterator, dtype=cutlass.Uint32), cute.make_layout((nkb * 4,)))
+    for kb in cutlass.range_constexpr(nkb):
+        for reg in cutlass.range_constexpr(4):
+            rs, kh = reg % 2, reg // 2
+            base = 2 * rs + 4 * (4 * kb + 2 * kh)
+            words[4 * kb + reg] = k1fa4_cvt_e4m3x4(acc_S[base], acc_S[base + 1], acc_S[base + 4], acc_S[base + 5])
+
+
+def k1fa4_cvt_p(acc_S, tOrP_acc, tOrP):
+    """The consumer's P conversion (replaces FA4's utils.cvt_f16 call): E4M3 with the key permutation for the FP8 core,
+    else FA4's F16 conversion."""
+    if k1fa4_K["pv8"]:
+        k1fa4_cvt_p8(acc_S, tOrP)
+    else:
+        k1fa4_utils.cvt_f16(tOrP_acc, tOrP)
+
+
+@k1fa4_dataclass
+class k1fa4_SoftmaxX(k1fa4_Softmax):
+    """FA4's sm90 online softmax with (a) for the FP8 PV core, stock FA3's FP8 max offset: P = exp2(s x - (s m - 8)),
+    i.e. P in [0, 256] instead of [0, 1], so that small probabilities stay normal in E4M3 (the 2^8 is in the row sum
+    too, so O is unchanged and every split's LSE carries the same + 8 ln 2, which the combine's weights cancel); and
+    (b) the lab exp2 knob K1FA4_EX2: mode 1 = timing mask (one FFMA, no MUFU; results INVALID); mode 2 = partial
+    software exp2 (degree-`deg` polynomial on the FMA pipe, FA4's ex2_emulation) for the elements i % freq < res."""
+
+    @staticmethod
+    def create(scale_log2, num_rows, arch=80, softmax_scale=None):
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
+        return k1fa4_SoftmaxX(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+
+    @cute.jit
+    def online_softmax(self, acc_S: cute.Tensor, is_first: cutlass.Constexpr[bool] = False,
+                       check_inf: cutlass.Constexpr[bool] = True) -> cute.Tensor:
+        mode = K1FA4_EX2["mode"]
+        freq = K1FA4_EX2["freq"]
+        res = K1FA4_EX2["res"]
+        deg = K1FA4_EX2["deg"]
+        off = K1FA4_P8_OFFSET if k1fa4_K["pv8"] else 0.0
+        acc_S_mn = k1fa4_layout_utils.reshape_acc_to_mn(acc_S)
+        row_scale = cute.make_fragment_like(self.row_max, Float32)
+        row_max = self.row_max
+        row_sum = self.row_sum
+        scale_log2 = self.scale_log2
+        arch = self.arch
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            acc_S_row = acc_S_mn[r, None].load()
+            row_max_cur = k1fa4_utils.fmax_reduce(
+                acc_S_row, init_val=row_max[r] if cutlass.const_expr(not is_first) else None, arch=arch)
+            row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
+            row_max_prev = row_max[r]
+            row_max[r] = row_max_cur
+            if cutlass.const_expr(check_inf):
+                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
+            row_max_cur_scaled = row_max_cur * scale_log2
+            if cutlass.const_expr(mode == 0):  # FA4's MUFU exp2 (with the FP8 offset)
+                acc_S_row_exp = cute.math.exp2(acc_S_row * scale_log2 - (row_max_cur_scaled - off), fastmath=True)
+            else:
+                xs = cute.make_rmem_tensor(acc_S_row.shape, Float32)
+                xs.store(acc_S_row * scale_log2 - (row_max_cur_scaled - off))
+                if cutlass.const_expr(mode == 2):
+                    for i in cutlass.range_constexpr(cute.size(xs)):
+                        if cutlass.const_expr(i % freq < res):
+                            xs[i] = k1fa4_utils.ex2_emulation(xs[i], poly_degree=deg)
+                        else:
+                            xs[i] = cute.math.exp2(xs[i], fastmath=True)
+                acc_S_row_exp = xs.load()  # mode 1: the FFMA argument itself (timing mask, invalid)
+            if cutlass.const_expr(is_first):
+                acc_S_row_sum = k1fa4_utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
+                row_scale[r] = 1.0
+            else:
+                row_scale[r] = cute.math.exp2((row_max_prev - row_max_cur) * scale_log2, fastmath=True)
+                acc_S_row_sum = k1fa4_utils.fadd_reduce(acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch)
+            row_sum[r] = acc_S_row_sum
+            acc_S_mn[r, None].store(acc_S_row_exp)
+        return row_scale
+
+
+@k1fa4_dsl_user_op
+def k1fa4_cp_async16_l2_128(dst_smem, src_gmem, *, loc=None, ip=None):
+    """16-B cp.async.cg with the .L2::128B prefetch-size hint (the L2 fetches the whole 128-B line: both KV heads)."""
+    k1fa4_llvm.inline_asm(
+        None, [Int32(dst_smem).ir_value(loc=loc, ip=ip), cutlass.Int64(src_gmem).ir_value(loc=loc, ip=ip)],
+        "cp.async.cg.shared.global.L2::128B [$0], [$1], 16;", "r,l", has_side_effects=True, is_align_stack=False,
+        asm_dialect=k1fa4_llvm.AsmDialect.AD_ATT)
+
+
+@k1fa4_dsl_user_op
+def k1fa4_prefetch_l2_128(src_gmem, *, loc=None, ip=None):
+    """Bulk (TMA-unit) L2 prefetch of the 128-B line at src_gmem (128-B aligned)."""
+    k1fa4_llvm.inline_asm(
+        None, [cutlass.Int64(src_gmem).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], 128;", "l", has_side_effects=True, is_align_stack=False,
+        asm_dialect=k1fa4_llvm.AsmDialect.AD_ATT)
+
+
+def k1fa4_softmax_cls(default):
+    """The consumer's softmax class (replaces FA4's Softmax.create receiver): FA4's for the F16 PV core with the
+    stock exp2, else k1fa4_SoftmaxX."""
+    return k1fa4_SoftmaxX if (k1fa4_K["ex2"] or (k1fa4_K["pv8"] and K1FA4_P8_OFFSET)) else default
+
+
+class k1fa4_Sm90FwdPV8(k1fa4_Sm90Fwd):
+    """FA4 sm90 forward, FP8 QK and FP8 PV: E4M3 P (key-permuted A fragment) x producer-built E4M3 Vt (K-major)."""
+    k1fa4_pv8 = True
+
+    def _get_shared_storage_cls(self):
+        q_n = max(cute.cosize(self.sQ_layout), 2 * cute.cosize(self.sO_layout))  # sO (F16) aliases sQ (E4M3)
+        f8 = cutlass.Float8E4M3FN
+        sQ_struct = cute.struct.Align[cute.struct.MemRange[f8, q_n], 1024]
+        sK_struct = cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(self.sK_layout)], 1024]
+        sV_struct = cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(self.sV_layout)], 1024]
+        sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, 0], 1024]
+        sVr_struct = cute.struct.Align[
+            cute.struct.MemRange[f8, K1FA4_RAW_STAGES * self.tile_n * self.tile_hdimv], 1024]
+        mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 2]
+        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+
+        @cute.struct
+        class SharedStorageK1fa4PV8:
+            mbar_ptr_Q: mbar_ptr_Q_struct
+            mbar_ptr_K: mbar_ptr_K_struct
+            mbar_ptr_V: mbar_ptr_V_struct
+            sV: sV_struct
+            sQ: sQ_struct
+            sK: sK_struct
+            sP: sP_struct
+            sVr: sVr_struct
+
+        return SharedStorageK1fa4PV8
+
+    @cute.jit
+    def _k1fa4_v_pages(self, mPageTable, batch_idx, seqlen_k, n_block, rbase, pg):
+        """Page (= cache row, page size 1) of keys n_block*128 + rbase + (0, 1, 8, 9), clamped to the last valid key
+        (finite data, P = 0 there). Issued one tile ahead of the cp.async that uses them."""
+        for i in cutlass.range_constexpr(4):
+            key = n_block * self.tile_n + rbase + (0, 1, 8, 9)[i]
+            pg[i] = mPageTable[batch_idx, cutlass.min(key, seqlen_k - 1)]
+
+    @cute.jit
+    def _k1fa4_gather_v(self, mV_h, pg, c, tidx, sVr, slot, atom):
+        """4 x 16 B cp.async (pages pg, head-dim chunk 16c) into this thread's private raw slot."""
+        for i in cutlass.range_constexpr(4):
+            p = k1fa4_utils.elem_pointer(mV_h, (0, 16 * c, pg[i]))
+            if const_expr(K1FA4_L2PF["vh"]):
+                k1fa4_cp_async16_l2_128(sVr[None, tidx, i, slot].iterator.toint(), p.toint())
+            else:
+                src = cute.make_tensor(cute.make_ptr(cutlass.Float8E4M3FN, p.toint(), cute.AddressSpace.gmem,
+                                                     assumed_align=16), cute.make_layout((16,)))
+                cute.copy(atom, src, sVr[None, tidx, i, slot])
+
+    @cute.jit
+    def _k1fa4_prefetch_lines(self, mK_h, mV_h, pg, c):
+        """Lab knob K1FA4_L2PF k / v: L2 prefetch of the next tile's whole 128-B K / V rows (both KV heads) for this
+        thread quad's 4 keys, issued one tile ahead (lane c = 0: K, c = 1: V)."""
+        if const_expr(K1FA4_L2PF["k"]):
+            if c == 0:
+                for i in cutlass.range_constexpr(4):
+                    a = k1fa4_utils.elem_pointer(mK_h, (0, 0, pg[i])).toint()
+                    k1fa4_prefetch_l2_128(cutlass.Int64(a) & cutlass.Int64(-128))
+        if const_expr(K1FA4_L2PF["v"]):
+            if c == 1:
+                for i in cutlass.range_constexpr(4):
+                    a = k1fa4_utils.elem_pointer(mV_h, (0, 0, pg[i])).toint()
+                    k1fa4_prefetch_l2_128(cutlass.Int64(a) & cutlass.Int64(-128))
+
+    @cute.jit
+    def _k1fa4_transpose_v(self, sVr32, tidx, slot, vt_base, c, g, rot):
+        """This thread's 4 keys x 16 dims (own bytes) -> 16 words Vt[16c + 4w + (e + c) % 4][4g .. 4g + 3] (128B
+        swizzle); the input bytes are rotated by c so that the 4 lanes of a key store 4 rows with distinct row % 8."""
+        prmt = k1fa4_utils.prmt_b32
+        rr = []
+        for i in cutlass.range_constexpr(4):
+            r = cute.make_rmem_tensor((4,), cutlass.Uint32)
+            cute.autovec_copy(sVr32[None, tidx, i, slot], r)
+            rr.append(r)
+        for w in cutlass.range_constexpr(4):
+            x0 = prmt(rr[0][w], rr[0][w], rot)
+            x1 = prmt(rr[1][w], rr[1][w], rot)
+            x2 = prmt(rr[2][w], rr[2][w], rot)
+            x3 = prmt(rr[3][w], rr[3][w], rot)
+            t0 = prmt(x0, x1, cutlass.Uint32(0x5140))
+            t1 = prmt(x0, x1, cutlass.Uint32(0x7362))
+            t2 = prmt(x2, x3, cutlass.Uint32(0x5140))
+            t3 = prmt(x2, x3, cutlass.Uint32(0x7362))
+            outs = (prmt(t0, t2, cutlass.Uint32(0x5410)), prmt(t0, t2, cutlass.Uint32(0x7632)),
+                    prmt(t1, t3, cutlass.Uint32(0x5410)), prmt(t1, t3, cutlass.Uint32(0x7632)))
+            for e in cutlass.range_constexpr(4):
+                d = 16 * c + 4 * w + ((e + c) % 4)
+                off = (d * self.tile_n + 4 * g) ^ ((d % 8) * 16)  # 128B swizzle: bits 4-6 ^= row % 8
+                cute.make_tensor(cute.recast_ptr(vt_base + off, dtype=cutlass.Uint32), cute.make_layout((1,)))[0] = outs[e]
+
+    @cute.jit
+    def load(self, mQ, mK, mV, sQ, sK, sV, tma_atom_Q, tma_atom_K, tma_atom_V, mBias, sBias, tma_atom_Bias,
+             pipeline_k, pipeline_v, pipeline_bias, pipeline_q, gmem_tiled_copy_Q, mPageTable,
+             blocksparse_tensors, block_info, SeqlenInfoCls, TileSchedulerCls, num_splits: Int32 = 1):
+        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        tidx, _, _ = cute.arch.thread_idx()
+        nthr = self.num_threads_per_warp_group
+        if const_expr(k1fa4_K["pdl"]):
+            cute.arch.griddepcontrol_wait()  # the prologue's E4M3 q and new K/V rows are visible from here on
+            if const_expr(k1fa4_K["trig"] == "start"):
+                cute.arch.griddepcontrol_launch_dependents()
+        storage = self._k1_storage
+        f8 = cutlass.Float8E4M3FN
+        nraw = K1FA4_RAW_STAGES  # raw V ring depth; V(it) is transposed lag = nraw - 1 iterations after its gather
+        lag = nraw - 1
+        sVr = storage.sVr.get_tensor(cute.make_layout((16, nthr, 4, nraw),
+                                                      stride=(1, 16, 16 * nthr, 64 * nthr)))
+        sVr32 = cute.make_tensor(cute.recast_ptr(sVr.iterator, dtype=cutlass.Uint32),
+                                 cute.make_layout((4, nthr, 4, nraw), stride=(1, 4, 4 * nthr, 16 * nthr)))
+        vt_ptr = storage.sV.data_ptr()
+        vt_stage_bytes = self.tile_hdimv * self.tile_n
+        atom = cute.make_copy_atom(k1fa4_cpasync.CopyG2SOp(cache_mode=k1fa4_cpasync.LoadCacheMode.GLOBAL), f8,
+                                   num_bits_per_copy=128)
+        # 4 lanes (c = 0..3) fetch the whole 64 B row of a key. The warp's 8 quads differ in bits 0, 1, 4 of g, and the
+        # dim each lane stores per step is rotated by c, so the swizzled Vt stores of a warp hit 32 distinct banks.
+        lane = tidx % 32
+        wv = tidx // 32
+        c = lane % 4
+        gq = lane // 4
+        g = (gq % 2) + 2 * ((gq // 2) % 2) + 4 * wv + 16 * (gq // 4)
+        rot = (cutlass.Uint32(0x32103210) >> (4 * c)) & cutlass.Uint32(0xFFFF)
+        rbase = 32 * (g // 8) + 16 * ((g % 8) // 4) + 2 * (g % 4)
+
+        q_producer_phase = Int32(1)
+        k_state = k1fa4_pipeline.make_pipeline_state(k1fa4_pipeline.PipelineUserType.Producer, self.num_stages)
+        v_state = k1fa4_pipeline.make_pipeline_state(k1fa4_pipeline.PipelineUserType.Producer, self.num_stages)
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+            load_Q, _, _ = k1fa4_copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ,
+                                                            single_stage=True)
+            pkm = k1fa4_PagedKVManager.create(mPageTable, mK, mV, k1fa4_FastDivmodDivisor(mK.shape[0]), batch_idx,
+                                              head_idx, tidx, seqlen.seqlen_k, 0, self.tile_n, self.tile_hdim,
+                                              self.tile_hdimv, nthr, mK.element_type, arch=90)
+            mV_h = mV[None, None, head_idx, None]
+            mK_h = mK[None, None, head_idx, None]
+            if warp_idx_in_wg == 0:
+                pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+            q_producer_phase ^= 1
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            nblk = n_block_max - n_block_min
+            if nblk > 0:
+                pg = cute.make_rmem_tensor((4,), Int32)
+                pkm.load_page_table(n_block_max - 1)
+                self._k1fa4_v_pages(mPageTable, batch_idx, seqlen.seqlen_k, n_block_max - 1, rbase, pg)
+                for it in cutlass.range(nblk, unroll=1):
+                    n_block = n_block_max - 1 - it
+                    pipeline_k.producer_acquire(k_state)
+                    pkm.load_KV(n_block, sK[None, None, k_state.index], "K")
+                    pipeline_k.producer_commit(k_state)
+                    k_state.advance()
+                    self._k1fa4_gather_v(mV_h, pg, c, tidx, sVr, it % nraw, atom)
+                    cute.arch.cp_async_commit_group()
+                    if it + 1 < nblk:  # page loads for the next tile (K: FA4's per-thread rows; V: this thread's quad)
+                        pkm.load_page_table(n_block - 1)
+                        self._k1fa4_v_pages(mPageTable, batch_idx, seqlen.seqlen_k, n_block - 1, rbase, pg)
+                        if const_expr(K1FA4_L2PF["k"] or K1FA4_L2PF["v"]):
+                            self._k1fa4_prefetch_lines(mK_h, mV_h, pg, c)
+                    if it >= lag:  # V(it - lag): this thread's copies landed (lag newer groups may be pending)
+                        cute.arch.cp_async_wait_group(lag)
+                        pipeline_v.producer_acquire(v_state)
+                        self._k1fa4_transpose_v(sVr32, tidx, (it - lag) % nraw,
+                                                vt_ptr + v_state.index * vt_stage_bytes, c, g, rot)
+                        cute.arch.fence_view_async_shared()
+                        cute.arch.mbarrier_arrive(pipeline_v.sync_object_full.get_barrier(v_state.index))
+                        v_state.advance()
+                cute.arch.cp_async_wait_group(0)
+                for j in cutlass.range(cutlass.max(nblk - lag, 0), nblk, unroll=1):
+                    pipeline_v.producer_acquire(v_state)
+                    self._k1fa4_transpose_v(sVr32, tidx, j % nraw, vt_ptr + v_state.index * vt_stage_bytes, c, g,
+                                            rot)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.mbarrier_arrive(pipeline_v.sync_object_full.get_barrier(v_state.index))
+                    v_state.advance()
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+        pipeline_v.producer_tail(v_state)
