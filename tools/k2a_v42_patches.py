@@ -11,11 +11,13 @@ kernels/muse_decode_layer/k3_v23.py (the K2A source embedded there, K2A33_KERNEL
   2 CALL256 bucket 256 weight 78 -> 76 (26 / 32): the best weight with WSK on the shipped-module path (box_out/v40/run6.log:
             shipP_f26 -24.3 us median, f28 -21.7, f30 -12.8, f32 -7.4).
 
-Measured, T=256 MoE, layer routing, 3 routings x 20 paired rounds, cold L2 (tools/box/k2a_v40.py; shipped module rebuilt with
-tools/k2a_v40_patches.KERNEL_PATCHES + this file's KERNEL_PATCHES = row shipP_*): ship 313.1 us -> 286.3 us at weight 76
-(-24.3 us median, x1.085; per routing -26.8 / -21.7 / -24.3); v4.0 alone (shipP_f28 in run4 / run5) -10.4 / -11.2 us, so WSK
-adds ~ -13 us on top of v4.0. Lab copy lw (LEAN + FLUSH2 + WSK, constexpr) -25.4 / -26.1 us at weight 78 (run5 / run6).
-T=128 (vid 5, gemm37) never runs the v3.3 gemm: shipP +0.4 us (noise). Checks PASS on every routing.
+Measured, layer routing, 3 routings x 20 paired rounds, cold L2, PAIRED VS SHIPPED-WITH-v4.0 (tools/box/k2a_v40.py --ref=shipA:
+shipA = k2a_v37 + k2a_v40 KERNEL_PATCHES = k3_v23's K2A at weight 78; shipP = shipA + this file at weight 76; box_out/v40/run7-9.log):
+  T=256  v4.2 vs v4.0: -11.4 us (run7: -20.9 / -9.1 / -11.4, x1.038) and -15.1 us (run9: -22.0 / -9.1 / -15.1, x1.050)
+         (vs the v3.7 module: -24.3 / -25.0 us, x1.085).
+  T=128 (vid 5) -0.6 / +0.4 / ..., T=32 / 16 (vid 3) -0.6 / +0.2, T=8 / 1 (vid 0) +0.0 / -0.3 (x0.998 / x1.014): unchanged
+         (none of them runs WSK). An earlier runtime-only gate (`if (P.hot_t > 0)` without `if constexpr (NC == 2)`) cost vid 0
+         +0.6 / +1.4 us at T=8 / 1 from code generation alone (run8): keep the constexpr gate. Checks PASS everywhere.
 
 Not included (lab only, kernels/lab/k2a_v40_lab.py V40_HANDOFF): the per-(expert, pass) K1 -> K2 hand-off. On top of WSK it is
 worth ~ -1.4 us (hw_f28 -27.5 vs lw_f28 -26.1, run5) because K1 finishes every expert near its role's end (no expert is ready
@@ -77,8 +79,13 @@ PATCHES = [
      WSK_HELPERS + "// v3.3 warm-expert item (all of its stages s0..s1)"),
     ("WSK: v3.3 gemm ranges by weight on HOTCAP calls (P.hot_t > 0); vid 0 / 1 keep equal-stage ranges",
      "  int beg, end;\n  my_range2(Stot, cta, ncta, beg, end);\n",
-     "  int beg, end;\n  if (P.hot_t > 0) wsk_range<HOTCAP, NC, NRB>(S, cta, ncta, beg, end);   // v4.2 WSK\n"
-     "  else my_range2(Stot, cta, ncta, beg, end);\n"),
+     "  int beg, end;\n"
+     "  if constexpr (NC == 2) {   // v4.2 WSK: NC 2 builds only (HOTCAP roles; vid 0's NC 1 code stays byte-identical)\n"
+     "    if (P.hot_t > 0) wsk_range<HOTCAP, NC, NRB>(S, cta, ncta, beg, end);\n"
+     "    else my_range2(Stot, cta, ncta, beg, end);\n"
+     "  } else {\n"
+     "    my_range2(Stot, cta, ncta, beg, end);\n"
+     "  }\n"),
     ("CALL256: bucket 256 role-split weight 78 -> 76 (26 / 32) with WSK",
      "                       hot_w4=(78 if rep == 256 else None))   # v4.0: LEAN + FLUSH2 hot role -> weight 28 / 32\n",
      "                       hot_w4=(76 if rep == 256 else None))   # v4.2: LEAN + FLUSH2 + WSK -> weight 26 / 32\n"),
