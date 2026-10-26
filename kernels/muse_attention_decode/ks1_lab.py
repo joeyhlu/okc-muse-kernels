@@ -85,6 +85,8 @@ def phases(stamps, names, ref_slot, keep=None):
     return f"{int(alive.sum())} CTAs | " + "  ".join(out) + " us (min/med/max)"
 
 
+KS4_NAMES = {0: "entry", 1: "prewait", 2: "wait", 3: "qprep", 4: "tile0", 5: "attn", 6: "partial", 7: "ticket1", 8: "merge1",
+             9: "ticket2", 10: "merged"}
 KS1_NAMES = {0: "entry", 1: "prewait", 2: "wait", 3: "prep", 4: "sync", 5: "attn", 6: "cta-merge", 7: "partial", 8: "ticket",
              9: "merged"}
 
@@ -229,8 +231,9 @@ def main_layer():
         saved = {k: getattr(mod, k) for k in sets}
         for k, x in sets.items():
             setattr(mod, k, x)
-        n, g = mod.KS1_GEOM[L]
-        prof = torch.zeros(16 * 2 * g * (n + 1), dtype=torch.int64, device="cuda")
+        full = not d0["config"]["window"]
+        n, g = (mod.KS4_GEOM[L][1], 0) if full else mod.KS1_GEOM[L]
+        prof = torch.zeros(16 * 1024, dtype=torch.int64, device="cuda")
         mod.KS1_PROF_BUF = prof
         st = J.clone_data(d0)
         try:
@@ -248,16 +251,18 @@ def main_layer():
             runs.append(prof.view(-1, 16).cpu().clone())
         # summary over runs: per-run spans relative to the earliest wait return
         spans, pre, post = [], [], []
+        last = 10 if full else 9
         for x in runs[2:]:
+            x = x[x[:, 2] > 0]
             w = x[:, 2]
             t0 = int(w.min())
-            spans.append((int(x[:, 9].max()) - t0) / 1000.0)
+            spans.append((int(x[:, last].max()) - t0) / 1000.0)
             pre.append((t0 - int(x[:, 0].min())) / 1000.0)
             post.append((int(w.max()) - t0) / 1000.0)
         say(f"[lab] LAYER [{idx}] {case['load']} {case['layer']} L{L} NS{n} NTG{g}: wait-return -> merged "
             f"{statistics.median(spans):.2f} us (median of {len(spans)}); first entry -> first wait-return {statistics.median(pre):.2f} us; "
             f"wait-return spread {statistics.median(post):.2f} us")
-        say(f"[lab] LAYER [{idx}] last run (rel. first wait-return): {phases(runs[-1], KS1_NAMES, 2)}")
+        say(f"[lab] LAYER [{idx}] last run (rel. first wait-return): {phases(runs[-1], KS4_NAMES if full else KS1_NAMES, 2)}")
         del gr, st
 
 
