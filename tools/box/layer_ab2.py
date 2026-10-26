@@ -58,6 +58,7 @@ def main():
     call = lambda d: mod.kernel_fn(d, state)  # noqa: E731
     print(f"[ab2] overhead {ov:.2f} us; {len(variants)} variants: {[v['name'] for v in variants]}", flush=True)
     summary = {}
+    measurements = []
     for idx in shapes:
         case = prob.benches[idx]
         t0 = time.time()
@@ -71,6 +72,8 @@ def main():
             st = J.clone_data(d0)
             try:
                 graphs.append(timer.capture(call, st))
+                if hasattr(mod, '_fresh_validate_capture'):
+                    mod._fresh_validate_capture(st, state)
             finally:
                 for k, x in saved.items():
                     setattr(mod, k, x)
@@ -81,7 +84,7 @@ def main():
         rnd = 0
         for si in range(n_seeds):
             data = J.make_input(ref, case, case["seed"] + J.SEED_STEP * (si + 1), weights, "cuda")
-            chk = J.clone_data(data) if do_check and si == n_seeds - 1 else None
+            chk = J.clone_data(data) if do_check and (do_check > 1 or si == n_seeds - 1) else None
             for st in statics:
                 J.copy_into(st, data)
             torch.cuda.synchronize()
@@ -109,6 +112,13 @@ def main():
         print("  ".join(line) + f"  ({time.time() - t0:.0f}s)", flush=True)
         for k, msg in bad.items():
             print(f"[ab2]      CHECK FAILED {k}: {msg}", flush=True)
+        measurements.append(dict(index=idx,case=case,variants=[dict(name=v['name'],times_us=times[i],ratios=ratios[i])
+            for i,v in enumerate(variants)],failures=bad))
+        if arg('out',''):
+            dst=Path(arg('out',''));dst.parent.mkdir(parents=True,exist_ok=True)
+            dst.write_text(json.dumps(dict(module=sys.argv[1],router_seed=rs,shapes=measurements),indent=2,default=str))
+        if bad and arg('strict-check',0):
+            raise RuntimeError(f'layer correctness failed: {bad}')
         del graphs, statics
         torch.cuda.synchronize()
     # load-level geomean of each variant vs variant 0, judge weights, using variant 0's µs as the SGLang-free base
