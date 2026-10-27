@@ -19,9 +19,9 @@ def main():
     modname = sys.argv[1] if len(sys.argv) > 1 else "q1_moe_lab"
     arch = sys.argv[2] if len(sys.argv) > 2 else "sm_90a"
     lab = importlib.import_module(modname)
-    src = getattr(lab, "Q1_CUDA", None) or lab.Q2_CUDA
-    ns = "q1" if hasattr(lab, "Q1_CUDA") else "q2"
-    stop = "template <int NST>\nconstexpr int smem_bytes" if ns == "q1" else "constexpr int smem_bytes()"
+    src = getattr(lab, "Q1_CUDA", None) or getattr(lab, "Q2_CUDA", None) or lab.Z1_CUDA
+    ns = "q1" if hasattr(lab, "Q1_CUDA") else ("q2" if hasattr(lab, "Q2_CUDA") else "z1")
+    stop = {"q1": "template <int NST>\nconstexpr int smem_bytes", "q2": "constexpr int smem_bytes()", "z1": "void launch("}[ns]
     head = src[:src.index(f"namespace {ns} {{")]
     body = src[src.index(f"namespace {ns} {{"):src.index(stop)]
     head = "\n".join(l for l in head.splitlines() if "torch/" not in l and "ATen" not in l and "c10/" not in l)
