@@ -36,7 +36,9 @@ def _vml_board_prepare(state):
     st, w = state["st"], state["w"]
     dev = w["w13"].device
     t0 = time.time()
-    _VML["mod"], dt = _vml_build()
+    dt = 0.0
+    if _VML["mod"] is None:
+        _VML["mod"], dt = _vml_build()
     _VML["sc"] = _vml_alloc(dev, torch.cuda.get_device_properties(dev).multi_processor_count)
     flush = torch.ones((256 << 20) // 4, dtype=torch.float32, device=dev)
     sink = torch.empty((), dtype=torch.float32, device=dev)
@@ -124,7 +126,14 @@ def kernel_fn(data, state):
 
 
 def prepare(weights):
+    th = None
+    if VML_ENABLE:   # VML1's nvcc build overlaps K2A's / VMS's
+        import threading
+        th = threading.Thread(target=lambda: _VML.__setitem__("mod", _vml_build()[0]), daemon=True)
+        th.start()
     state = _vmsb_prepare(weights)
+    if th is not None:
+        th.join()
     if VML_ENABLE and state.get("st") is not None:
         try:
             _vml_board_prepare(state)
@@ -148,7 +157,12 @@ def main():
                 "(notes/study/vm_large.md), in-prepare variant table; check only, never scored.")
     t = "\n".join(lines)
     block, _ = vml_patches.lab_block()
-    s = t.rstrip("\n") + "\n\n\n" + block + TAIL
+    tail = TAIL
+    if "--research" in sys.argv:   # in-prepare refit + variant table (tools/vml_board_research.py)
+        import vml_board_research
+        a, b = TAIL.index("\nVML_ENABLE = True\n"), TAIL.index("\ndef prepare(weights):\n")
+        tail = TAIL[:a] + vml_board_research.RESEARCH + "\n" + TAIL[b:]
+    s = t.rstrip("\n") + "\n\n\n" + block + tail
     names = [getattr(n, "name", None) or (n.targets[0].id if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
                                           else None) for n in ast.parse(s).body]
     dup = sorted({n for n in names if n and names.count(n) > 1})

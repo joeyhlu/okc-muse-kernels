@@ -89,7 +89,7 @@ struct Args {
   const uint8_t* ws13; const uint8_t* ws2; const float* gsc13; const float* gsc2; const float* nw;
   __nv_bfloat16* xA; __nv_bfloat16* xB; float* y; float* fix; int* cnt; int* xready; int* doneA; int* rmap;
   __nv_bfloat16* out; int* err; long long* marks; unsigned long long magG; int flags;
-uint32_t cost[8]; unsigned long long mag[8];
+uint32_t cost[16]; unsigned long long mag[16];
 };
 __device__ __forceinline__ int split_point(const Args& A, int pb, int g0, int g1) {
   const int ue = ((g1 - 1) >> 4) << 4;
@@ -214,7 +214,7 @@ __device__ __forceinline__ int stage_at(const Args& A, const Tab& T, int pb, int
   int lo = 0, hi = nj;
   while (hi - lo > 1) { const int mid = (lo + hi) >> 1; if (cp[mid] <= x) lo = mid; else hi = mid; }
   const int nt = (T.jC[lo] + 7) >> 3;
-  uint32_t st = mdiv(x - cp[lo], A.mag[nt - 1]);
+  uint32_t st = mdiv(x - cp[lo], A.mag[8 * pb + nt - 1]);
   const uint32_t ns = 512u >> pb;
   if (st > ns - 1) st = ns - 1;
   return (lo << (9 - pb)) + (int)st;
@@ -293,11 +293,12 @@ __device__ void route(const Args& A, Tab& T, int* hist, uint16_t* ent) {
     uint32_t accA = 0, accB = 0;
     for (int j0 = 0; j0 < T.nj; j0 += 32) {
       const int j = j0 + lane;
-      const int ca = (j < T.nj) ? (int)A.cost[((T.jC[j] + 7) >> 3) - 1] : 0;
-      const int sc = excl_scan(ca, lane);
-      if (j < T.nj) { T.cpA[j] = accA + 512u * (uint32_t)sc; T.cpB[j] = accB + 256u * (uint32_t)sc; }
-      const int tt = __shfl_sync(0xffffffffu, sc + ca, 31);
-      accA += 512u * (uint32_t)tt; accB += 256u * (uint32_t)tt;
+      const int nt = (j < T.nj) ? ((T.jC[j] + 7) >> 3) - 1 : 0;
+      const int ca = (j < T.nj) ? (int)A.cost[nt] : 0, cb = (j < T.nj) ? (int)A.cost[8 + nt] : 0;
+      const int sc = excl_scan(ca, lane), sd = excl_scan(cb, lane);
+      if (j < T.nj) { T.cpA[j] = accA + 512u * (uint32_t)sc; T.cpB[j] = accB + 256u * (uint32_t)sd; }
+      accA += 512u * (uint32_t)__shfl_sync(0xffffffffu, sc + ca, 31);
+      accB += 256u * (uint32_t)__shfl_sync(0xffffffffu, sd + cb, 31);
     }
     if (lane == 0) { T.cpA[T.nj] = accA; T.cpB[T.nj] = accB; }
   }
@@ -565,6 +566,11 @@ __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
     for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     if (A.marks) A.marks[(size_t)blockIdx.x * 32] = gtime();
+  } else if (tid == 32 && (A.flags & 2)) {
+    const uint32_t tot = (uint32_t)A.M * (KDIM * 2), S = (mdiv(tot + gridDim.x - 1, A.magG) + 15u) & ~15u, off = blockIdx.x * S;
+    if (off < tot)
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
+                   "r"(min(S, tot - off)) : "memory");
   }
   int* hist = reinterpret_cast<int*>(smem + NS * US);
   uint16_t* ent = reinterpret_cast<uint16_t*>(smem + NS * US + 4096);
@@ -669,7 +675,7 @@ void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V) {
   a.out = reinterpret_cast<__nv_bfloat16*>(T[16].data_ptr()); a.err = T[17].data_ptr<int>();
   a.marks = T[18].numel() >= G * 32 ? reinterpret_cast<long long*>(T[18].data_ptr()) : nullptr;
   a.magG = (unsigned long long)V[3]; a.flags = (int)V[5];
-  for (int k = 0; k < 8; ++k) { a.cost[k] = (uint32_t)V[6 + k]; a.mag[k] = ((1ull << 40) + V[6 + k] - 1) / V[6 + k]; }
+  for (int k = 0; k < 16; ++k) { a.cost[k] = (uint32_t)V[6 + k]; a.mag[k] = ((1ull << 40) + V[6 + k] - 1) / V[6 + k]; }
   auto stream = at::cuda::getCurrentCUDAStream();
   if (mask & 1) {
     cudaFuncSetAttribute(vm::vm_main, cudaFuncAttributeMaxDynamicSharedMemorySize, vm::SMEM);
@@ -713,7 +719,7 @@ def alloc(dev, G):
             "err": z((4,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
 
-FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first
+FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows prefetched to L2 at kernel start
 
 
 def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
@@ -724,5 +730,5 @@ def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None
         out = torch.empty((m, KDIM), dtype=torch.bfloat16, device=x.device)
     mod.vml_run([x, ids, wts, k["ws13"], k["ws2"], k["gsc13"], k["gsc2"], k["nw"], sc["xA"], sc["xB"], sc["y"], sc["fix"],
                  sc["cnt"], sc["xready"], sc["doneA"], sc["rmap"], out, sc["err"], sc["nomark"] if marks is None else marks],
-                [m, ls, sc["G"], sc["magG"], mask, flags] + list(COST if cost is None else cost))
+                [m, ls, sc["G"], sc["magG"], mask, flags] + list(COST + COST if cost is None else cost))
     return out

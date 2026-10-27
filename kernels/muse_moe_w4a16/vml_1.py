@@ -3518,8 +3518,6 @@ constexpr int JMAX = @JMAX@, GMAX = 136, SLOTS = @SLOTS@, FIXW = @FIXW@;
 constexpr int BAR_OFF = NS * US + NX * XS;
 constexpr int TAB_OFF = BAR_OFF + 8 * 2 * (NS + NX);
 constexpr long long WAIT_BUDGET = 1ll << 31;
-__constant__ uint32_t c_cost[8] = {@COST@};
-__constant__ unsigned long long c_mag[8] = {@MAG@};
 
 struct Tab {
 int nj, R, Rpad, pad0;
@@ -3536,6 +3534,7 @@ const __nv_bfloat16* x; const int* ids; const float* wts; int M; int ls;
 const uint8_t* ws13; const uint8_t* ws2; const float* gsc13; const float* gsc2; const float* nw;
 __nv_bfloat16* xA; __nv_bfloat16* xB; float* y; float* fix; int* cnt; int* xready; int* doneA; int* rmap;
 __nv_bfloat16* out; int* err; long long* marks; unsigned long long magG; int flags;
+uint32_t cost[16]; unsigned long long mag[16];
 };
 __device__ __forceinline__ int split_point(const Args& A, int pb, int g0, int g1) {
 const int ue = ((g1 - 1) >> 4) << 4;
@@ -3651,7 +3650,7 @@ for (int o = 1; o < 32; o <<= 1) { const int n = __shfl_up_sync(0xffffffffu, s, 
 return s - v;
 }
 
-__device__ __forceinline__ int stage_at(const Tab& T, int pb, int c, int G, unsigned long long magG) {
+__device__ __forceinline__ int stage_at(const Args& A, const Tab& T, int pb, int c, int G, unsigned long long magG) {
 const int nj = T.nj;
 if (nj == 0) return 0;
 if (c >= G) return nj << (9 - pb);
@@ -3660,7 +3659,7 @@ const uint32_t x = mdiv(cp[nj] * (uint32_t)c, magG);
 int lo = 0, hi = nj;
 while (hi - lo > 1) { const int mid = (lo + hi) >> 1; if (cp[mid] <= x) lo = mid; else hi = mid; }
 const int nt = (T.jC[lo] + 7) >> 3;
-uint32_t st = mdiv(x - cp[lo], c_mag[nt - 1]);
+uint32_t st = mdiv(x - cp[lo], A.mag[8 * pb + nt - 1]);
 const uint32_t ns = 512u >> pb;
 if (st > ns - 1) st = ns - 1;
 return (lo << (9 - pb)) + (int)st;
@@ -3739,17 +3738,18 @@ if (warp == 0) {
 uint32_t accA = 0, accB = 0;
 for (int j0 = 0; j0 < T.nj; j0 += 32) {
 const int j = j0 + lane;
-const int ca = (j < T.nj) ? (int)c_cost[((T.jC[j] + 7) >> 3) - 1] : 0;
-const int sc = excl_scan(ca, lane);
-if (j < T.nj) { T.cpA[j] = accA + 512u * (uint32_t)sc; T.cpB[j] = accB + 256u * (uint32_t)sc; }
-const int tt = __shfl_sync(0xffffffffu, sc + ca, 31);
-accA += 512u * (uint32_t)tt; accB += 256u * (uint32_t)tt;
+const int nt = (j < T.nj) ? ((T.jC[j] + 7) >> 3) - 1 : 0;
+const int ca = (j < T.nj) ? (int)A.cost[nt] : 0, cb = (j < T.nj) ? (int)A.cost[8 + nt] : 0;
+const int sc = excl_scan(ca, lane), sd = excl_scan(cb, lane);
+if (j < T.nj) { T.cpA[j] = accA + 512u * (uint32_t)sc; T.cpB[j] = accB + 256u * (uint32_t)sd; }
+accA += 512u * (uint32_t)__shfl_sync(0xffffffffu, sc + ca, 31);
+accB += 256u * (uint32_t)__shfl_sync(0xffffffffu, sd + cb, 31);
 }
 if (lane == 0) { T.cpA[T.nj] = accA; T.cpB[T.nj] = accB; }
 }
 __syncthreads();
 const int G = gridDim.x;
-if (tid <= G) { T.bA[tid] = stage_at(T, 0, tid, G, A.magG); T.bB[tid] = stage_at(T, 1, tid, G, A.magG); }
+if (tid <= G) { T.bA[tid] = stage_at(A, T, 0, tid, G, A.magG); T.bB[tid] = stage_at(A, T, 1, tid, G, A.magG); }
 __syncthreads();
 }
 
@@ -3986,6 +3986,7 @@ if (ge == g1 && sp > g0) { gs = g0; ge = sp; } else break;
 }
 const int u = gs >> 4, s0 = gs & 15, s1 = min(16, s0 + (ge - gs));
 const int j = PB ? (u >> 4) : (u >> 5);
+if (A.marks && q == 0 && wp == 0 && lane == 0) A.marks[(size_t)c * 32 + 8 + 8 * PB + ((T.jC[j] + 7) >> 3) - 1] += s1 - s0;
 switch ((T.jC[j] + 7) >> 3) {
 case 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
 case 2: seg<PB, 16>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
@@ -4009,11 +4010,17 @@ if (tid == 0) {
 for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW); }
 for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
 asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-if (A.marks) A.marks[(size_t)blockIdx.x * 8] = gtime();
+if (A.marks) A.marks[(size_t)blockIdx.x * 32] = gtime();
+} else if (tid == 32 && (A.flags & 2)) {
+const uint32_t tot = (uint32_t)A.M * (KDIM * 2), S = (mdiv(tot + gridDim.x - 1, A.magG) + 15u) & ~15u, off = blockIdx.x * S;
+if (off < tot)
+asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
+"r"(min(S, tot - off)) : "memory");
 }
 int* hist = reinterpret_cast<int*>(smem + NS * US);
 uint16_t* ent = reinterpret_cast<uint16_t*>(smem + NS * US + 4096);
 route(A, T, hist, ent);
+if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 7] = gtime();
 if (warp >= NCW) {
 if (warp == NCW) {
 if (lane == 0) prod_w(A, T, sa(smem), bars);
@@ -4025,13 +4032,13 @@ return;
 }
 gather(A, T, ent);
 bar_arrive(6, 32 * NCW + 32);
-if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 8 + 5] = gtime();
+if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 5] = gtime();
 const int q = warp >> 2, wp = warp & 3;
 int it = 0;
 phase<false>(A, T, smem, bars, it, q, wp, lane);
-if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * 8 + 6] = gtime();
+if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * 32 + 6] = gtime();
 phase<true>(A, T, smem, bars, it, q, wp, lane);
-if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 8 + 1 + q] = gtime();
+if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 1 + q] = gtime();
 }
 
 __global__ void __launch_bounds__(256) vm_fin(const Args A) {
@@ -4111,8 +4118,9 @@ a.xA = reinterpret_cast<__nv_bfloat16*>(T[8].data_ptr()); a.xB = reinterpret_cas
 a.y = T[10].data_ptr<float>(); a.fix = T[11].data_ptr<float>(); a.cnt = T[12].data_ptr<int>();
 a.xready = T[13].data_ptr<int>(); a.doneA = T[14].data_ptr<int>(); a.rmap = T[15].data_ptr<int>();
 a.out = reinterpret_cast<__nv_bfloat16*>(T[16].data_ptr()); a.err = T[17].data_ptr<int>();
-a.marks = T[18].numel() >= G * 8 ? reinterpret_cast<long long*>(T[18].data_ptr()) : nullptr;
+a.marks = T[18].numel() >= G * 32 ? reinterpret_cast<long long*>(T[18].data_ptr()) : nullptr;
 a.magG = (unsigned long long)V[3]; a.flags = (int)V[5];
+for (int k = 0; k < 16; ++k) { a.cost[k] = (uint32_t)V[6 + k]; a.mag[k] = ((1ull << 40) + V[6 + k] - 1) / V[6 + k]; }
 auto stream = at::cuda::getCurrentCUDAStream();
 if (mask & 1) {
 cudaFuncSetAttribute(vm::vm_main, cudaFuncAttributeMaxDynamicSharedMemorySize, vm::SMEM);
@@ -4127,8 +4135,7 @@ C10_CUDA_KERNEL_LAUNCH_CHECK();
 """
 _vml_CUDA = (_vml_CUDA_T.replace("@WGSPECS@", "".join(_vml_wg_spec(n) for n in (8, 16, 24, 32, 40, 48, 56, 64)))
         .replace("@JMAX@", str(_vml_JMAX)).replace("@SLOTS@", str(_vml_SLOTS)).replace("@FIXW@", str(_vml_FIXW))
-        .replace("@COST@", ", ".join(f"{c}u" for c in _vml_COST))
-        .replace("@MAG@", ", ".join(str(_vml_mag(c)) + "ull" for c in _vml_COST)))
+        )
 
 _vml_CPP = r"""
 #include <torch/extension.h>
@@ -4157,10 +4164,10 @@ def _vml_alloc(dev, G):
             "err": z((4,)), "nomark": z((0,), torch.int64), "G": G, "magG": _vml_mag(G)}
 
 
-_vml_FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first
+_vml_FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows prefetched to L2 at kernel start
 
 
-def _vml_call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None):
+def _vml_call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
     m = x.shape[0]
     assert m <= _vml_MMAX
     flags = _vml_FLAGS_DEFAULT if flags is None else flags
@@ -4168,7 +4175,7 @@ def _vml_call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags
         out = torch.empty((m, _vml_KDIM), dtype=torch.bfloat16, device=x.device)
     mod.vml_run([x, ids, wts, k["ws13"], k["ws2"], k["gsc13"], k["gsc2"], k["nw"], sc["xA"], sc["xB"], sc["y"], sc["fix"],
                  sc["cnt"], sc["xready"], sc["doneA"], sc["rmap"], out, sc["err"], sc["nomark"] if marks is None else marks],
-                [m, ls, sc["G"], sc["magG"], mask, flags])
+                [m, ls, sc["G"], sc["magG"], mask, flags] + list(_vml_COST + _vml_COST if cost is None else cost))
     return out
 
 
@@ -4185,7 +4192,9 @@ def _vml_board_prepare(state):
     st, w = state["st"], state["w"]
     dev = w["w13"].device
     t0 = time.time()
-    _VML["mod"], dt = _vml_build()
+    dt = 0.0
+    if _VML["mod"] is None:
+        _VML["mod"], dt = _vml_build()
     _VML["sc"] = _vml_alloc(dev, torch.cuda.get_device_properties(dev).multi_processor_count)
     flush = torch.ones((256 << 20) // 4, dtype=torch.float32, device=dev)
     sink = torch.empty((), dtype=torch.float32, device=dev)
@@ -4273,7 +4282,14 @@ def kernel_fn(data, state):
 
 
 def prepare(weights):
+    th = None
+    if VML_ENABLE:   # VML1's nvcc build overlaps K2A's / VMS's
+        import threading
+        th = threading.Thread(target=lambda: _VML.__setitem__("mod", _vml_build()[0]), daemon=True)
+        th.start()
     state = _vmsb_prepare(weights)
+    if th is not None:
+        th.join()
     if VML_ENABLE and state.get("st") is not None:
         try:
             _vml_board_prepare(state)

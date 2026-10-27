@@ -1,0 +1,3 @@
+muse_moe_w4a16 kernels/muse_moe_w4a16/vml_2.py
+muse_moe_w4a16 kernels/muse_moe_w4a16/vml_1.py
+muse_decode_layer kernels/muse_decode_layer/k3_vml_2.py
