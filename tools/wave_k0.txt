@@ -1,0 +1,2 @@
+# K0 SWEEP kill test (G-small), lab in prepare, kernel_fn = shipped K2A (sa_k35moe)
+muse_moe_w4a16 kernels/muse_moe_w4a16/k0_check.py
