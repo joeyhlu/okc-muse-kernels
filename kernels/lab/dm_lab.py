@@ -39,7 +39,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "kernels" / "lab"))
 
 # (T, ST, STX) instantiations; kid = index
-DM_INSTS = [(128, 4, 8), (128, 6, 8), (128, 2, 8), (256, 2, 6)]
+DM_INSTS = [(128, 4, 8, 0), (128, 6, 8, 0), (128, 2, 8, 0), (256, 2, 6, 0)]
+# R-dm-2 drain test: (T, ST, STX, CP); CP 1 = consumer warps cp.async their units into own smem slots, LDS -> decode
+DRAIN_INSTS = [(128, 4, 8, 0), (128, 4, 8, 1), (128, 6, 8, 1)]
 
 DM_CPP_SRC = r"""
 #include <torch/extension.h>
@@ -73,12 +75,13 @@ struct Params {
   uint32_t tb;
 };
 
-template <int T, int ST, int STX>
+template <int T, int ST, int STX, int CP>
 struct Cfg {
   static constexpr int XB = T * 128;         // x stage: T rows x 64 bf16, SW128
   static constexpr int NA = T / 2;           // accumulator floats per thread (m64 x T per warpgroup)
   static constexpr int THREADS = 256;        // 8 consumer warps; thread 0 also issues the x copies (9 warps cap regs at 168)
-  static constexpr int SMEM = 1024 + STX * XB + 16 * STX;
+  static constexpr int WOFF = STX * XB + 256;                      // CP: per-warp weight slots after the barriers
+  static constexpr int SMEM = 1024 + WOFF + (CP ? 8 * ST * 1536 : 0);
   static_assert(ST % 2 == 0, "ST even: unit parity = slot parity");
   static_assert(SMEM <= 227 * 1024, "smem");
 };
@@ -127,6 +130,19 @@ __device__ __forceinline__ int ld_acq(const int* p) {
   asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
   return v;
 }
+__device__ __forceinline__ void cpunit(uint32_t dst, const void* src) {   // 3 planes x 16 B of one lane, cp.async.cg
+#pragma unroll
+  for (int pl = 0; pl < 3; ++pl)
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst + 512 * pl),
+                 "l"(reinterpret_cast<const uint8_t*>(src) + 512 * pl) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
+__device__ __forceinline__ uint4 lds128(uint32_t a) {
+  uint4 r;
+  asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(a) : "memory");
+  return r;
+}
 // gv1 P12 unit: 3 planes x 512 B (two low-byte planes + code plane), lane owns 16 B of each
 __device__ __forceinline__ void ldunit(const uint8_t* up, int lane, uint4 (&r)[3]) {
   r[0] = ldw(up + lane * 16); r[1] = ldw(up + 512 + lane * 16); r[2] = ldw(up + 1024 + lane * 16);
@@ -171,9 +187,9 @@ template <int NR> __device__ __forceinline__ void fence_regs(float* d) {
 
 __global__ void null_kernel(int* err) { if (threadIdx.x == 1023) err[1] = 0; }
 
-template <int T, int ST, int STX>
+template <int T, int ST, int STX, int CP>
 __global__ void __launch_bounds__(256, 1) dm_kernel(const __grid_constant__ CUtensorMap tmx, const Params P) {
-  using C = Cfg<T, ST, STX>;
+  using C = Cfg<T, ST, STX, CP>;
   constexpr int XB = C::XB, NA = C::NA;
   extern __shared__ uint8_t dsm[];
   const uint32_t raw = sa(dsm);
@@ -209,17 +225,24 @@ __global__ void __launch_bounds__(256, 1) dm_kernel(const __grid_constant__ CUte
     const int gw = (split * P.ntile + tile) * 8 + warp;
     const size_t wstep = (size_t)G * 1536;
     const uint8_t* wp = P.w + (size_t)gw * 1536;
-    uint4 R[ST][3];
+    uint4 R[CP ? 1 : ST][3];
+    const uint32_t wsl = base + C::WOFF + (uint32_t)(warp * ST * 1536 + lane * 16);   // CP: lane's 16 B, slot 0, plane 0
 #pragma unroll
-    for (int i = 0; i < ST; ++i)
-      if (i < nloc) ldunit(wp + (size_t)i * wstep, lane, R[i]);
+    for (int i = 0; i < ST; ++i) {
+      if constexpr (CP) {
+        if (i < nloc) cpunit(wsl + i * 1536, wp + (size_t)i * wstep + lane * 16);
+        cp_commit();
+      } else {
+        if (i < nloc) ldunit(wp + (size_t)i * wstep, lane, R[i]);
+      }
+    }
     const uint32_t em = lde(P.esc + (size_t)gw * 32 + lane);
     int ecur = 0;
     uint32_t enx = __shfl_sync(0xffffffffu, em, 0);
 #pragma unroll
     for (int i = 0; i < NA; ++i) acc[i] = 0.f;
     uint32_t a[2][16];
-    const bool nox = (flags & 4) != 0, nomma = (flags & 2) != 0, nodec = (flags & 16) != 0;
+    const bool nox = (flags & 4) != 0, nomma = (flags & 2) != 0, nodec = (flags & 16) != 0, nowg = (flags & 64) != 0;
 #pragma unroll 1
     for (int ub = 0; ub < nloc; ub += ST) {
 #pragma unroll
@@ -227,7 +250,7 @@ __global__ void __launch_bounds__(256, 1) dm_kernel(const __grid_constant__ CUte
         const int u = ub + d;
         if (u < nloc) {
           const int ab = d & 1;
-          wg_wait<1>();   // unit u - 2's wgmma group is done: a[ab] and x stage (u - 2) are free
+          if (!nowg) wg_wait<1>();   // unit u - 2's wgmma group is done: a[ab] and x stage (u - 2) are free
           if (u >= 2 && lane == 0 && !nox) mbar_arrive(bempty + 8 * ((u - 2) % STX));
           if (issuer && u >= 3 && u - 3 + STX < nloc) {   // refill the stage every warp released one unit ago
             const int i = u - 3 + STX, sr = (u - 3) % STX;
@@ -235,15 +258,29 @@ __global__ void __launch_bounds__(256, 1) dm_kernel(const __grid_constant__ CUte
             mbar_expect_tx(bfull + 8 * sr, (uint32_t)XB);
             tma_x(base + sr * XB, &tmx, (kb + i) * 64, 0, bfull + 8 * sr);
           }
+          uint4 pv[3];
+          if constexpr (CP) {
+            cp_wait<ST - 1>();   // this lane's copies of unit u have landed (one group per unit, always committed)
+#pragma unroll
+            for (int pl = 0; pl < 3; ++pl) pv[pl] = lds128(wsl + d * 1536 + 512 * pl);
+          } else {
+#pragma unroll
+            for (int pl = 0; pl < 3; ++pl) pv[pl] = R[CP ? 0 : d][pl];
+          }
           if (nodec) {
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-              a[ab][4 * q] = R[d][0].x ^ q; a[ab][4 * q + 1] = R[d][1].y; a[ab][4 * q + 2] = R[d][2].z; a[ab][4 * q + 3] = R[d][0].w;
+              a[ab][4 * q] = pv[0].x ^ q; a[ab][4 * q + 1] = pv[1].y; a[ab][4 * q + 2] = pv[2].z; a[ab][4 * q + 3] = pv[0].w;
             }
           } else {
-            decode(R[d], P.tb, a[ab]);
+            decode(pv, P.tb, a[ab]);
           }
-          if (u + ST < nloc) ldunit(wp + (size_t)(u + ST) * wstep, lane, R[d]);
+          if constexpr (CP) {   // the decode consumed the LDS results, so the slot can be overwritten
+            if (u + ST < nloc) cpunit(wsl + d * 1536, wp + (size_t)(u + ST) * wstep + lane * 16);
+            cp_commit();
+          } else {
+            if (u + ST < nloc) ldunit(wp + (size_t)(u + ST) * wstep, lane, R[CP ? 0 : d]);
+          }
           while ((int)(enx >> 20) == u) {
             patch(a[ab], enx, lane);
             ++ecur;
@@ -252,17 +289,17 @@ __global__ void __launch_bounds__(256, 1) dm_kernel(const __grid_constant__ CUte
           const int s = u % STX;
           if (!nox) mbar_wait(bfull + 8 * s, (uint32_t)((u / STX) & 1), P.err, dead);
           const uint32_t xs = base + s * XB;
-          wg_fence();
+          if (!nowg) wg_fence();
           if (!nomma) {
 #pragma unroll
             for (int q = 0; q < 4; ++q)
               wgmma_rs<T>(acc, a[ab][4 * q], a[ab][4 * q + 1], a[ab][4 * q + 2], a[ab][4 * q + 3], desc_sw128(xs + q * 32));
           }
-          wg_commit();
+          if (!nowg) wg_commit();
         }
       }
     }
-    wg_wait<0>();
+    if (!nowg) wg_wait<0>();
     fence_regs<NA>(acc);
   }
   // ---------------- epilogue
@@ -344,12 +381,12 @@ static dm_encode_fn dm_get_encode() {
   return fn;
 }
 
-template <int T, int ST, int STX>
+template <int T, int ST, int STX, int CP>
 static int64_t dm_launch_t(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& esc, const torch::Tensor& y,
                            const torch::Tensor& ws, const torch::Tensor& cnt, const torch::Tensor& err, int64_t S, int64_t ntile,
                            int64_t tb, int64_t flags) {
-  using C = dm::Cfg<T, ST, STX>;
-  auto kern = dm::dm_kernel<T, ST, STX>;
+  using C = dm::Cfg<T, ST, STX, CP>;
+  auto kern = dm::dm_kernel<T, ST, STX, CP>;
   static bool attr = false;
   if (!attr) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
@@ -393,10 +430,10 @@ static int64_t dm_launch_t(const torch::Tensor& x, const torch::Tensor& w, const
   return 0;
 }
 
-template <int T, int ST, int STX>
+template <int T, int ST, int STX, int CP>
 static std::vector<int64_t> dm_info_t() {
-  using C = dm::Cfg<T, ST, STX>;
-  auto kern = dm::dm_kernel<T, ST, STX>;
+  using C = dm::Cfg<T, ST, STX, CP>;
+  auto kern = dm::dm_kernel<T, ST, STX, CP>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
   cudaFuncAttributes fa;
   C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, kern));
@@ -447,10 +484,10 @@ def dm_wg_specs(ns):
 
 
 def dm_cuda_src(insts=DM_INSTS):
-    run = "\n".join(f"    case {i}: return dm_launch_t<{t}, {s}, {x}>(x, w, esc, y, ws, cnt, err, S, ntile, tb, flags);"
-                    for i, (t, s, x) in enumerate(insts))
-    info = "\n".join(f"    case {i}: return dm_info_t<{t}, {s}, {x}>();" for i, (t, s, x) in enumerate(insts))
-    ns = sorted({t for t, _, _ in insts})
+    run = "\n".join(f"    case {i}: return dm_launch_t<{t}, {s}, {x}, {c}>(x, w, esc, y, ws, cnt, err, S, ntile, tb, flags);"
+                    for i, (t, s, x, c) in enumerate(insts))
+    info = "\n".join(f"    case {i}: return dm_info_t<{t}, {s}, {x}, {c}>();" for i, (t, s, x, c) in enumerate(insts))
+    ns = sorted({t for t, _, _, _ in insts})
     return DM_CUDA_SRC.replace("@RUNCASES@", run).replace("@INFOCASES@", info).replace("@WGSPECS@", dm_wg_specs(ns))
 
 
@@ -543,12 +580,14 @@ def main():
     reps = int(arg("reps", "21"))
     rounds = int(arg("rounds", "10"))
     out_path = Path(arg("out", str(ROOT / "box_out" / "dm1" / "lab.json")))
-    mod = dm_build(verbose=bool(int(arg("verbose", "0"))))
+    drain = int(arg("drain", "0"))
+    insts = DRAIN_INSTS if drain else DM_INSTS
+    mod = dm_build(insts, verbose=bool(int(arg("verbose", "0"))))
     if int(arg("build-only", "0")):
         return
-    infos = {i: list(mod.dm_info(i)) for i in range(len(DM_INSTS))}
+    infos = {i: list(mod.dm_info(i)) for i in range(len(insts))}
     for i, v in infos.items():
-        print(f"[dm] inst {i} {DM_INSTS[i]}: smem {v[0]} regs {v[1]} local {v[2]} B occ {v[3]}", flush=True)
+        print(f"[dm] inst {i} {insts[i]}: smem {v[0]} regs {v[1]} local {v[2]} B occ {v[3]}", flush=True)
     dev = torch.device("cuda")
     torch.manual_seed(1234)
     flush = torch.empty((64 << 20,), dtype=torch.float32, device=dev).uniform_().view(4096, -1)   # 256 MB read sweep
@@ -574,17 +613,20 @@ def main():
             y_cub = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
             arms = {"cublas": (lambda x=x, y=y_cub: torch.mm(x, w.t(), out=y))}
             ys = {}
-            for kid, (t, st, stx) in enumerate(DM_INSTS):
+            for kid, (t, st, stx, cp) in enumerate(insts):
                 if t != m:
                     continue
-                for S in SPLITS[proj]:
+                for S in (SPLITS[proj][:1] if drain else SPLITS[proj]):
                     p = packs[S]
                     ws = torch.empty((S * ntile * 8 * (t // 8) * 32 * 4,), dtype=torch.float32, device=dev)
-                    for fl, tag in ((0, ""), (2, "_nomma"), (4, "_nox"), (6, "_wonly"), (8, "_noreduce"), (16, "_nodec")):
-                        if fl and not (S == SPLITS[proj][0] and kid in (0, 3)):
+                    flist = (((0, ""), (14, "_wonly_nored"), (78, "_wonly_nored_nowg")) if drain else
+                             ((0, ""), (2, "_nomma"), (4, "_nox"), (6, "_wonly"), (8, "_noreduce"), (16, "_nodec")))
+                    for fl, tag in flist:
+                        if not drain and fl and not (S == SPLITS[proj][0] and kid in (0, 3)):
                             continue
                         y = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
-                        name = f"dm{kid}_st{st}_x{stx}_S{S}{tag}"
+                        path = "cp" if cp else "reg"
+                        name = f"dm{kid}_{path}_st{st}_x{stx}_S{S}{tag}"
 
                         def run(kid=kid, x=x, p=p, y=y, ws=ws, S=S, fl=fl):
                             mod.dm_run(kid, x, p["w"], p["esc"], y, ws, cnt, err, S, ntile, p["kumax"], p["tb"], fl)
@@ -633,9 +675,12 @@ def main():
             row["rel_after"] = {name: float((y.double() - y_ref64).abs().max()) / scale for name, (y, fl) in ys.items() if fl == 0}
             results["rows"].append(row)
             print(f"[dm] {proj} m{m}: floor {fl0:.2f} us; net us (x vs cuBLAS):", flush=True)
+            pmb = n * k * 1.5 / 1e6   # P12 bytes (MB), escapes negligible
             for nm in names:
                 a = row["arms"][nm]
-                print(f"    {nm:28s} {a['net_us']:7.2f}  x{a['x_vs_cublas_net']:.3f}   raw {a['raw_us']:.2f}", flush=True)
+                a["eff_tbs_p12"] = pmb / a["net_us"]
+                print(f"    {nm:36s} {a['net_us']:7.2f}  x{a['x_vs_cublas_net']:.3f}   raw {a['raw_us']:.2f}"
+                      f"   {pmb / a['net_us']:.2f} TB/s(P12 eff)", flush=True)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(json.dumps(results, indent=1))
     print("[dm] done", flush=True)
