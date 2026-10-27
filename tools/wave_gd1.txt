@@ -1,0 +1,2 @@
+# R-gd-1 ADOPT -> one free judge check of k3_gd_1 (k3_v39 + GD gv1 P12 GEMVs)
+muse_decode_layer kernels/muse_decode_layer/k3_gd_1.py

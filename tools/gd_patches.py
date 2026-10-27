@@ -781,6 +781,412 @@ def _gd_k3trig(state, tokens):
 
 '''
 
+# ---- PRT (k3_gd_2+, apply(prt=True)): the T = 1 pooler inside a G2-style fused kernel on gv1's stream --------------------
+# G2's prt_kernel<1, 1> (k3_v39: pooler + FP32 router + routing tail in one launch; router weights cp.async'd to smem before
+# the PDL wait; the last CTA by ticket runs the tail) with P1's pooler stream replaced by gv1's P12 stream of geometry
+# (1, 16, 8, 1) ST 2 (judge 12.67 us standalone vs P1's 15.65): 256 CTAs x 512 threads = G2's grid, so CTA c is still pooler
+# row tile c and router32's CTA (c % 32, c / 32). Router and tail expressions are G2's, verbatim.
+PRT_CPP = r'''
+int gd_prt_raw(const void* w, const void* esc, uint32_t tb, const void* x, void* y, const void* x32, const void* w32, void* part,
+               const void* nw, const void* bias, const void* lstart, void* xn, void* tw, void* tid, void* lid, void* tcnt,
+               float eps, float mult, float rscale, float deps, int pdl, cudaStream_t st);
+int gd_prt_info_raw(int64_t* res);
+void gd_prt(torch::Tensor w, torch::Tensor esc, int64_t tb, torch::Tensor x, torch::Tensor y, torch::Tensor x32,
+            torch::Tensor w32, torch::Tensor part, torch::Tensor nw, torch::Tensor bias, torch::Tensor lstart, torch::Tensor xn,
+            torch::Tensor tw, torch::Tensor tid, torch::Tensor lid, torch::Tensor tcnt, double eps, double mult, double rscale,
+            double deps, int64_t pdl) {
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2 && x.size(0) == 1 && x.size(1) == 8192 &&
+              x32.scalar_type() == at::kFloat && x32.is_contiguous() && x32.numel() == 8192 && w32.scalar_type() == at::kFloat &&
+              w32.is_contiguous() && w32.numel() == 256 * 8192 && y.numel() == 4096 && xn.numel() == 4096 && part.numel() == 8 * 256 &&
+              tw.numel() == 8 && tid.numel() == 8 && lid.numel() == 8 && nw.numel() == 4096 && bias.numel() == 256,
+              "gd_prt: T = 1 shapes");
+  const int e = gd_prt_raw(w.data_ptr(), esc.data_ptr(), (uint32_t)tb, x.data_ptr(), y.data_ptr(), x32.data_ptr(), w32.data_ptr(),
+                           part.data_ptr(), nw.data_ptr(), bias.data_ptr(), lstart.data_ptr(), xn.data_ptr(), tw.data_ptr(),
+                           tid.data_ptr(), lid.data_ptr(), tcnt.data_ptr(), (float)eps, (float)mult, (float)rscale, (float)deps,
+                           (int)pdl, at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(e == 0, "gd_prt: CUDA error ", e, " ", cudaGetErrorString((cudaError_t)e));
+}
+std::vector<int64_t> gd_prt_info() {
+  std::vector<int64_t> r(4, 0);
+  TORCH_CHECK(gd_prt_info_raw(r.data()) == 0, "gd_prt_info");
+  return r;
+}
+'''
+
+PRT_DEV = r'''
+// GD-PRT (T = 1): G2's prt_kernel<1, 1> with gv1's P12 pooler stream (geometry (1, 16, KU, 1)) in place of P1's stream.
+constexpr int PD = 4096, NE = 256, TK = 8, PNT = 512, RK = 8192, RKS4 = 256;
+
+struct PArgs {
+  const float* x32; const float* w32; float* part; const __nv_bfloat16* nw; const float* bias; const int* lstart;
+  __nv_bfloat16* xn; float* tw; int* tid; int* lid; int* tcnt;
+  float eps, mult, rscale, deps;
+};
+
+__device__ __forceinline__ void cp16(void* sdst, const void* gsrc) {
+  const unsigned s = (unsigned)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gsrc) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
+
+template <int KU, int ST>
+__global__ void __launch_bounds__(512, 2) gprt_kernel(const __grid_constant__ Args A, const __grid_constant__ PArgs G) {
+  constexpr int NW = 16, NP = 3;
+  extern __shared__ float4 dsm[];
+  float4* const wsm = dsm;               // router weight rows bx*8 .. bx*8+7, K slice sl: [8][256] float4
+  float4* const xsm = dsm + 8 * RKS4;    // router input K slice sl: [256] float4 (token 0)
+  __shared__ float red[NW][4][32];
+  __shared__ float tred[NW];
+  __shared__ int s_last;
+  const int tid = (int)threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int rt = (int)blockIdx.x, m = A.M;
+  const int bx = rt & 31, sl = rt >> 5, k0 = sl * 1024;
+  // 0. router weights (prepare-time data) -> smem, issued before the PDL wait
+  for (int idx = tid; idx < 8 * RKS4; idx += PNT) {
+    const int r = idx >> 8, c = idx & 255;
+    cp16(wsm + idx, reinterpret_cast<const float4*>(G.w32 + (size_t)(bx * 8 + r) * RK + k0) + c);
+  }
+  cp_commit();
+  // 1. pooler row tile rt, warp = K slice of KU units: the first ST units and the escapes before the PDL wait (gv1's stream)
+  const int gw = rt * NW + warp;
+  const size_t wstep = (size_t)((int)gridDim.x * NW) * (NP * 32);
+  const uint4* wp = A.w + (size_t)gw * (NP * 32) + lane;
+  uint4 R[ST][NP];
+#pragma unroll
+  for (int i = 0; i < ST; ++i)
+#pragma unroll
+    for (int p = 0; p < NP; ++p) R[i][p] = ldw(wp + (size_t)i * wstep + p * 32);
+  const uint32_t em = lde(A.esc + (size_t)gw * 32 + lane);
+  pdl_wait();
+  for (int idx = tid; idx < RKS4; idx += PNT) cp16(xsm + idx, reinterpret_cast<const float4*>(G.x32 + k0) + idx);
+  cp_commit();
+  const uint4* xb = reinterpret_cast<const uint4*>(A.x + (size_t)warp * KU * 64 + 16 * (lane & 3));
+  int ecur = 0;
+  uint32_t enx = __shfl_sync(0xffffffffu, em, 0);
+  float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+  for (int s = 0; s < KU; ++s) {
+    const uint4 x0 = ldx(xb + s * 8), x1 = ldx(xb + s * 8 + 1);
+    uint32_t a[16];
+    decode(R[s % ST], A.tb, a);
+    if (s + ST < KU) {
+#pragma unroll
+      for (int p = 0; p < NP; ++p) R[s % ST][p] = ldw(wp + (size_t)(s + ST) * wstep + p * 32);
+    }
+    while ((int)(enx >> 20) == s) {
+      patch(a, enx, lane);
+      ++ecur;
+      enx = ecur < 32 ? __shfl_sync(0xffffffffu, em, ecur & 31) : 0xFFFFFFFFu;
+    }
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const uint4 xv = (q >> 1) ? x1 : x0;
+      mma16816(acc[q & 1], a[4 * q], a[4 * q + 1], a[4 * q + 2], a[4 * q + 3], (q & 1) ? xv.z : xv.x, (q & 1) ? xv.w : xv.y);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) red[warp][i][lane] = acc[0][i] + acc[1][i];
+  cp_wait_all();
+  __syncthreads();
+  if (tid < 128) {
+    const int l = tid & 31, c = tid >> 5;
+    float v = 0.f;
+#pragma unroll
+    for (int k2 = 0; k2 < NW; ++k2) v += red[k2][c][l];
+    const int row = rt * 16 + (l >> 2) + 8 * (c >> 1), tok = 2 * (l & 3) + (c & 1);
+    if (tok < m) reinterpret_cast<__nv_bfloat16*>(A.out)[(size_t)tok * A.ldo + row] = __float2bfloat16_rn(v);
+  }
+  // 2. router32_kernel<1>'s CTA (bx, sl): warp w < 8 = router row bx*8 + w over K slice sl (G2's RM 1 expressions)
+  if (warp < 8) {
+    const int row = bx * 8 + warp;
+    float racc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int c = i * 32 + lane;
+      const float4 wv = wsm[warp * RKS4 + c];
+      const float4 xv = xsm[c];
+      racc = fmaf(wv.x, xv.x, racc);
+      racc = fmaf(wv.y, xv.y, racc);
+      racc = fmaf(wv.z, xv.z, racc);
+      racc = fmaf(wv.w, xv.w, racc);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) racc += __shfl_xor_sync(0xffffffffu, racc, o);
+    if (lane == 0) G.part[(long)sl * NE + row] = racc;
+  }
+  // 3. the last CTA (ticket; no spin) runs the tail (G2's expressions for M = 1)
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = (atomicAdd(G.tcnt, 1) == (int)gridDim.x - 1);
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (tid == 0) atomicExch(G.tcnt, 0);
+  const uint4 wq = *(reinterpret_cast<const uint4*>(G.nw) + tid);
+  const uint4 yq = __ldcg(reinterpret_cast<const uint4*>(A.out) + tid);
+  {
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&yq);
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = __bfloat162float(h[i]);
+    float ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) ss += v[i] * v[i];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) tred[warp] = ss;
+  }
+  __syncthreads();
+  {
+    float tot = 0.f;
+#pragma unroll
+    for (int i = 0; i < NW; ++i) tot += tred[i];
+    const float rstd = rsqrtf(tot / (float)PD + G.eps);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&yq);
+    const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wq);
+    __align__(16) __nv_bfloat16 o8[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) o8[i] = __float2bfloat16((__bfloat162float(h[i]) * rstd) * __bfloat162float(w[i]));
+    *(reinterpret_cast<uint4*>(G.xn) + tid) = *reinterpret_cast<const uint4*>(o8);
+  }
+  if (warp >= m) return;
+  // tail_kernel<false, 8>'s warp-0 routing for token 0 (lane l holds experts 8l .. 8l+7)
+  const float4* pbias = reinterpret_cast<const float4*>(G.bias) + lane * 2;
+  const float4 c0b = pbias[0], c1b = pbias[1];
+  const float4* pq0 = reinterpret_cast<const float4*>(G.part) + lane * 2;
+  float4 a0 = __ldcg(pq0), a1 = __ldcg(pq0 + 1);
+#pragma unroll
+  for (int q = 1; q < 8; ++q) {   // FP32 split-K partials summed in a fixed order
+    const float4* pq = reinterpret_cast<const float4*>(G.part + q * NE) + lane * 2;
+    const float4 b0 = __ldcg(pq), b1 = __ldcg(pq + 1);
+    a0.x += b0.x; a0.y += b0.y; a0.z += b0.z; a0.w += b0.w;
+    a1.x += b1.x; a1.y += b1.y; a1.z += b1.z; a1.w += b1.w;
+  }
+  const float4 qb0 = make_float4(0.f, 0.f, 0.f, 0.f), qb1 = qb0;   // tail_kernel's lb == nullptr term
+  a0.x += qb0.x; a0.y += qb0.y; a0.z += qb0.z; a0.w += qb0.w; a1.x += qb1.x; a1.y += qb1.y; a1.z += qb1.z; a1.w += qb1.w;
+  const float lg[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const float bs[8] = {c0b.x, c0b.y, c0b.z, c0b.w, c1b.x, c1b.y, c1b.z, c1b.w};
+  float s[8], b[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    s[j] = 1.f / (1.f + expf(-lg[j] * G.mult));
+    b[j] = s[j] + bs[j];
+  }
+  unsigned key[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const unsigned u = __float_as_uint(b[j]);
+    key[j] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  }
+  int sel_id[TK];
+  float sel_s[TK];
+#pragma unroll
+  for (int k = 0; k < TK; ++k) {
+    unsigned hv = key[0];
+    int hj = 0;
+#pragma unroll
+    for (int j = 1; j < 8; ++j)
+      if (key[j] > hv) { hv = key[j]; hj = j; }
+    float hs = s[0];
+#pragma unroll
+    for (int j = 1; j < 8; ++j)
+      if (j == hj) hs = s[j];
+    const unsigned mx = __reduce_max_sync(0xffffffffu, hv);
+    const int wl = __ffs(__ballot_sync(0xffffffffu, hv == mx)) - 1;   // lowest lane holding the max = lowest expert id
+    const int wj = __shfl_sync(0xffffffffu, hj, wl);
+    sel_id[k] = wl * 8 + wj;
+    sel_s[k] = __shfl_sync(0xffffffffu, hs, wl);
+    if (lane == wl) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (j == hj) key[j] = 0u;
+    }
+  }
+  if (lane == 0) {
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < TK; ++i) sum += sel_s[i];
+    const float inv = G.rscale / (sum + G.deps);
+    const int ls = G.lstart[0];
+#pragma unroll
+    for (int k = 0; k < TK; ++k) {
+      G.tw[k] = sel_s[k] * inv;
+      G.tid[k] = sel_id[k];
+      const int rel = ((sel_id[k] - ls) % NE + NE) % NE;
+      G.lid[k] = rel < 32 ? rel : -1;
+    }
+  }
+}
+'''
+
+PRT_HOST = r'''
+int gd_prt_raw(const void* w, const void* esc, uint32_t tb, const void* x, void* y, const void* x32, const void* w32, void* part,
+               const void* nw, const void* bias, const void* lstart, void* xn, void* tw, void* tid, void* lid, void* tcnt,
+               float eps, float mult, float rscale, float deps, int pdl, cudaStream_t st) {
+  Args A;
+  A.w = reinterpret_cast<const uint4*>(w); A.esc = reinterpret_cast<const uint32_t*>(esc);
+  A.x = reinterpret_cast<const uint16_t*>(x); A.out = y; A.M = 1; A.K = RK; A.ldo = PD; A.tb = tb; A.trig = 0;
+  PArgs G;
+  G.x32 = reinterpret_cast<const float*>(x32); G.w32 = reinterpret_cast<const float*>(w32); G.part = reinterpret_cast<float*>(part);
+  G.nw = reinterpret_cast<const __nv_bfloat16*>(nw); G.bias = reinterpret_cast<const float*>(bias);
+  G.lstart = reinterpret_cast<const int*>(lstart); G.xn = reinterpret_cast<__nv_bfloat16*>(xn);
+  G.tw = reinterpret_cast<float*>(tw); G.tid = reinterpret_cast<int*>(tid); G.lid = reinterpret_cast<int*>(lid);
+  G.tcnt = reinterpret_cast<int*>(tcnt);
+  G.eps = eps; G.mult = mult; G.rscale = rscale; G.deps = deps;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(256u, 1u, 1u);
+  cfg.blockDim = dim3((unsigned)PNT, 1u, 1u);
+  cfg.dynamicSmemBytes = (size_t)9 * RKS4 * 16;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl ? 1u : 0u;
+  return (int)cudaLaunchKernelEx(&cfg, gprt_kernel<8, 2>, A, G);
+}
+
+int gd_prt_info_raw(int64_t* res) {
+  cudaFuncAttributes fa;
+  int e = (int)cudaFuncGetAttributes(&fa, gprt_kernel<8, 2>);
+  if (e) return e;
+  int occ = 0;
+  e = (int)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, gprt_kernel<8, 2>, PNT, 9 * RKS4 * 16);
+  res[0] = fa.numRegs; res[1] = (int64_t)fa.localSizeBytes; res[2] = occ; res[3] = (int64_t)fa.sharedSizeBytes;
+  return e;
+}
+'''
+
+PRT_PY = '''
+
+# GD prt (tools/gd_patches.py, prt=True): the T = 1 pooler inside a G2-style fused pooler + FP32 router + tail kernel on gv1's
+# P12 stream; GD_ENABLE and GD_PRT are read at call time (False = G2's prt).
+GD_PRT = True
+GD_PRT_PDL = True        # = G2_PRT_PDL
+GD_PRT_GEO = (1, 16, 8, 1)   # (wr, wk, ku, s) of the pooler pack gprt_kernel<8, 2> streams
+
+
+def _gd_prt_run(p, x, router_input, state, data, pdl):
+    dev = x.device
+    y = torch.empty((1, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    part = torch.empty((8, 1, N_EXPERTS), dtype=torch.float32, device=dev)
+    xn = torch.empty((1, D_EXPERT), dtype=torch.bfloat16, device=dev)
+    tw = torch.empty((1, TOP_K), dtype=torch.float32, device=dev)
+    tid = torch.empty((1, TOP_K), dtype=torch.int32, device=dev)
+    lid = torch.empty((1, TOP_K), dtype=torch.int32, device=dev)
+    v8 = state["v8"]
+    p["mod"].gd_prt(p["w"], p["esc"], p["tb"], x, y, router_input, state["router"], part, v8["nw"], v8["bias"],
+                    data["local_start"], xn, tw, tid, lid, p["tcnt"], RMS_EPS, 0.1767766952966369, 1.0, 1e-15, pdl)
+    return xn, tw, tid, lid
+
+
+def _gd_prt(ffn_input, router_input, state, data, tokens, mode, tail):
+    st = state.get("gd")
+    if not (GD_ENABLE and GD_PRT and st is not None and st.get("prt") is not None) or tokens != 1:
+        return None
+    if mode != "f32" or tail != "sep" or router_input is None or state.get("v8") is None:
+        return None
+    x = ffn_input
+    if not (x.dtype == torch.bfloat16 and x.dim() == 2 and tuple(x.shape) == (1, HIDDEN) and x.is_contiguous()
+            and x.data_ptr() % 16 == 0 and router_input.dtype == torch.float32 and router_input.is_contiguous()
+            and router_input.shape == x.shape and router_input.data_ptr() % 16 == 0):
+        return None
+    try:
+        out = _gd_prt_run(st["prt"], x, router_input, state, data, 1 if GD_PRT_PDL else 0)
+        if ("prt", 1) not in _GD_SEEN:
+            _GD_SEEN.add(("prt", 1))
+            print(f"[gd] first call prt T=1: {st['prt']['desc']}", flush=True)
+        return out
+    except Exception as ex:
+        st["prt"] = None
+        print(f"[gd] prt raised at call time, G2's prt from now on: {ex!r}", flush=True)
+        return None
+
+
+def _gd_prt_selftest(state, p, w):
+    dev = w.device
+    parts = []
+    for seed, ls in ((4243, 0), (4244, 37), (4245, 200)):
+        gen = torch.Generator(device=dev).manual_seed(seed)
+        h = torch.randn((1, HIDDEN), generator=gen, device=dev)
+        h = (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True))).contiguous()
+        hb = h.to(torch.bfloat16).contiguous()
+        d = {"local_start": torch.tensor([ls], dtype=torch.int32, device=dev)}
+        part = torch.empty((8, 1, N_EXPERTS), dtype=torch.float32, device=dev)
+        state["v8"]["mod"].v8_router32(h, state["router"], part)
+        pool = (hb.double() @ w.double().T).to(torch.bfloat16)
+        ref = _v8_tail(pool, part, state, d)
+        outs = [_gd_prt_run(p, hb, h, state, d, pdl) for pdl in (0, 1, 1)]
+        torch.cuda.synchronize()
+        cnt = int(p["tcnt"][0])
+        for k, got in enumerate(outs):
+            ex = float((got[0].float() - ref[0].float()).norm() / ref[0].float().norm())
+            ew = float((got[1] - ref[1]).abs().max())
+            ids = bool(torch.equal(got[2], ref[2])) and bool(torch.equal(got[3], ref[3]))
+            if not (ex < 2e-3 and ew < 1e-6 and ids and bool(torch.isfinite(got[0].float()).all()) and cnt == 0):
+                return False, f"ls {ls} call {k}: xn rel {ex:.2e} w maxdiff {ew:.1e} ids {ids} ticket {cnt}"
+        if not all(bool(torch.equal(a, b)) for a, b in zip(outs[1], outs[2])):
+            return False, f"ls {ls}: repeat not bitwise"
+        parts.append(f"ls {ls} xn {ex:.1e}")
+    return True, " ".join(parts)
+
+
+def _gd_prt_prepare(state, mod, live):
+    if not GD_PRT:
+        return None
+    w = state["dense"]["pooler"]
+    if state.get("v8") is None or state.get("router") is None:
+        print("[gd] FALLBACK prt: no v8 tail / router state -> G2's prt", flush=True)
+        return None
+    why = None
+    try:
+        info = mod.gd_prt_info()
+        sms = torch.cuda.get_device_properties(w.device).multi_processor_count
+        if info[1] > 64 or (GD_ONE_WAVE and info[2] * sms < 256):
+            why = f"regs {info[0]} spill {info[1]} occ {info[2]} for 256 CTAs"
+        else:
+            wr, wk, ku, s = GD_PRT_GEO
+            wv = w.contiguous()
+            pk = _gd_pack(wv, wr, wk, ku, s, _gd_window_base(wv))
+            un = torch.empty_like(wv)
+            mod.gd_unpack(pk["w"], pk["esc"], un, wv.shape[1], pk["G"], pk["nbx"], wr, wk, ku, pk["tb"])
+            torch.cuda.synchronize()
+            exact = bool(torch.equal(un.view(torch.int16), wv.view(torch.int16)))
+            del un
+            if not exact:
+                why = "pack / bit-exact unpack failed"
+            else:
+                p = {"mod": mod, "w": pk["w"], "esc": pk["esc"], "tb": pk["tb"], "desc": f"prt(1,16,8,1)s2r{info[0]}",
+                     "tcnt": torch.zeros((1,), dtype=torch.int32, device=w.device)}
+                ok, msg = _gd_prt_selftest(state, p, wv)
+                if not ok:
+                    why = f"self-test: {msg}"
+    except Exception as ex:
+        why = f"EXC {ex!r}"
+    if why is not None:
+        print(f"[gd] FALLBACK prt: {why} -> G2's prt", flush=True)
+        return None
+    print(f"[gd] self-test prt {p['desc']}: ok ({msg}; {pk['nesc']} escapes)", flush=True)
+    live.append(f"pooler/1 {p['desc']}")
+    return p
+
+'''
+
+PRT_EDITS = [
+    ("prt build functions",
+     'functions=["gd_run", "gd_info", "gd_unpack"]',
+     'functions=["gd_run", "gd_info", "gd_unpack", "gd_prt", "gd_prt_info"]'),
+    ("prt prepare",
+     '    torch.cuda.empty_cache()\n    state["gd"] = {"mod": mod, "route": routes} if routes else None\n',
+     '    prt = _gd_prt_prepare(state, mod, live)\n    torch.cuda.empty_cache()\n'
+     '    state["gd"] = {"mod": mod, "route": routes, "prt": prt} if (routes or prt is not None) else None\n'),
+    ("prt route at T = 1",
+     '    g2out = _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n',
+     '    g2out = _gd_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n    if g2out is None:\n'
+     '        g2out = _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n'),
+]
+
 PY_ANCHOR = "\ndef kernel_fn(data, state):\n"
 
 EDITS = [
@@ -813,15 +1219,21 @@ EDITS = [
 ]
 
 
-def block():
-    """The GD Python block with the two kernel sources inlined as raw string literals."""
-    for src in (GD_CPP_SRC, GD_CUDA_SRC):
+def block(prt=False):
+    """The GD Python block with the two kernel sources inlined as raw string literals (+ the T = 1 prt kernel if prt)."""
+    cpp, cuda, py = GD_CPP_SRC, GD_CUDA_SRC, PY
+    if prt:
+        ns_end = "}  // namespace gd\n"
+        if cuda.count(ns_end) != 1:
+            raise RuntimeError("gd patch: namespace end anchor")
+        cpp, cuda, py = cpp + PRT_CPP, cuda.replace(ns_end, PRT_DEV + "\n" + ns_end) + PRT_HOST, py + PRT_PY
+    for src in (cpp, cuda):
         if "'''" in src or src.endswith("\\"):
             raise RuntimeError("gd patch: a kernel source holds ''' or ends in a backslash")
-    return PY.replace("@CPP@", "r'''" + GD_CPP_SRC + "'''").replace("@CUDA@", "r'''" + GD_CUDA_SRC + "'''")
+    return py.replace("@CPP@", "r'''" + cpp + "'''").replace("@CUDA@", "r'''" + cuda + "'''")
 
 
-def apply(text):
+def apply(text, prt=False):
     for name in ("GD_ENABLE", "GD_CUDA_SRC", "def _gd(", "def _gd_prepare(", "_gd_build"):
         if name in text:
             raise RuntimeError(f"gd patch: {name!r} already in the base")
@@ -831,7 +1243,13 @@ def apply(text):
         text = text.replace(old, new)
     if text.count(PY_ANCHOR) != 1:
         raise RuntimeError("gd patch: kernel_fn anchor")
-    return text.replace(PY_ANCHOR, block() + PY_ANCHOR)
+    text = text.replace(PY_ANCHOR, block(prt) + PY_ANCHOR)
+    if prt:
+        for name, old, new in PRT_EDITS:
+            if text.count(old) != 1:
+                raise RuntimeError(f"gd patch {name!r}: anchor found {text.count(old)}x (want 1)")
+            text = text.replace(old, new)
+    return text
 
 
 if __name__ == "__main__":
