@@ -8,7 +8,8 @@ What is kept, byte for byte:
   * the first and last line of every string literal;
   * a `//` line that ends with a backslash, or follows a line ending with a backslash (line splicing would change meaning);
   * a `//` line that mentions a license or copyright (strip_layer.LICENSE);
-  * a `//` line containing any single-line string constant of the file that itself contains `//` (the Python code may search
+  * a `//` line containing a string the Python code searches text for (first argument of str.index / find / split / replace /
+    ... or the left side of an `in` test; e.g.
     the CUDA source for it, e.g. `p1_src.index("// D = 1: <= 64 registers")` in G2; dropping such a line broke G2 once).
 Check (`equivalent`): ast.dump of the output equals ast.dump of the original after applying the same line filter to every
 plain string constant at the value level (f-string parts untouched); the header lines are unchanged; and every single-line
@@ -33,10 +34,22 @@ SEP = chr(0)
 BACKSLASH = chr(92)
 
 
+SEARCH_METHODS = {"index", "rindex", "find", "rfind", "split", "rsplit", "partition", "rpartition", "replace", "count",
+                  "startswith", "endswith"}
+
+
 def _probes(text):
-    """Single-line string constants (>= 4 chars): what the Python code might search the CUDA sources for."""
-    return {n.value for n in ast.walk(ast.parse(text))
-            if isinstance(n, ast.Constant) and isinstance(n.value, str) and NL not in n.value and len(n.value.strip()) >= 4}
+    """String constants the Python code searches text for: the first argument of a str search/split/replace method,
+    or the left side of an `in` / `not in` test. A line holding one is never dropped, and its count must not change."""
+    out = set()
+    for n in ast.walk(ast.parse(text)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in SEARCH_METHODS and n.args
+                and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str)):
+            out.add(n.args[0].value)
+        elif (isinstance(n, ast.Compare) and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str)
+              and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops)):
+            out.add(n.left.value)
+    return {q for q in out if q.strip()}
 
 
 def _kept(lines, probes=()):
@@ -59,7 +72,7 @@ def _filter(lines, probes=()):
 
 def strip(text):
     lines = text.splitlines(keepends=True)
-    probes = [q for q in _probes(text) if "//" in q]
+    probes = sorted(_probes(text))
     drop = set()
     for t in tokenize.generate_tokens(io.StringIO(text).readline):
         if t.type != tokenize.STRING or t.start[0] == t.end[0]:
@@ -95,7 +108,7 @@ def _multiline_text(text):
 
 def equivalent(orig, out):
     probes = _probes(orig)
-    a = _reference(ast.parse(orig), [q for q in probes if "//" in q])
+    a = _reference(ast.parse(orig), sorted(probes))
     b = ast.parse(out)
     if ast.dump(a, include_attributes=False) != ast.dump(b, include_attributes=False):
         return False, "AST differs from the value-level reference filter"
