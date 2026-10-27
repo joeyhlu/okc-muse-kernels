@@ -9211,7 +9211,7 @@ def _k2a37_dyn_code(dyn):
     assert 0 <= f1 < 64 and 0 <= f2 < 64 and 0 <= dsh <= 4, dyn
     return (f1 << 8) | (f2 << 14) | (dsh << 20) | ((1 << 23) if cold_only else 0)
 
-KW1_K2_W4 = 6   # KW1 (tools/kw1_patches.py): K2-only hot weight for vid 5's role split (0 = shipped hot_w4)
+KW1_K2_W4 = 5   # KW1 (tools/kw1_patches.py): K2-only hot weight for vid 5's role split (0 = shipped hot_w4)
 
 def _k2a37_call(st, data, vid, hot=None, dyn=None, probe=K2A33_HINT, mask=7):
     """One call of variant vid: hot = (hot_t, hot_mode, hot_w4) for HK2 / HK3 variants, dyn = (f1, f2, log2 D) for HK3

@@ -7,7 +7,7 @@ Why (per-CTA marks, box_out/fb4 + box_out/r1, 12 routings, 3 router seeds):
   * The fitted K2 cost of an extra 8-token chunk-stage is beta = 0.32-0.43 of a cold stage (median 0.36), while the model
     uses 12/16 = 0.75. So Gh = 149-183 is too large: hot-role CTAs finish at work p50 39-50 us, cold-role ones at 52-70 us
     (max 67-87).
-  * The model reproduces the observed Gh exactly. Re-weighting K2 to w4 = 6 with Gh >= G/2 (one hot CTA on every SM, so no
+  * The model reproduces the observed Gh exactly. Re-weighting K2 to w4 = 5-6 (R3 adopted 5) with Gh >= G/2 (one hot CTA on every SM, so no
     cold+cold SM pairs) predicts K2 -10.6 us median (-7.4..-14.5) over the 12 routings. K1 keeps hot_w4 and its 8/64 ticket
     pool.
 Encoding: probe bits 26-30 = K2 hot weight (0 = off = shipped behaviour). The Python side sets them from KW1_K2_W4, read at
@@ -46,7 +46,7 @@ PY_NEW = ("    pb = probe | (_k2a37_dyn_code(dyn) if v[3] == 3 else 0)\n"
           "    if v[3] == 3 and 0 < KW1_K2_W4 < 32:   # KW1: K2-only hot weight (probe bits 26-30), read at call time\n"
           "        pb |= KW1_K2_W4 << 26\n")
 PY_GLOBAL_ANCHOR = "def _k2a37_call(st, data, vid, hot=None, dyn=None, probe=K2A33_HINT, mask=7):\n"
-PY_GLOBAL = ("KW1_K2_W4 = 6   # KW1 (tools/kw1_patches.py): K2-only hot weight for vid 5's role split (0 = shipped hot_w4)\n\n")
+PY_GLOBAL = ("KW1_K2_W4 = 5   # KW1 (tools/kw1_patches.py): K2-only hot weight for vid 5's role split (0 = shipped hot_w4)\n\n")
 
 
 def apply(text):
