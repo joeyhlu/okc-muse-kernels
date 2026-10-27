@@ -55,6 +55,8 @@ GLUE = r'''
 # ======== VML1: T >= 17 MoE route (notes/study/vm_large.md; tools/vml_patches.py) ========
 VML_ENABLE = True
 VML_BUCKETS = {128: True, 256: True, 32: @VML32@}
+VML_FLAGS = @VMLFLAGS@
+VML_COST = @VMLCOST@
 _VML = {"mod": None, "sc": None, "ok": {}, "err": None}
 
 
@@ -64,8 +66,10 @@ def _vml_build_job():
 
 def _vml_route(st, data):
     x = data["hidden_states"].contiguous()
+    rep = _k2a_bucket_of(x.shape[0])
     return _vml_call(_VML["mod"], st, _VML["sc"], x, data["topk_ids"].to(torch.int32).contiguous(),
-                         data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]))
+                     data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]),
+                     flags=VML_FLAGS.get(rep), cost=VML_COST.get(rep))
 
 
 def _vml_prepare(st, w, dev):
@@ -149,14 +153,16 @@ CALL_NEW = """    rep = _k2a_bucket_of(x.shape[0])
 ANCHOR = "\nK2A36_ENABLE = True\n"
 
 
-def apply(text, t32=False):
+def apply(text, t32=False, flags=None, cost=None):
+    """flags / cost: per-bucket dicts {rep: int} / {rep: [16 ints]} baked in as VML_FLAGS / VML_COST (None = lab defaults)."""
     for old in (PT1_OLD, PREP_OLD, CALL_OLD, ANCHOR):
         assert text.count(old) == 1, old[:80]
     block, names = lab_block()
     for nm in names:
         assert ("_vml_" + nm.lstrip("_")) not in text, nm
     text = text.replace(PT1_OLD, PT1_NEW).replace(PREP_OLD, PREP_NEW).replace(CALL_OLD, CALL_NEW)
-    glue = GLUE.replace("@VML32@", "True" if t32 else "False")
+    glue = (GLUE.replace("@VML32@", "True" if t32 else "False").replace("@VMLFLAGS@", repr(dict(flags or {})))
+            .replace("@VMLCOST@", repr({k: list(v) for k, v in (cost or {}).items()})))
     text = text.replace(ANCHOR, "\n" + block + glue + ANCHOR)
     ast.parse(text)
     return text

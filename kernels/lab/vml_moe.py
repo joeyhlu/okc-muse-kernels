@@ -81,6 +81,7 @@ struct Tab {
   uint32_t cpA[JMAX + 1], cpB[JMAX + 1];
   int bA[GMAX + 1], bB[GMAX + 1];
   int est[E_LOC];
+  unsigned long long bperm[JMAX];
 };
 constexpr int SMEM = TAB_OFF + (int)sizeof(Tab);
 
@@ -225,7 +226,7 @@ __device__ __forceinline__ int cta_of(const Tab& T, int pb, int s, int G) {
   while (hi - lo > 1) { const int mid = (lo + hi) >> 1; if (b[mid] <= s) lo = mid; else hi = mid; }
   return lo;
 }
-__device__ void route(const Args& A, Tab& T, int* hist, uint16_t* ent) {
+__device__ void route(const Args& A, Tab& T, int* hist, uint16_t* ent, uint32_t* fin) {
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int E8 = A.M * TOPK;
   const int C = (((E8 + 15) >> 4) + 31) & ~31;
@@ -305,6 +306,39 @@ __device__ void route(const Args& A, Tab& T, int* hist, uint16_t* ent) {
   __syncthreads();
   const int G = gridDim.x;
   if (tid <= G) { T.bA[tid] = stage_at(A, T, 0, tid, G, A.magG); T.bB[tid] = stage_at(A, T, 1, tid, G, A.magG); }
+  if (A.flags & 32) {   // phase-B stage order by A readiness: estimated finish (cost units) of every A unit
+    for (int i = tid; i < T.nj * 32; i += NTH) fin[i] = 0;
+    __syncthreads();
+    if (tid < G) {
+      const int g0 = T.bA[tid], g1 = T.bA[tid + 1], sp = split_point(A, 0, g0, g1);
+      uint32_t pos = 0;
+      for (int gs = sp, ge = g1;;) {
+        if (gs >= ge) {
+          if (ge == g1 && sp > g0) { gs = g0; ge = sp; } else break;
+        }
+        const int u = gs >> 4, s0 = gs & 15, s1 = min(16, s0 + (ge - gs));
+        pos += (uint32_t)(s1 - s0) * A.cost[((T.jC[u >> 5] + 7) >> 3) - 1];
+        atomicMax(fin + u, pos);
+        gs += s1 - s0;
+      }
+    }
+    __syncthreads();
+    if (tid < T.nj) {
+      uint32_t r[16];
+      int ord[16];
+#pragma unroll
+      for (int k = 0; k < 16; ++k) { r[k] = max(fin[tid * 32 + 2 * k], fin[tid * 32 + 2 * k + 1]); ord[k] = k; }
+      for (int a = 1; a < 16; ++a) {
+        const int o = ord[a];
+        int b = a - 1;
+        while (b >= 0 && r[ord[b]] > r[o]) { ord[b + 1] = ord[b]; --b; }
+        ord[b + 1] = o;
+      }
+      unsigned long long pk = 0;
+      for (int k = 0; k < 16; ++k) pk |= (unsigned long long)ord[k] << (4 * k);
+      T.bperm[tid] = pk;
+    }
+  }
   __syncthreads();
 }
 
@@ -353,6 +387,65 @@ __device__ void gather(const Args& A, const Tab& T, const uint16_t* ent) {
   }
 }
 
+__device__ void gather_warp(const Args& A, const Tab& T, const uint16_t* ent, int lane) {
+  const int G = gridDim.x, c = blockIdx.x;
+  const int q0 = (int)mdiv((uint32_t)(T.Rpad * c), A.magG);
+  const int q1 = (c == G - 1) ? T.Rpad : (int)mdiv((uint32_t)(T.Rpad * (c + 1)), A.magG);
+  const int kk = lane * 8, i = kk >> 6, t = (kk >> 4) & 3, qb = (kk >> 1) & 7;
+  uint32_t* xa = reinterpret_cast<uint32_t*>(A.xA);
+  int j = 0;
+  for (int q = q0; q < q1; ++q) {
+    while (T.jrow[j + 1] <= q) ++j;
+    const int r = q - T.jrow[j], cn = T.jC[j];
+    if (r >= cn) continue;
+    const int npad = (cn + 7) & ~7;
+    const uint4* src = reinterpret_cast<const uint4*>(A.x + (size_t)(ent[T.jS[j] + r] >> 3) * KDIM) + lane;
+    uint4 v[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) v[m] = __ldg(src + 32 * m);
+    uint32_t* d = xa + T.jrow[j] * 2048 + (((((r >> 3) * 4 + i) * 8 + qb) * 8 + (r & 7)) * 4 + t);
+#pragma unroll
+    for (int m = 0; m < 16; ++m) {
+      uint32_t* dm = d + m * npad * 128;
+      dm[0] = v[m].x; dm[32] = v[m].y; dm[64] = v[m].z; dm[96] = v[m].w;
+    }
+  }
+  fence_proxy_async();
+  __syncwarp();
+  if (lane == 0) {
+    int jj = 0;
+    for (int q = q0; q < q1;) {
+      while (T.jrow[jj + 1] <= q) ++jj;
+      const int e = min(q1, T.jrow[jj + 1]);
+      red_release_add(A.xready + jj, e - q);
+      q = e;
+    }
+  }
+}
+__device__ __forceinline__ int nfill_of(const Args& A, const Tab& T) {
+  return (A.flags & 64) ? min(NX - 1, T.bA[blockIdx.x + 1] - T.bA[blockIdx.x]) : 0;
+}
+// consumers fill the x slots of the CTA's first nf phase-A stages straight from x (no xA round trip)
+__device__ void self_fill(const Args& A, const Tab& T, uint8_t* smem, uint32_t bars, const uint16_t* ent, int nf) {
+  const int tid = threadIdx.x, c = blockIdx.x;
+  const int g0 = T.bA[c], g1 = T.bA[c + 1], sp = split_point(A, 0, g0, g1);
+  for (int f = 0; f < nf; ++f) {
+    const int gs = (sp + f < g1) ? sp + f : sp + f - (g1 - g0);
+    const int j = gs >> 9, st = gs & 15, cn = T.jC[j];
+    uint32_t* xs = reinterpret_cast<uint32_t*>(smem + NS * US + f * XS);
+    for (int w = tid; w < cn * 32; w += 32 * NCW) {
+      const int r = w >> 5, ch = w & 31, i = ch >> 3, t = (ch >> 1) & 3, qb = (ch & 1) * 4;
+      const uint4 v = __ldg(reinterpret_cast<const uint4*>(A.x + (size_t)(ent[T.jS[j] + r] >> 3) * KDIM + 256 * st) + ch);
+      uint32_t* d = xs + (((((r >> 3) * 4 + i) * 8 + qb) * 8 + (r & 7)) * 4 + t);
+      d[0] = v.x; d[32] = v.y; d[64] = v.z; d[96] = v.w;
+    }
+  }
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+  bar_sync(5, 32 * NCW);
+  if (tid == 0)
+    for (int f = 0; f < nf; ++f) mbar_arrive(bars + 8 * (2 * NS + f));
+}
+
 __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars) {
   const uint64_t pol = policy_evict_first();
   const int c = blockIdx.x;
@@ -361,8 +454,9 @@ __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars
     const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
     for (int i = 0; i < g1 - g0; ++i, ++it) {
       const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
-      const int u = gs >> 4, s = gs & 15;
+      const int u = gs >> 4;
       const int j = pb ? (u >> 4) : (u >> 5), ub = pb ? (u & 15) : (u & 31);
+      const int s = (pb && (A.flags & 32)) ? (int)((T.bperm[j] >> (4 * (gs & 15))) & 15) : (gs & 15);
       const int e = T.jE[j];
       const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW
                               : A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;
@@ -376,16 +470,18 @@ __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars
   }
 }
 __device__ void prod_x(const Args& A, const Tab& T, uint32_t xring, uint32_t bars) {
-  const int c = blockIdx.x;
+  const int c = blockIdx.x, nf = nfill_of(A, T);
   int it = 0;
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
     int lastj = -1;
     for (int i = 0; i < g1 - g0; ++i, ++it) {
       const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
-      const int u = gs >> 4, s = gs & 15;
+      const int u = gs >> 4;
       const int j = pb ? (u >> 4) : (u >> 5);
+      const int s = (pb && (A.flags & 32)) ? (int)((T.bperm[j] >> (4 * (gs & 15))) & 15) : (gs & 15);
       const int npad = (T.jC[j] + 7) & ~7;
+      if (!pb && i < nf) continue;
       if (!pb) {
         if (j != lastj) { wait_flag(A.xready + j, npad, A.err); fence_proxy_async(); lastj = j; }
       } else {
@@ -674,21 +770,24 @@ __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
       asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
                    "r"(min(S, tot - off)) : "memory");
   }
-  int* hist = reinterpret_cast<int*>(smem + NS * US);
-  uint16_t* ent = reinterpret_cast<uint16_t*>(smem + NS * US + 4096);
-  route(A, T, hist, ent);
+  uint8_t* scr = smem + NS * US + (NX - 1) * XS;
+  int* hist = reinterpret_cast<int*>(scr);
+  uint16_t* ent = reinterpret_cast<uint16_t*>(scr + 4096);
+  route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));
   if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 7] = gtime();
   if (warp >= NCW) {
     if (warp == NCW) {
       if (A.flags & 4) bar_sync(7, 32 * NCW + 32);
       if (lane == 0) prod_w(A, T, sa(smem), bars);
     } else {
+      if (A.flags & 64) gather_warp(A, T, ent, lane);
       bar_sync(6, 32 * NCW + 32);
       if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
     }
     return;
   }
-  gather(A, T, ent);
+  if (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));
+  else gather(A, T, ent);
   bar_arrive(6, 32 * NCW + 32);
   if (A.flags & 4) bar_arrive(7, 32 * NCW + 32);
   if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 5] = gtime();
@@ -769,7 +868,7 @@ def alloc(dev, G):
             "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
 
-FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, bit 3: in-launch finalize (grid barrier), bit 4: designated finishers (needs bit 0 in phase A)
+FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, bit 3: in-launch finalize (grid barrier), bit 4: designated finishers (needs bit 0 in phase A), bit 5: phase-B stages in A-readiness order, bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers
 
 
 def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):

@@ -46,7 +46,10 @@ def main():
         import vml_slim
         t = vml_slim.apply(t)
         rep.append(f"slim: K2A v3.7 removed ({len(t.encode())} B)")
-    t = vml_patches.apply(t, t32=T32)
+    import json
+    fl = {int(k): int(v) for k, v in json.loads(ARGS.get("flags", "{}")).items()}
+    co = {int(k): [int(x) for x in v] for k, v in json.loads(ARGS.get("cost", "{}")).items()}
+    t = vml_patches.apply(t, t32=T32, flags=fl, cost=co)
     if LABONLY:   # box A/B copy only: the 1 MB judge limit is reported, not enforced
         chk0 = GM.check
         GM.check = lambda ok, msg: chk0(ok or "file >= 1 MB" in msg, msg)

@@ -1,6 +1,6 @@
 """vml_board_research.py: the research tail of tools/gen_vml_board.py --research (kernels/muse_moe_w4a16/vml_<n>.py):
 per bucket an in-prepare cost-table refit from per-CTA marks (least squares of phase ends on per-CTA stage counts by
-n-tiles), correctness of three VML arms (v1 = flags 1, v3 = flags 3 (+ x L2 prefetch), v7 = flags 7 (+ weights start after the gather), v11 = flags 11 (1 + 2 + in-launch finalize), v27 = 11 + designated finishers, v3f / v27f = + refit table) vs
+n-tiles), correctness of three VML arms (v1 = flags 1, v3 = flags 3 (+ x L2 prefetch), v65 = flags 65 (self-fill of the first x slots + producer-warp gather), v67 = 65 + x prefetch, v65f = v65 + refit table) vs
 K2A and FP32, cold-L2 graph timings of K2A and the arms, and marks quantiles; one printed line per item (judge log_tail
 keeps 16 KB). The fastest passing arm serves the bucket only if it beats K2A by > 1 us.
 """
@@ -81,8 +81,8 @@ def _vml_board_prepare(state):
             continue
         ds = [norm(_k2a_self_test_inputs(rep, 900 + 7 * i + rep, dev, "normal" if i % 2 == 0 else "skewed"))
               for i in range(3)]
-        cost = _vml_fit(lambda d: marked(d), ds, G)
-        arms = {"v1": (1, None), "v3": (3, None), "v7": (7, None), "v11": (11, None), "v27": (27, None), "v3f": (3, cost), "v27f": (27, cost)}
+        cost = _vml_fit(lambda d: marked(d, 65), ds, G)
+        arms = {"v1": (1, None), "v3": (3, None), "v65": (65, None), "v67": (67, None), "v65f": (65, cost)}
         good = {nm: True for nm in arms}
         for bs, seed, dist in _VML_CASES[rep]:
             d = norm(_k2a_self_test_inputs(bs, seed, dev, dist))
@@ -137,7 +137,7 @@ def _vml_board_prepare(state):
             _VML["route"][rep] = arms[best]
         print(f"[vmlb] bs={rep}: " + " ".join(f"{nm} {v:.1f}" for nm, v in med.items())
               + f" us | ok {ok_arms} -> {best if live else 'K2A'}", flush=True)
-        for nm in ("v1", "v27f"):
+        for nm in ("v1", "v65"):
             mv = marked(ds[1], *arms[nm]).double()
             t00 = float(mv[:, 0].min())
             r = lambda col: [(float(x) - t00) / 1e3 for x in mv[:, col]]  # noqa: E731
