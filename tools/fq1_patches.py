@@ -70,6 +70,7 @@ def patch_src(src):
 HOST_ADD = '''
 FQ1_FMA_DEQ = True    # FQ1 (tools/fq1_patches.py): K2A consumer shifts / scale words on the FMA pipe (bitwise forms); read at call time
 FQ1_BUILD = True      # build the FQ1 K2A module in prepare (lab A/B arms toggle FQ1_FMA_DEQ)
+FQ1_REQUIRE = True    # lab file: prepare raises if the FQ1 module is disabled (set False before any promotion to a layer)
 
 
 def _fq1_build_mod(variants):
@@ -102,7 +103,7 @@ def _fq1_prepare(st, w, dev):
         m = _fq1_build_mod(st["variants"])
         for i in range(len(st["variants"])):
             a, b = list(st["mod"].attrs3v(i)), list(m.attrs3v(i))
-            if (a[3], a[7]) != (b[3], b[7]) or b[1] or b[5]:
+            if (a[3], a[7]) != (b[3], b[7]) or b[1] > a[1] or b[5] > a[5]:   # no worse than shipped (HOTCAP spills in both)
                 raise RuntimeError(f"variant {i}: occupancy / spill {b} vs shipped {a}")
         st["mod_fq1"] = m
         for bs, seed, dist in K2A33_SELF_TEST_CASES:
@@ -129,6 +130,8 @@ def _fq1_prepare(st, w, dev):
     except Exception as ex:  # noqa: BLE001
         print(f"[fq1] disabled, shipped K2A module kept: {ex!r}", flush=True)
         st["mod_fq1"] = None
+        if FQ1_REQUIRE:   # lab A/B: fail fast instead of timing two identical arms (R2)
+            raise
     finally:
         FQ1_FMA_DEQ = keep
         _k2a33_reset(st)
