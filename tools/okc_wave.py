@@ -8,6 +8,7 @@ printed or written anywhere else. Rate limit: 6 submissions a minute per token, 
 Jobs are appended to notes/jobs.jsonl; results land in kernels/results/<job>.json.
 """
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -41,6 +42,8 @@ def submit(wave_file, mode="check"):
             job = None
         rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "mode": mode, "problem": problem,
                "file": path, "job": job, "rc": rc, "out": out[-400:], "err": err[-400:]}
+        if os.environ.get("OKC_SESSION"):  # set by tools/harness/guard.py: lets it count checks per session
+            rec["session"] = os.environ["OKC_SESSION"]
         with JOBS.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"{problem:24s} {path:60s} -> {job or 'ERROR rc=%d %s' % (rc, (err or out)[-160:])}")
