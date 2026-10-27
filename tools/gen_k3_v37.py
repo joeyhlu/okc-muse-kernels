@@ -19,8 +19,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
-FIN1 = "--fin1" in sys.argv
-SS3 = "--ss3" in sys.argv   # lab: + tools/ss3_patches.py (ss in K3, 4-CTA clusters; R12 A/B file)
+V38 = "--v38" in sys.argv   # k3_v38 = the R12 binary (FIN1 code present) with SS3 on and FIN1 off by default
+FIN1 = "--fin1" in sys.argv or V38
+SS3 = "--ss3" in sys.argv or V38   # lab: + tools/ss3_patches.py (ss in K3, 4-CTA clusters; R12 A/B file)
 CHECK = "--check" in sys.argv
 _argv, sys.argv = sys.argv, [sys.argv[0]]   # gen_k3_v35 reads its flags at import; library use only
 import gen_k3_v35 as G  # noqa: E402
@@ -37,9 +38,12 @@ import tie1_patches  # noqa: E402
 import tl1_patches  # noqa: E402
 
 _LABNAME = "k3_v37" + ("_ss3" if SS3 else "") + ("_fin1" if FIN1 else "")
-OUT = ROOT / ("kernels/muse_decode_layer/k3_v37.py" if not (SS3 or FIN1) else f"kernels/lab/{_LABNAME}_ab.py")
-LAB = ROOT / f"kernels/lab/{_LABNAME}_ab.py"
-NONCE = ("# nonce k3-v37-1 (k3_v36 [v35_fa_pt1 + TIE1 + TL1 + K3P] + RS1 warp-parallel K2A setup + SBB1 attention boundary"
+OUT = ROOT / ("kernels/muse_decode_layer/k3_v38.py" if V38 else "kernels/muse_decode_layer/k3_v37.py" if not (SS3 or FIN1)
+              else f"kernels/lab/{_LABNAME}_ab.py")
+LAB = ROOT / ("kernels/lab/k3_v38_ab.py" if V38 else f"kernels/lab/{_LABNAME}_ab.py")
+NONCE = ("# nonce k3-v38-1 (k3_v37 [k3_v36 + RS1 + SBB1] + SS3 ss in K3 via 4-CTA DSMEM clusters on; FIN1 code present, off)"
+         if V38 else
+         "# nonce k3-v37-1 (k3_v36 [v35_fa_pt1 + TIE1 + TL1 + K3P] + RS1 warp-parallel K2A setup + SBB1 attention boundary"
          + (" + FIN1 vid-3 9-warp finalize" if FIN1 else "") + ")")
 
 
@@ -71,6 +75,10 @@ def generate():
     text = sbb1_patches.apply(text)
     check(text.count("SBB1_ENABLE = True") == 1 and 'jobs.append(("sbb1", _sbb1_build))' in text, "SBB1 + PT1 job")
     rep.append("SBB1 applied (attention boundary, PT1 job)")
+    if V38:   # R12: SS3 qualified, FIN1 arms did not
+        check(text.count("FIN1_ENABLE = True   #") == 1, "FIN1 default anchor")
+        text = text.replace("FIN1_ENABLE = True   #", "FIN1_ENABLE = False   # R12: off by default;")
+        rep.append("k3_v38 defaults: SS3_ENABLE True, FIN1_ENABLE False (R12)")
     check(text.count(G.NONCE_OLD) == 1, "base nonce line")
     text = text.replace(G.NONCE_OLD, NONCE)
     before = len(text.encode())
@@ -93,7 +101,8 @@ def verify(text, base):
         tmp.unlink()
     check(text.isascii(), "non-ASCII character")
     check(text.split("\n", 1)[0] == "# okc: problem=muse_decode_layer", "line 1")
-    check(text.count("k3-v37-1") == 1 and not any(f"k3-v3{v}-1" in text for v in (4, 5, 6)), "nonce")
+    tag = "k3-v38-1" if V38 else "k3-v37-1"
+    check(text.count(tag) == 1 and not any(f"k3-v3{v}-1" in text for v in (4, 5, 6)), "nonce")
     names = [getattr(n, "name", None) or (n.targets[0].id if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) else None)
              for n in ast.parse(text).body]
     dup = sorted({n for n in names if n and names.count(n) > 1})
