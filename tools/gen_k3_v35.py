@@ -37,11 +37,13 @@ BASE_SHA1 = "1d5e2a5ddee39134e4cb9960bf08884d61671d45"
 X4 = ROOT / ".claude/worktrees/explorer-baba5f/kernels/muse_decode_layer/x_4.py"   # reference (optional, checked when present)
 WITH_FA = "--with-fa206" in sys.argv
 STRIP = "--strip" in sys.argv or WITH_FA   # PR206 needs it to fit < 1 MB (parent: keep the K2A fallbacks, strip comments instead)
-OUT = ROOT / ("kernels/muse_decode_layer/k3_v35_fa.py" if WITH_FA else
-              "kernels/muse_decode_layer/k3_v35_s.py" if STRIP else "kernels/muse_decode_layer/k3_v35.py")
+PT1 = "--pt1" in sys.argv   # tools/pt1_patches.py: threaded prefetch of the independent CUDA builds (prepare-time cut)
+_STEM = "k3_v35" + ("_fa" if WITH_FA else "_s" if STRIP else "") + ("_pt1" if PT1 else "")
+OUT = ROOT / f"kernels/muse_decode_layer/{_STEM}.py"
 NONCE_OLD = "# nonce k3-v34-1 (k3_v19 + the v20 levers listed in tools/gen_k3_v20.py)"
 NONCE = ("# nonce k3-v35-1 (k3_v34 + explorer x_4 levers: SU1 at T=1, K3 trigger -> P1 unpooler at T=8, DG1 o at T=32; "
-         "+ KW1 K2 hot weight 5 at T=128" + ("; + PR206 full verify B>=16" if WITH_FA else "") + ")")
+         "+ KW1 K2 hot weight 5 at T=128" + ("; + PR206 full verify B>=16" if WITH_FA else "")
+         + ("; + PT1 threaded build prefetch" if PT1 else "") + ")")
 
 # step 2: x_4's configuration (old, new); each `old` must occur exactly once in the whole text
 X4_CONFIG = [
@@ -114,6 +116,10 @@ def generate():
         import fa206_patches   # the hook: everything but its own nonce patch (this wrapper writes the nonce)
         text = fa206_patches.apply(text, [p for p in fa206_patches.PATCHES if p[0] != "nonce"])
         rep.append("PR206 hook applied (fa206_patches.apply minus its nonce patch; every patch hit once)")
+    if PT1:   # before the strip: its anchors carry comments
+        import pt1_patches
+        text = pt1_patches.apply(text)
+        rep.append(f"PT1 applied ({len(pt1_patches.PATCHES)} patches hit once)")
     check(text.count(NONCE_OLD) == 1, "base nonce line")
     text = text.replace(NONCE_OLD, NONCE)
     if STRIP:   # tools/strip_layer.py: comments + docstrings only, license blocks and lines 1-2 kept, kernel strings untouched
