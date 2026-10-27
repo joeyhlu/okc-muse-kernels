@@ -166,3 +166,19 @@ def apply(text, t32=False, flags=None, cost=None):
     text = text.replace(ANCHOR, "\n" + block + glue + ANCHOR)
     ast.parse(text)
     return text
+
+
+def replace(text, t32=False, flags=None, cost=None):
+    """For a base that already carries a VML block (e.g. k3_va_3): swap the block + glue for the current lab source; the
+    PT1 job, prepare call and route hook stay as they are (same names). Asserts exactly one old block."""
+    START_OLD = "_vml_E_LOC, _vml_TOPK, _vml_KDIM = 32, 8, 4096\n"
+    assert text.count(START_OLD) == 1 and text.count(ANCHOR) == 1
+    for new in (PT1_NEW, PREP_NEW, CALL_NEW):
+        assert text.count(new) == 1, new[:80]
+    a, b = text.index(START_OLD), text.index(ANCHOR)
+    block, _ = lab_block()
+    glue = (GLUE.replace("@VML32@", "True" if t32 else "False").replace("@VMLFLAGS@", repr(dict(flags or {})))
+            .replace("@VMLCOST@", repr({k: list(v) for k, v in (cost or {}).items()})))
+    text = text[:a] + block + glue + text[b:]
+    ast.parse(text)
+    return text

@@ -5,7 +5,7 @@ base only by the VML1 patch (+ optional --slim: tools/vml_slim.py removes K2A v3
 Then gen_k3_m32.finish (strips, compiles, ASCII, nonce, no duplicate names, judge-checker scan <= base, < 1 MB). Writes the
 layer file and a byte-identical box copy kernels/lab/k3_vml_<n>_ab.py.
 
-    python -I tools/gen_k3_vml.py [--n=1] [--base=k3_vms_1] [--t32] [--slim] [--lab-only]
+    python -I tools/gen_k3_vml.py [--n=1] [--base=k3_vms_1] [--t32] [--slim] [--lab-only] [--replace]
 """
 import hashlib
 import pathlib
@@ -49,7 +49,10 @@ def main():
     import json
     fl = {int(k): int(v) for k, v in json.loads(ARGS.get("flags", "{}")).items()}
     co = {int(k): [int(x) for x in v] for k, v in json.loads(ARGS.get("cost", "{}")).items()}
-    t = vml_patches.apply(t, t32=T32, flags=fl, cost=co)
+    if "--replace" in sys.argv:   # base already carries a VML block (k3_va_3, ...): swap it for the current lab source
+        t = vml_patches.replace(t, t32=T32, flags=fl, cost=co)
+    else:
+        t = vml_patches.apply(t, t32=T32, flags=fl, cost=co)
     if LABONLY:   # box A/B copy only: the 1 MB judge limit is reported, not enforced
         chk0 = GM.check
         GM.check = lambda ok, msg: chk0(ok or "file >= 1 MB" in msg, msg)
