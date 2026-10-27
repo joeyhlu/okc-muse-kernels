@@ -483,6 +483,138 @@ def main_va2():
     return 0
 
 
+ATTN_ADAPTER = r'''
+
+_AD = {"state": None}
+
+
+def _ad_watchdog(limit_s):
+    """a hung new kernel in the lazy prepare must fail this check fast instead of running into the judge timeout"""
+    import os
+    import threading
+    done = threading.Event()
+    def run():
+        if not done.wait(limit_s):
+            print(f"[va] prepare watchdog: no progress in {limit_s} s, exiting", flush=True)
+            os._exit(17)
+    threading.Thread(target=run, daemon=True).start()
+    return done
+
+
+def _ad_prepare(device):
+    """The layer prepare's attention part, once, on the first eager call (this problem has no prepare): r1's state without
+    weights, K1 (its own build: K1 + VA1 + VA2), v10qk, FA4 v6 / v8, KS1 / KS2 / KS3, PR206, VA1, VA2 with their self-tests."""
+    global _K1_MOD
+    done = _ad_watchdog(280)
+    t0 = time.time()
+    inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, 64, 2, dtype=torch.float, device=device) / 64))
+    freqs = torch.einsum("i,j -> ij", torch.arange(ROPE_POSITIONS, dtype=torch.float, device=device), inv_freq)
+    state = {
+        "router": torch.empty((1,), dtype=torch.float32, device=device),
+        "cos_sin": torch.cat((freqs.cos(), freqs.sin()), dim=-1),
+        "qk_norm": FusedQKNorm(head_dim=64, num_q_heads=16, num_kv_heads=2, eps=RMS_EPS),
+        "o_norm_gate": FusedRMSNormGate(MuseSpark1xRMSNorm(64, eps=RMS_EPS, has_weight=False), True, 64),
+        "stage_loc": torch.arange(1, STAGE_LOC_MAX + 1, dtype=torch.int64, device=device),
+        "k1_ok": False,
+    }
+    del freqs
+    if USE_K1:
+        try:
+            if _K1_MOD is None:
+                _K1_MOD = _k1_build()
+            state["k1_ok"] = _k1_prepare(device)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[ad] K1 build / prepare FAILED, K1 off: {ex!r}", flush=True)
+    state["v10qk"] = _v10_qk_prepare(state)
+    _v18_fa4_prepare(state, t0)
+    _ks1_prepare(state, t0)
+    _p206_prepare(state, t0)
+    _va1_prepare(state)
+    _va2_prepare(state)
+    torch.cuda.synchronize()
+    done.set()
+    print(f"[va] attention prepare {time.time() - t0:.1f}s: k1 {state['k1_ok']} fa4v6 {bool(state.get('fa4v6'))} "
+          f"ks1 {bool(state.get('ks1'))} p206 {bool(state.get('p206'))} va1 {state.get('va1_ok')} va2 {state.get('va2_ok')} "
+          f"(variant {VA2_VAR}, segk {VA2_SEGK})", flush=True)
+    return state
+
+
+def _ad_attention(qkv, data, cfg, state):
+    """The layer kernel_fn's attention block, verbatim: routes, order and fallbacks."""
+    tokens = cfg["tokens"]
+    hq, d = cfg["num_q_heads"], cfg["head_dim"]
+@BLOCK@
+    return o
+
+
+def kernel_fn(data):
+    cfg = data["config"]
+    if (cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]) != (16, 2, 64):
+        return _ad_r1_kernel_fn(data)
+    if _AD["state"] is None:
+        if torch.cuda.is_current_stream_capturing():
+            return _ad_r1_kernel_fn(data)
+        _AD["state"] = _ad_prepare(data["qkv"].device)
+    batch, length = cfg["batch"], cfg["q_len"]
+    tokens = batch * length
+    lcfg = dict(cfg)
+    lcfg["tokens"] = tokens
+    ldata = dict(data)
+    ldata["config"] = lcfg
+    o = _ad_attention(data["qkv"].reshape(tokens, -1), ldata, lcfg, _AD["state"])
+    return o.view(batch, length, cfg["num_q_heads"] * cfg["head_dim"])
+'''
+ATTN_OLD_NAMES = ("RMS_EPS", "FP8", "_NORMS", "_ROPE", "ROPE_POSITIONS", "R1_QK_FUSED_FP8_STAGE", "NUM_SPLITS_OVERRIDE",
+                  "STAGE_LOC_MAX", "_STAGE_LOC", "_stage_loc", "_qk_norm", "_cos_sin", "_r1_kernel_fn", "rms_norm_gate")
+
+
+def main_attn():
+    """--attn --src=kernels/lab/va_k3_va_7_ab.py --n=1 [--set=NAME=VALUE,...]: kernels/muse_attention_decode/va_<n>.py, the
+    layer file's attention path (incl. VA1 / VA2) behind this problem's kernel_fn(data) (pattern of tools/gen_attn_pkg.py at
+    0612e37), our previous entry's stock path for other head shapes, a prepare watchdog; module globals set by --set."""
+    import py_compile
+    import re
+    src = ROOT / ARGS.get("src", "kernels/lab/va_k3_va_7_ab.py")
+    t = src.read_text(encoding="utf-8")
+    lines = t.split(chr(10))
+    assert lines[0] == "# okc: problem=muse_decode_layer", lines[0]
+    sets = [kv.split("=", 1) for kv in ARGS.get("set", "").split(",") if kv]
+    lines[0] = "# okc: problem=muse_attention_decode"
+    lines[1] = (f"# nonce va-{N} ({src.stem} attention path for muse_attention_decode (VA1 + VA2 routes), tools/va_patches.py "
+                f"--attn; {' '.join(f'{k}={v}' for k, v in sets) or 'defaults'})")
+    t = chr(10).join(lines)
+    for old, new in ((chr(10) + "def prepare(weights):" + chr(10), chr(10) + "def _layer_prepare(weights):" + chr(10)),
+                     (chr(10) + "def kernel_fn(data, state):" + chr(10), chr(10) + "def _layer_kernel_fn(data, state):" + chr(10))):
+        assert t.count(old) == 1, old
+        t = t.replace(old, new)
+    for k, v in sets:
+        old = next(ln for ln in t.split(chr(10)) if ln.startswith(f"{k} = "))
+        assert t.count(chr(10) + old + chr(10)) == 1, k
+        t = t.replace(chr(10) + old + chr(10), chr(10) + f"{k} = {v}" + chr(10))
+    a = t.index(chr(10) + "def _layer_kernel_fn(data, state):" + chr(10))
+    b0 = t.index("    o = None" + chr(10) + "    ks1_ran = False" + chr(10), a)
+    end_mark = "    if o is None:" + chr(10) + "        o = _r1_attention(qkv, data, state)" + chr(10)
+    b1 = t.index(end_mark, b0) + len(end_mark)
+    block = t[b0:b1].rstrip(chr(10))
+    o = (ROOT / "kernels/muse_attention_decode/k1_fa4v6_route.py").read_text(encoding="utf-8")
+    s = o.index(chr(10) + "RMS_EPS = 1e-5" + chr(10)) + 1
+    tail = "    return o.view(batch, length, hq * d)" + chr(10)
+    e = o.index(tail, o.index(chr(10) + "def _r1_kernel_fn(data):" + chr(10))) + len(tail)
+    old_block = o[s:e]
+    for n in sorted(ATTN_OLD_NAMES, key=len, reverse=True):
+        old_block = re.sub(rf"(?<![\w.]){re.escape(n)}\b", f"_ad_{n.lstrip('_')}", old_block)
+    head = (chr(10) * 2 + "# muse_attention_decode package (tools/va_patches.py --attn): the layer's attention block; stock path "
+            "for other head shapes = our previous entry's r1, names prefixed _ad_." + chr(10) +
+            "from sglang.kernels.ops.muse_spark_v12.norm_gate import rms_norm_gate as _ad_rms_norm_gate  # noqa: E402" + chr(10) * 2)
+    t = t.rstrip(chr(10)) + head + old_block + ATTN_ADAPTER.replace("@BLOCK@", block)
+    out = ROOT / f"kernels/muse_attention_decode/va_{N}.py"
+    out.write_bytes(t.encode("utf-8"))
+    py_compile.compile(str(out), doraise=True)
+    assert t.isascii() and len(t.encode()) < 1_000_000, len(t.encode())
+    print(f"[va_patches] wrote {out.relative_to(ROOT)} ({len(t.encode())} B, compiles, ASCII; sets {sets})")
+    return 0
+
+
 ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
 N = int(ARGS.get("n", 1))
 OUT = ROOT / f"kernels/muse_decode_layer/k3_va_{N}.py"
@@ -528,4 +660,5 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main_va2() if "--va2" in sys.argv else main_riders() if "--riders" in sys.argv else main())
+    sys.exit(main_attn() if "--attn" in sys.argv else main_va2() if "--va2" in sys.argv
+             else main_riders() if "--riders" in sys.argv else main())

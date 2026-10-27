@@ -15,11 +15,9 @@ VA2_CUDA = r'''// VA2 (tools/va2_src.py): verify full q_len 8; part_o / part_lse
 #ifndef VA2_DIAG
 #define VA2_DIAG 0   // lab timing probes (wrong results): 1 no V^T transpose, 2 no softmax math, 3 no PV, 4 no QK, 5 no consumer work
 #endif
-template <int ST> constexpr int va2_off_vt() { return ST * STAGE_BYTES; }
-template <int ST> constexpr int va2_off_new() { return va2_off_vt<ST>() + 3 * VT_BYTES; }
-template <int ST> constexpr int va2_off_q() { return va2_off_new<ST>() + NEW8_BYTES; }
-template <int ST> constexpr int va2_off_bar() { return va2_off_q<ST>() + 8192; }
-template <int ST> constexpr int va2_smem() { return va2_off_bar<ST>() + 16 * ST + 4 * 1032; }
+template <int ST, int NVT> constexpr int va2_off_new() { return ST * STAGE_BYTES + NVT * VT_BYTES; }
+template <int ST, int NVT> constexpr int va2_off_bar() { return va2_off_new<ST, NVT>() + NEW8_BYTES + 8192; }
+template <int ST, int NVT> constexpr int va2_smem() { return va2_off_bar<ST, NVT>() + 16 * ST + 4 * 264; }   // B <= 128
 __device__ __forceinline__ void va_red2(float* a, float x, float y) {
 #if __CUDA_ARCH__ >= 900
   asm volatile("red.global.add.v2.f32 [%0], {%1, %2};\n" ::"l"(a), "f"(x), "f"(y) : "memory");
@@ -28,21 +26,56 @@ __device__ __forceinline__ void va_red2(float* a, float x, float y) {
 #endif
 }
 
+// Lazy softmax (p.W & 2): P from the running offset with no per-tile max; the offset moves (exact softmax_pack7 on
+// the unchanged S, with the O rescale) only when some packed e4m3 P byte exceeds 0x78 (P > 2^8; satfinite max 0x7E).
+__device__ __forceinline__ bool va2_softmax_lazy(float (&S)[32], const float (&m)[2], uint32_t (&pa)[2][4], const int t,
+                                                 const float cl2, const bool need, const int tile_abs, const int key_lim,
+                                                 const int seq, const int j0) {
+  if (m[0] == neg_inf() || m[1] == neg_inf()) return false;
+  if (need) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int ak = tile_abs + 8 * j + 2 * t + e;
+#pragma unroll
+        for (int rb = 0; rb < 2; ++rb)
+          if (!((ak < key_lim) && (ak <= seq + j0 + rb))) S[4 * j + 2 * rb + e] = neg_inf();
+      }
+  }
+  const float b0 = m[0] - P_OFFSET, b1 = m[1] - P_OFFSET;
+  uint32_t ov = 0u;
+#pragma unroll
+  for (int st = 0; st < 2; ++st) {
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+      const int ja = 2 * (2 * st + h2), jb = ja + 1;
+      pa[st][2 * h2 + 0] = pk4f(ex2(fmaf(S[4 * ja + 0], cl2, -b0)), ex2(fmaf(S[4 * ja + 1], cl2, -b0)),
+                                ex2(fmaf(S[4 * jb + 0], cl2, -b0)), ex2(fmaf(S[4 * jb + 1], cl2, -b0)));
+      pa[st][2 * h2 + 1] = pk4f(ex2(fmaf(S[4 * ja + 2], cl2, -b1)), ex2(fmaf(S[4 * ja + 3], cl2, -b1)),
+                                ex2(fmaf(S[4 * jb + 2], cl2, -b1)), ex2(fmaf(S[4 * jb + 3], cl2, -b1)));
+      ov |= ((pa[st][2 * h2] + 0x07070707u) | (pa[st][2 * h2 + 1] + 0x07070707u)) & 0x80808080u;
+    }
+  }
+  return !__any_sync(FULL, ov != 0u);
+}
+
 // Registers: 2 CTAs/SM put 5-6 warps on an SM sub-partition (16 K regs each). PW 1: 288 threads, ptxas caps at 96 regs.
-// PW 4: 384 threads (launch 80 regs), the producer warpgroup drops to 40 and the consumers rise to 104 (setmaxnreg).
-template <int ST, int PW>
+// PW 4: 384 threads (launch 80 regs), the producer warpgroup drops to 32 and the consumers rise to 104 (setmaxnreg;
+// the pool must balance per sub-partition: 4 x (80 - 32) >= 8 x (104 - 80), else setmaxnreg.inc never returns).
+template <int ST, int PW, int NVT>
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #if K1_ARCH_OK
   constexpr int L = 8;
   extern __shared__ __align__(128) uint8_t smem[];
-  uint8_t* vtb = smem + va2_off_vt<ST>();
-  uint8_t* newk = smem + va2_off_new<ST>();
-  uint8_t* qs = smem + va2_off_q<ST>();
-  uint64_t* full = reinterpret_cast<uint64_t*>(smem + va2_off_bar<ST>());
+  uint8_t* vtb = smem + ST * STAGE_BYTES;
+  uint8_t* newk = smem + va2_off_new<ST, NVT>();
+  uint8_t* qs = newk + NEW8_BYTES;
+  uint64_t* full = reinterpret_cast<uint64_t*>(smem + va2_off_bar<ST, NVT>());
   uint64_t* empt = full + ST;
   int* flag = reinterpret_cast<int*>(empt + ST);
   int* sV = flag + 4;
-  int* sN = sV + 513;
+  int* sN = sV + 129;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int hp = blockIdx.y, HP = gridDim.y, B = p.B, segk = p.min_chunk;
   constexpr int NPL = 32 * PW, MPT = 512 / NPL, XS = NPL / 8;   // producer lanes, (key, chunk) pairs per lane, key stride
@@ -68,9 +101,9 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     if (lane == 0) sV[B] = carry;
   }
   __syncthreads();
-  if (tid < 256) {   // e4m3 ones in row group 8 of every V^T region (3 ring buffers + the new tile): PV row sums
+  if (tid < 64 * (NVT + 1)) {   // e4m3 ones in row group 8 of every V^T region (NVT ring buffers + the new tile): row sums
     const int buf = tid >> 6, rg = (tid >> 4) & 3, ch = tid & 15;
-    uint8_t* base = (buf < 3) ? (vtb + buf * VT_BYTES) : (newk + 8192);
+    uint8_t* base = (buf < NVT) ? (vtb + buf * VT_BYTES) : (newk + 8192);
     *reinterpret_cast<uint4*>(base + rg * VT_REGION + 8 * VT_SBO + (ch & 7) * 16 + (ch >> 3) * 128) =
         make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
   }
@@ -89,19 +122,28 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
   int n = 0;
   if (warp >= 8) {   // producers: (key x, chunk c) pairs x = (q >> 3) + XS m, c = q & 7
 #if __CUDA_ARCH__ >= 900
-    if (PW == 4) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+    if (PW == 4) asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
 #endif
     const int q = tid - 256, c = q & 7, x0 = q >> 3, psh = p.page_shift, pm = (1 << psh) - 1;
     const uint8_t* kc = p.k_cache + (size_t)hp * 128 + 16 * c;
     const uint8_t* vc = p.v_cache + (size_t)hp * 128 + 16 * c;
+    // KX (p.W & 4, PW 4): K copied with a key-fastest lane map (8 lanes = 8 keys of one chunk: the 128-B core-matrix rows
+    // of the no-swizzle wgmma layout land in 8 distinct bank groups); V keeps the chunk-fastest map (its slots are
+    // chunk-contiguous). Without KX both use the chunk-fastest map (K stores 8-way bank-conflicted).
+    const bool kx = PW == 4 && (p.W & 4) != 0;
+    const int ck = (q >> 3) & 7, xk0 = (q & 7) + 8 * (q >> 6);
+    const uint8_t* kck = p.k_cache + (size_t)hp * 128 + 16 * ck;
     for (int b = bf; b < B && sV[b] < v1; ++b) {
       const int k0 = max(v0 - sV[b], 0), k1 = min(v1 - sV[b], sN[b]), cend = min(k1, sN[b] - 1);
       if (k1 <= k0 || cend <= k0) continue;
       const int nt = (cend - k0 + TILE - 1) / TILE;
       const int* pt = p.page_table + (size_t)b * p.pt_stride;
-      int pg[MPT];
+      int pg[MPT], pgk[MPT];
 #pragma unroll
-      for (int m = 0; m < MPT; ++m) pg[m] = (k0 + x0 + XS * m < cend) ? __ldg(pt + ((k0 + x0 + XS * m) >> psh)) : -1;
+      for (int m = 0; m < MPT; ++m) {
+        pg[m] = (k0 + x0 + XS * m < cend) ? __ldg(pt + ((k0 + x0 + XS * m) >> psh)) : -1;
+        pgk[m] = (kx && k0 + xk0 + 16 * m < cend) ? __ldg(pt + ((k0 + xk0 + 16 * m) >> psh)) : -1;
+      }
       for (int t = 0; t < nt; ++t, ++n) {
         const int st = n % ST;
         if (n >= ST) va_wait(empt + st, ((n / ST) - 1) & 1);
@@ -111,7 +153,14 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
           const int x = x0 + XS * m, pos = k0 + t * TILE + x;
           const size_t go = pg[m] >= 0 ? (size_t)((pg[m] << psh) | (pos & pm)) * rowB : (size_t)0;
           const int vt = (x >> 4) * 64 + ((x >> 3) & 1) * 32 + ((x >> 1) & 3) * 8 + c;
-          cp_async16(stg + (c >> 2) * 4096 + (x >> 3) * 512 + (c & 3) * 128 + (x & 7) * 16, kc + go, pg[m] >= 0 ? 16 : 0);
+          if (kx) {
+            const int xk = xk0 + 16 * m, posk = k0 + t * TILE + xk;
+            const size_t gk = pgk[m] >= 0 ? (size_t)((pgk[m] << psh) | (posk & pm)) * rowB : (size_t)0;
+            cp_async16(stg + (ck >> 2) * 4096 + (xk >> 3) * 512 + (ck & 3) * 128 + (xk & 7) * 16, kck + gk, pgk[m] >= 0 ? 16 : 0);
+            pgk[m] = (posk + TILE < cend) ? __ldg(pt + ((posk + TILE) >> psh)) : -1;
+          } else {
+            cp_async16(stg + (c >> 2) * 4096 + (x >> 3) * 512 + (c & 3) * 128 + (x & 7) * 16, kc + go, pg[m] >= 0 ? 16 : 0);
+          }
           cp_async16(stg + 8192 + (x & 1) * 4096 + vt * 16, vc + go, pg[m] >= 0 ? 16 : 0);
           const int nx = pos + TILE;
           pg[m] = (nx < cend) ? __ldg(pt + (nx >> psh)) : -1;
@@ -139,7 +188,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     const uint8_t* stg = smem + (nn % ST) * STAGE_BYTES + 8192;
     const uint4 va = *reinterpret_cast<const uint4*>(stg + vtid * 16);
     const uint4 vb = *reinterpret_cast<const uint4*>(stg + 4096 + vtid * 16);
-    uint8_t* dst = vtb + (nn % 3) * VT_BYTES + vt_own;
+    uint8_t* dst = vtb + (nn % NVT) * VT_BYTES + vt_own;
     const uint32_t wa[4] = {va.x, va.y, va.z, va.w}, wb[4] = {vb.x, vb.y, vb.z, vb.w};
 #pragma unroll
     for (int w4 = 0; w4 < 4; ++w4) {
@@ -202,6 +251,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     for (int i = 0; i < nt; ++i, ++n) {
       const int ts = k0 + i * TILE;
       if (VA2_DIAG != 4 && VA2_DIAG != 5) qk_issue(S, dq, desc_il(smem + (n % ST) * STAGE_BYTES + h * 4096, 128, 512));
+      if (NVT == 2) wg_wait<1>();                    // PV(i-1) done: V^T buffer (n + 1) % 2 is free (QK(i) may run)
       if (i + 1 < nt) {
         va_wait(full + (n + 1) % ST, ((n + 1) / ST) & 1);
         if (VA2_DIAG != 1 && VA2_DIAG != 5) transpose_v(n + 1);
@@ -216,9 +266,10 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         for (int q = 0; q < 8; ++q) pa[q >> 2][q & 3] = __float_as_uint(S[q]) & 0x37373737u;
         m[0] = 0.f; m[1] = 0.f;
       } else {
-        softmax_pack7(S, O, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, 0, j0);
+        if (!((p.W & 2) && va2_softmax_lazy(S, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, j0)))
+          softmax_pack7(S, O, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, 0, j0);
       }
-      if (VA2_DIAG != 3 && VA2_DIAG != 5) pv_issue7(O, pa, vtb + (n % 3) * VT_BYTES, h);
+      if (VA2_DIAG != 3 && VA2_DIAG != 5) pv_issue7(O, pa, vtb + (n % NVT) * VT_BYTES, h);
     }
     if (has_new) {
       qk_issue(S, dq, desc_il(newk + h * 4096, 128, 512));
@@ -278,11 +329,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 '''
 
 VA2_HOST = r'''
-template <int ST, int PW>
+template <int ST, int PW, int NVT>
 static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
   static bool attr = false;
   if (!attr) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT>()));
     attr = true;
   }
   int nb = 0;
@@ -291,10 +342,10 @@ static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST>(); cfg.stream = s;
+    cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT>(); cfg.stream = s;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW>, *p));
-  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW>, 256 + 32 * PW, k1::va2_smem<ST>()));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT>, *p));
+  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT>, 256 + 32 * PW, k1::va2_smem<ST, NVT>()));
   return nb;
 }'''
 
@@ -302,7 +353,9 @@ VA2_PY = '''VA2_ENABLE = True   # VA2 (tools/va2_src.py): flat warp-specialized 
 VA2_MIN_B = 2
 VA2_SEGK = 600
 VA2_PDL = False
-VA2_PW = 4          # producer warps: 4 (warpgroup + setmaxnreg 104 / 40) or 1 (96 regs)
+VA2_LAZY = False    # lazy softmax offset (packed-byte overflow test), runtime flag W & 2
+VA2_KX = False      # conflict-free K copies (key-fastest producer map, PW 4), runtime flag W & 4
+VA2_VAR = 344       # 344: producer warpgroup (setmaxnreg 32 / 104), 4 stages, 2 V^T buffers; 323: 3 stages; 303: 1 producer warp
 VA2_CASES = ((2, 3000, 1, 1.0, 401), (3, 1500, 64, 1.0, 402), (16, 700, 1, 1.0 / 64, 403), (5, 9000, 1, 1.0, 404),
              (33, 300, 1, 1.0, 405), (32, 2500, 1, 1.0, 406), (2, 20, 64, 1.0, 407))
 
@@ -310,14 +363,15 @@ VA2_CASES = ((2, 3000, 1, 1.0, 401), (3, 1500, 64, 1.0, 402), (16, 700, 1, 1.0 /
 def _va2_run(qkv, data, cfg, segk=None, pdl=None):
     B, hq, hkv = cfg["batch"], cfg["num_q_heads"], cfg["num_kv_heads"]
     dev = qkv.device
-    code = 323 if VA2_PW == 4 else 303
+    code = int(VA2_VAR)
     G = max(B + 1, _k1_sms(dev) * max(1, min(2, _K1_OCC.get((8, code, str(dev)), 1))) // (hkv // 2))
     pdl = VA2_PDL if pdl is None else pdl
     ws = _VA1_WS[str(dev)]
     out = torch.empty((B, 8, hq * 64), dtype=torch.bfloat16, device=dev)
     _K1_MOD.k1_forward(qkv, data["seq_lens"], data["cache_loc"], data["page_table"], data["k_cache"].view(torch.uint8),
                        data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], ws[2], ws[0], ws[1], out, ws[3],
-                       B, 8, hq, hkv, 1, cfg["page_size"].bit_length() - 1, G, max(1, int(VA2_SEGK if segk is None else segk)),
+                       B, 8, hq, hkv, 1 | (2 if VA2_LAZY else 0) | (4 if VA2_KX else 0), cfg["page_size"].bit_length() - 1, G,
+                       max(1, int(VA2_SEGK if segk is None else segk)),
                        1 if pdl else 0, float(cfg["qk_scale_factor"] * cfg["sm_scale"]), 1, 4, code + (10 if pdl else 0))
     return out
 
@@ -352,7 +406,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 323):
+        for code in (303, 323, 344):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -365,7 +419,7 @@ def _va2_prepare(state):
                         and kt < 3e-2 and vt < 3e-2):
                     raise RuntimeError(f"self-test mismatch B={B} ctx={ctx}")
         state["va2_ok"] = True
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy PW1 {_K1_OCC.get((8, 303, str(dev)))} PW4 {_K1_OCC.get((8, 323, str(dev)))} (PW {VA2_PW}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 323, 344)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
@@ -379,13 +433,15 @@ def va2_patches(text):
     K1_MAIN = "template <int L, int ST>\n__global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {"
     steps = (
         ("VA2 kernel", K1_MAIN, VA2_CUDA + K1_MAIN),
-        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 300 && ST < 340 && ST % 10 == 3)); }"),
+        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || ST == 303 || ST == 313 || ST == 323 || ST == 333 || ST == 344 || ST == 354); }"),
         ("VA2 host", "int64_t k1_occupancy(int64_t L, int64_t ST) {", VA2_HOST + "\n\nint64_t k1_occupancy(int64_t L, int64_t ST) {"),
         ("occupancy", "  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>",
-         "  if (ST > 300) return (int64_t)(ST >= 320 ? va2_go<3, 4>(nullptr, dim3(1), 0, false) : va2_go<3, 1>(nullptr, dim3(1), 0, false));\n  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>"),
+         "  if (ST > 300) return (int64_t)(ST >= 344 ? va2_go<4, 4, 2>(nullptr, dim3(1), 0, false) : ST >= 320 ? "
+         "va2_go<3, 4, 3>(nullptr, dim3(1), 0, false) : va2_go<3, 1, 3>(nullptr, dim3(1), 0, false));\n  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>"),
         ("launch", "  if (stages > 200) {",
-         "  if (stages > 300) {\n    TORCH_CHECK(L == 8 && fold == 1 && B <= 512, \"va2: L 8, fold, B <= 512\");\n"
-         "    if (stages >= 320) va2_go<3, 4>(&p, grid, st, stages > 330);\n    else va2_go<3, 1>(&p, grid, st, stages > 310);\n    C10_CUDA_KERNEL_LAUNCH_CHECK();\n    return;\n  }\n  if (stages > 200) {"),
+         "  if (stages > 300) {\n    TORCH_CHECK(L == 8 && fold == 1 && B <= 128, \"va2: L 8, fold, B <= 128\");\n"
+         "    if (stages >= 344) va2_go<4, 4, 2>(&p, grid, st, stages > 350);\n"
+         "    else if (stages >= 320) va2_go<3, 4, 3>(&p, grid, st, stages > 330);\n    else va2_go<3, 1, 3>(&p, grid, st, stages > 310);\n    C10_CUDA_KERNEL_LAUNCH_CHECK();\n    return;\n  }\n  if (stages > 200) {"),
         ("rows", "VA1_ROWS = 16 * 1024\n", "VA1_ROWS = 34 * 1024\n"),
         ("python", "def _va1_prepare(state):\n", VA2_PY + "def _va1_prepare(state):\n"),
         ("prepare", "    _va1_prepare(state)\n", "    _va1_prepare(state)\n    _va2_prepare(state)\n"),
