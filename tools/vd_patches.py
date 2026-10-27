@@ -1,13 +1,13 @@
 """vd_patches.py: VD1 (notes/study/vd_dense.md) as the layer's dense route at buckets 128 / 256 (verify16 / verify32): SS-wgmma
 swap-AB with all tokens per CTA, pre-swizzled front-major weight tiles streamed by 1-D bulk copies, DSMEM cluster split-K, PDL.
 
-Applied to a finish()-fixed-point base (default k3_va_3): the kernel source comes from kernels/lab/vd_lab.py (vd_cuda_src of
+Applied to a finish()-fixed-point base (default k3_vml_5): the kernel source comes from kernels/lab/vd_lab.py (vd_cuda_src of
 the route instances, expanded here), the Python glue is ours. Hooks (each anchor asserted unique): VD build joins PT1's
 threaded prefetch; _vd_prepare (pack + self-test every route vs FP64 and today's cuBLAS, twice, err 0; fallback loudly)
 runs after _dg1_prepare; _dg1 tries _vd first (so qkv / o / cat / unpooler at T >= 49 get VD where a route is live).
 VD_ENABLE and VD_ROUTE are read at call time (one file serves every A/B arm).
 
-    python -I tools/vd_patches.py [--base=k3_va_3] [--n=1] [--routes=qkv:128:2,...] [--lab-only]
+    python -I tools/vd_patches.py [--base=k3_vml_5] [--n=1] [--routes=qkv:128:2,...] [--lab-only]
 """
 import hashlib
 import pathlib
@@ -19,12 +19,12 @@ sys.path.insert(0, str(ROOT / "kernels" / "lab"))
 ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
 NL = chr(10)
 
-# (proj, bucket) -> (NWG, BN, NST, CL, F32); filled from R-vd-1's per-shape winners
+# (proj, bucket) -> (NWG, BN, NST, CL, F32, RBD); filled from R-vd-2's per-shape winners
 DEFAULT_ROUTES = {
-    ("qkv", 128): (1, 128, 9, 3, 0),
-    ("o", 128): (2, 128, 7, 2, 0),
-    ("cat", 128): (2, 128, 7, 3, 1),
-    ("unpooler", 128): (2, 128, 7, 2, 0),
+    ("qkv", 128): (1, 128, 8, 3, 0, 1),
+    ("o", 128): (1, 128, 9, 1, 0, 0),
+    ("cat", 128): (2, 128, 5, 3, 1, 1),
+    ("unpooler", 128): (2, 128, 6, 2, 0, 1),
 }
 
 
@@ -42,8 +42,13 @@ def parse_routes(spec):
 PY_TMPL = r'''
 
 VD_ENABLE = True
+VD_BUCKETS = [128, 256]
+VD_PROJS = ["qkv", "o", "cat", "unpooler"]
 VD_PDL = True
 VD_TRIG = True
+VD_PF = 2
+VD_ROT = 0
+VD_FLAGS = 8
 VD_TOL = (1.0e-2, 1.0e-4, 1.0e-2)
 VD_INSTS = @INSTS@
 VD_ROUTE = @ROUTE@
@@ -81,7 +86,7 @@ def _vd_pack(w, bm):
 def _vd_call(st, r, x, out):
     flat, w_rb, w_s = st["w"][(r["proj"], r["bm"])]
     st["mod"].vd_run(r["kid"], x, flat, flat, out, st["err"], st["stamps"], r["nrb"], w_rb, w_s,
-                     128 if VD_TRIG else 0, 1 if VD_PDL else 0)
+                     (128 if VD_TRIG else 0) | VD_FLAGS, 1 if VD_PDL else 0, VD_PF | (VD_ROT << 8))
 
 
 def _vd_selftest(st, r, w, T, gen):
@@ -130,7 +135,7 @@ def _vd_prepare(state, t0):
           "stamps": torch.zeros((4,), dtype=torch.int64, device=dev), "w": {}, "route": {}}
     gen = torch.Generator(device=dev).manual_seed(4242)
     for (proj, b), kid in sorted(VD_ROUTE.items()):
-        nwg, bn, nst, cl, f32 = VD_INSTS[kid]
+        nwg, bn, nst, cl, f32, rbd = VD_INSTS[kid]
         w = _dg1_weight(state, proj)
         if w is None or w.dtype != torch.bfloat16 or w.shape[0] % (64 * nwg) or w.shape[1] % 64:
             print(f"[vd] {proj}/{b}: no weight -> today's path", flush=True)
@@ -158,7 +163,7 @@ def _vd(state, proj, x):
         return None
     T = x.shape[0]
     b = _k2a_bucket_of(T)
-    if VD_ROUTE.get((proj, b)) is None:
+    if b not in VD_BUCKETS or proj not in VD_PROJS or VD_ROUTE.get((proj, b)) is None:
         return None
     r = st["route"].get((proj, b))
     if (r is None or T > r["T"] or x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != r["K"] or not x.is_contiguous()
@@ -226,7 +231,7 @@ def main():
     import gen_k3_m32 as GM
     sys.argv = _argv
     _, chk_base, _ = GM.G37.generate()
-    base = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_va_3')}.py"
+    base = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_vml_5')}.py"
     b = base.read_text(encoding="utf-8")
     bn = b.split(NL)[1]
     GM.check(GM.finish(b, bn, bn.split()[2], chk_base, []) == b, f"{base.name} is not a finish() fixed point")
