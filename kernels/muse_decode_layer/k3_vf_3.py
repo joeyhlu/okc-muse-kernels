@@ -2962,7 +2962,7 @@ def _v8_logits(mode, ffn_input, router_input, state):
         part = torch.empty((8, router_input.shape[0], N_EXPERTS), dtype=torch.float32, device=router_input.device)
         kind = VF_ROUTER.get(1 if router_input.shape[0] == 1 else 8, "r32")
         if kind != "r32" and _VF["r8"] and _SBB1["mod"] is not None:
-            _SBB1["mod"].vf_router32(router_input, state["router"], part, 1 if kind == "lean4" else 0)
+            _SBB1["mod"].vf_router32(router_input, state["router"], part, {"lean4": 1, "lean5": 2}.get(kind, 0))
         else:
             state["v8"]["mod"].v8_router32(router_input, state["router"], part)
         return part
@@ -14600,7 +14600,7 @@ def _r1_attention(qkv, data, state):
 G2_ENABLE = True
 
 
-G2_PRT = False
+G2_PRT = True
 
 
 G2_PRT_PDL = True
@@ -15031,6 +15031,8 @@ def _g2_prt_run(g2, P, ffn_input, router_input, state, data, pdl):
 def _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail):
     g2 = state.get("g2")
     if not (G2_ENABLE and G2_PRT and g2 is not None and g2.get("prt")) or tokens != 1:
+        return None
+    if _vf_t1_live(state):
         return None
     if mode != "f32" or tail != "sep" or router_input is None or state.get("v8") is None:
         return None
@@ -19044,6 +19046,51 @@ __global__ void __launch_bounds__(128, 6) vf_router32b_kernel(const float* __res
   }
 }
 
+template <int MT>
+__global__ void __launch_bounds__(128, 6) vf_router32c_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                              float* __restrict__ part, int m) {
+  constexpr int K = 8192, KS = 1024;
+  const int sl = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int k0 = sl * KS;
+#pragma unroll
+  for (int q = 1; q < 4; ++q) {
+    const float* pl = w + (long)(blockIdx.x * 16 + q * 4 + warp) * K + k0 + lane * 32;
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(pl));
+  }
+#pragma unroll 1
+  for (int q = 0; q < 4; ++q) {
+    const int row = blockIdx.x * 16 + q * 4 + warp;
+    const float4* wp = reinterpret_cast<const float4*>(w + (long)row * K + k0);
+    float4 wv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) wv[i] = __ldcs(wp + i * 32 + lane);
+    float acc[MT];
+#pragma unroll
+    for (int j = 0; j < MT; ++j) acc[j] = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int c = i * 32 + lane;
+#pragma unroll
+      for (int j = 0; j < MT; ++j) {
+        if (j < m) {
+          const float4 xv = __ldg(reinterpret_cast<const float4*>(x + (long)j * K + k0) + c);
+          acc[j] = fmaf(wv[i].x, xv.x, acc[j]);
+          acc[j] = fmaf(wv[i].y, xv.y, acc[j]);
+          acc[j] = fmaf(wv[i].z, xv.z, acc[j]);
+          acc[j] = fmaf(wv[i].w, xv.w, acc[j]);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < MT; ++j) {
+      float a = acc[j];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+      if (lane == 0 && j < m) part[((long)sl * m + j) * 256 + row] = a;
+    }
+  }
+}
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 template <bool A, bool B, bool C>
@@ -19097,7 +19144,9 @@ void vf_router32(torch::Tensor x, torch::Tensor w, torch::Tensor part, int64_t k
               reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
               "vf_router32: x f32 [m <= 8, 8192], w f32 [256, 8192], part [8, m, 256]");
   auto s = c10::cuda::getCurrentCUDAStream();
-  if (kind == 1)
+  if (kind == 2)
+    vf_router32c_kernel<8><<<dim3(16, 8), 128, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
+  else if (kind == 1)
     vf_router32b_kernel<8><<<dim3(64, 8), 128, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
   else if (m == 1)
     vf_router32_kernel<1><<<dim3(16, 8), 256, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
@@ -19112,6 +19161,7 @@ SBB1_DECL = 'void sbb1_run(torch::Tensor branch, torch::Tensor stream, torch::Te
 VF_ROUTER = {1: 'lean', 8: 'r32'}
 VF_PRT = False
 VF_SBB2 = {1: False, 8: False, 16: False}
+VF_T1 = True
 VF_SELF_TEST_SEEDS = (731, 732, 733)
 _VF = {"r8": False, "prt": False, "st2": None, "seen": set()}
 
@@ -19131,6 +19181,17 @@ def _vf_sbb2(stream, branch, tokens):
     return out, ns, None
 
 
+def _vf_t1_live(state):
+    if not VF_T1:
+        return False
+    ok = (VF_ROUTER.get(1) == "lean" and _VF["r8"] and _SBB1["mod"] is not None and state.get("v8") is not None
+          and _gd_live(state, "pooler", 1) is not None)
+    if not ok and "t1off" not in _VF["seen"]:
+        _VF["seen"].add("t1off")
+        print("[vf] FALLBACK t1: lean router / GD pooler T=1 not live -> G2 prt at T = 1", flush=True)
+    return ok
+
+
 def _vf_test_r8(state, mod):
     dev = state["router"].device
     ok = True
@@ -19141,7 +19202,7 @@ def _vf_test_r8(state, mod):
         ref = torch.full((8, m, N_EXPERTS), float("nan"), dtype=torch.float32, device=dev)
         got = torch.full((8, m, N_EXPERTS), float("nan"), dtype=torch.float32, device=dev)
         state["v8"]["mod"].v8_router32(z, state["router"], ref)
-        for kind in ((0,) if m == 1 else (0, 1)):
+        for kind in ((0,) if m == 1 else (0, 1, 2)):
             got.fill_(float("nan"))
             mod.vf_router32(z, state["router"], got, kind)
             torch.cuda.synchronize()

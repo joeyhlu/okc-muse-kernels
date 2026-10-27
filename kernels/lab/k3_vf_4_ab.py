@@ -2962,7 +2962,7 @@ def _v8_logits(mode, ffn_input, router_input, state):
         part = torch.empty((8, router_input.shape[0], N_EXPERTS), dtype=torch.float32, device=router_input.device)
         kind = VF_ROUTER.get(1 if router_input.shape[0] == 1 else 8, "r32")
         if kind != "r32" and _VF["r8"] and _SBB1["mod"] is not None:
-            _SBB1["mod"].vf_router32(router_input, state["router"], part, 1 if kind == "lean4" else 0)
+            _SBB1["mod"].vf_router32(router_input, state["router"], part, {"lean4": 1, "lean5": 2}.get(kind, 0))
         else:
             state["v8"]["mod"].v8_router32(router_input, state["router"], part)
         return part
@@ -19044,6 +19044,51 @@ __global__ void __launch_bounds__(128, 6) vf_router32b_kernel(const float* __res
   }
 }
 
+template <int MT>
+__global__ void __launch_bounds__(128, 6) vf_router32c_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                              float* __restrict__ part, int m) {
+  constexpr int K = 8192, KS = 1024;
+  const int sl = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int k0 = sl * KS;
+#pragma unroll
+  for (int q = 1; q < 4; ++q) {
+    const float* pl = w + (long)(blockIdx.x * 16 + q * 4 + warp) * K + k0 + lane * 32;
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(pl));
+  }
+#pragma unroll 1
+  for (int q = 0; q < 4; ++q) {
+    const int row = blockIdx.x * 16 + q * 4 + warp;
+    const float4* wp = reinterpret_cast<const float4*>(w + (long)row * K + k0);
+    float4 wv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) wv[i] = __ldcs(wp + i * 32 + lane);
+    float acc[MT];
+#pragma unroll
+    for (int j = 0; j < MT; ++j) acc[j] = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int c = i * 32 + lane;
+#pragma unroll
+      for (int j = 0; j < MT; ++j) {
+        if (j < m) {
+          const float4 xv = __ldg(reinterpret_cast<const float4*>(x + (long)j * K + k0) + c);
+          acc[j] = fmaf(wv[i].x, xv.x, acc[j]);
+          acc[j] = fmaf(wv[i].y, xv.y, acc[j]);
+          acc[j] = fmaf(wv[i].z, xv.z, acc[j]);
+          acc[j] = fmaf(wv[i].w, xv.w, acc[j]);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < MT; ++j) {
+      float a = acc[j];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+      if (lane == 0 && j < m) part[((long)sl * m + j) * 256 + row] = a;
+    }
+  }
+}
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 template <bool A, bool B, bool C>
@@ -19097,7 +19142,9 @@ void vf_router32(torch::Tensor x, torch::Tensor w, torch::Tensor part, int64_t k
               reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
               "vf_router32: x f32 [m <= 8, 8192], w f32 [256, 8192], part [8, m, 256]");
   auto s = c10::cuda::getCurrentCUDAStream();
-  if (kind == 1)
+  if (kind == 2)
+    vf_router32c_kernel<8><<<dim3(16, 8), 128, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
+  else if (kind == 1)
     vf_router32b_kernel<8><<<dim3(64, 8), 128, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
   else if (m == 1)
     vf_router32_kernel<1><<<dim3(16, 8), 256, 0, s>>>(x.data_ptr<float>(), w.data_ptr<float>(), part.data_ptr<float>(), m);
@@ -19142,7 +19189,7 @@ def _vf_test_r8(state, mod):
         ref = torch.full((8, m, N_EXPERTS), float("nan"), dtype=torch.float32, device=dev)
         got = torch.full((8, m, N_EXPERTS), float("nan"), dtype=torch.float32, device=dev)
         state["v8"]["mod"].v8_router32(z, state["router"], ref)
-        for kind in ((0,) if m == 1 else (0, 1)):
+        for kind in ((0,) if m == 1 else (0, 1, 2)):
             got.fill_(float("nan"))
             mod.vf_router32(z, state["router"], got, kind)
             torch.cuda.synchronize()
