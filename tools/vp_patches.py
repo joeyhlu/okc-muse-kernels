@@ -144,7 +144,11 @@ VP_PY_ANCHOR = "\n\ndef _gd_bucket(T):\n"
 
 # (proj, gd bucket) -> (mt, wr, wk, ku, st, s, xp): the R-vp-2 clone winners (in-prepare net us, XR vs today's GD route):
 # o m8 (1,8,2,1) s2 x2 4.00 vs 4.29; o m16 (2,8,2,1) s2 x2 4.29 vs (2,4,4,1) 4.83; unpooler m16 (2,4,16,1) s2 x3 12.51 vs 12.99.
-VP_ROUTE = {("o", 8): (1, 1, 8, 2, 2, 1, 2), ("o", 16): (2, 2, 8, 2, 2, 1, 2), ("unpooler", 16): (2, 2, 4, 16, 2, 1, 3)}
+# R-vp-3 (in-layer A/B, 2 router seeds): o T 2-8 wins (verify1 -1.0 / -0.7 us, x1.009 / x1.006 sliding / full), o + unpooler at
+# T 9-16 lose (decode16 +0.4 / +0.75 us): k3_vp_1 = all three (as measured), k3_vp_2 = o T 2-8 only (--n=2).
+VP_ROUTES = {1: {("o", 8): (1, 1, 8, 2, 2, 1, 2), ("o", 16): (2, 2, 8, 2, 2, 1, 2), ("unpooler", 16): (2, 2, 4, 16, 2, 1, 3)},
+             2: {("o", 8): (1, 1, 8, 2, 2, 1, 2)}}
+VP_ROUTE = VP_ROUTES[next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--n=")), 2)]
 
 
 def _repl(text, edits, what):
