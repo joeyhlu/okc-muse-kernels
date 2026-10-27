@@ -382,6 +382,75 @@ def apply(text):
     return text
 
 
+# Riders mode: a STRIPPED base that already carries VA1 (k3_va_1 revision, e.g. k3_vml_3) gets the current revision's VA1
+# regions, copied from the stripped kernels/muse_decode_layer/k3_va_2.py (start marker, end marker; each unique).
+RIDER_REGIONS = (
+    ("__device__ __forceinline__ uint32_t va_sa", K1_MAIN),
+    ("static bool stages_ok", "int64_t k1_occupancy(int64_t L, int64_t ST) {"),
+    ("  TORCH_CHECK(stages_ok(L, ST), ", "torch::Tensor k1_prof_read() {"),
+    ("  const dim3 grid((unsigned)Gx, (unsigned)(Hkv / 2));\n", "  if (L == 1) {\n    if (stages == 4)"),
+    ("VA1_ENABLE = True", "def _k1_rms_t"),
+)
+RIDER_LINE = ("    if o is None and _v18_fa4_wanted(qkv, data, cfg, state):\n",
+              "    if o is None and not _va1_b1(cfg, state) and _v18_fa4_wanted(qkv, data, cfg, state):\n")
+
+
+def _region(text, a, b, what):
+    i = text.find(a)
+    if i < 0 or text.count(a) != 1:
+        raise ValueError(f"rider region {what}: start marker found {text.count(a)} times")
+    j = text.find(b, i)
+    if j < 0:
+        raise ValueError(f"rider region {what}: end marker not found")
+    return i, j
+
+
+def riders(text, src, defaults):
+    """text, src: stripped layer texts (src = k3_va_2.py); defaults: {'VA1_PDL': True, ...} set in the result."""
+    for k, (a, b) in enumerate(RIDER_REGIONS):
+        i, j = _region(text, a, b, k)
+        si, sj = _region(src, a, b, k)
+        text = text[:i] + src[si:sj] + text[j:]
+    if text.count(RIDER_LINE[0]) != 1:
+        raise ValueError("rider kernel_fn line")
+    text = text.replace(RIDER_LINE[0], RIDER_LINE[1])
+    for name, val in defaults.items():
+        old = next((ln for ln in text.split(chr(10)) if ln.startswith(f"{name} = ")), None)
+        if old is None or text.count(old + chr(10)) != 1:
+            raise ValueError(f"rider default {name}")
+        text = text.replace(old + chr(10), f"{name} = {val!r}" + chr(10))
+    return text
+
+
+def main_riders():
+    """--riders --base=k3_vml_3 --n=3 [--pdl] [--b1]: k3_va_<n> = <stripped base> + the VA1 revision of k3_va_2."""
+    _argv, sys.argv = sys.argv, [sys.argv[0]]
+    import gen_k3_m32 as GM
+    sys.argv = _argv
+    _, chk_base, _ = GM.G37.generate()
+    base = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_vml_3')}.py"
+    b = base.read_text(encoding="utf-8")
+    bn = b.split(chr(10))[1]
+    GM.check(GM.finish(b, bn, bn.split()[2], chk_base, []) == b, f"{base.name} is not a finish() fixed point")
+    src = (ROOT / "kernels/muse_decode_layer/k3_va_2.py").read_text(encoding="utf-8")
+    defaults = {"VA1_PDL": "--pdl" in sys.argv, "VA1_B1": "--b1" in sys.argv}
+    tag = f"k3-va-{N}"
+    nonce = (f"# nonce {tag} ({base.stem} + VA1 riders: PDL {defaults['VA1_PDL']}, decode full B = 1 {defaults['VA1_B1']}; "
+             "VA1_PDL / VA1_B1 switches)")
+    t = riders(b.replace(bn, nonce), src, defaults)
+    rep = [f"base {base.name} {len(b.encode())} B is a finish() fixed point"]
+    s = GM.finish(t, nonce, tag, chk_base, rep)
+    rep.append(f"size: {len(b.encode())} -> {len(s.encode())} B (headroom {1_000_000 - len(s.encode())} B)")
+    for r in rep:
+        print(f"[va_patches] OK  {r}")
+    out, lab = ROOT / f"kernels/muse_decode_layer/k3_va_{N}.py", ROOT / f"kernels/lab/va_k3_va_{N}_ab.py"
+    out.write_text(s, encoding="utf-8", newline=chr(10))
+    lab.write_text(s, encoding="utf-8", newline=chr(10))
+    print(f"[va_patches] wrote {out.relative_to(ROOT)} and {lab.relative_to(ROOT)} ({len(s.encode())} B, "
+          f"sha1 {hashlib.sha1(s.encode()).hexdigest()[:12]})")
+    return 0
+
+
 ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
 N = int(ARGS.get("n", 1))
 OUT = ROOT / f"kernels/muse_decode_layer/k3_va_{N}.py"
@@ -427,4 +496,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_riders() if "--riders" in sys.argv else main())
