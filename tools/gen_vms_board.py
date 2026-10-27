@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import vms_patches  # noqa: E402
 
 ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
-N, MAXT = int(ARGS.get("n", 1)), int(ARGS.get("maxt", 16))
+N, MAXT, FL = int(ARGS.get("n", 1)), int(ARGS.get("maxt", 16)), int(ARGS.get("fl", 0))
 SRC = ROOT / "kernels/muse_moe_w4a16/k0_check.py"
 OUT = ROOT / f"kernels/muse_moe_w4a16/vms_{N}.py"
 
@@ -39,7 +39,7 @@ def kernel_fn(data, state):
         out = torch.empty((m, K2A_D_HIDDEN), dtype=torch.bfloat16, device=x.device)
         vs["mod"].run(x, data["topk_ids"].to(torch.int32).contiguous(), data["topk_weights"].to(torch.float32).contiguous(),
                       vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"], out,
-                      vs["nomarks"], m, K2A_POST_NORM_EPS, 0, int(data["config"]["local_start"]))
+                      vs["nomarks"], m, K2A_POST_NORM_EPS, 0, int(data["config"]["local_start"]), VMS_FL)
         return out
     return _sa_kernel_fn(data, state)
 
@@ -64,10 +64,14 @@ def main():
     lines[1] = (f"# vms-board-{N}: our layer MoE (K2A, board copy of k3_v35_pt1's) + VMS one-launch MoE at bs <= {MAXT} "
                 "(notes/study/vm_small.md); check only, never scored.")
     t = "\n".join(lines)
-    cuda, cpp = vms_patches._lab_sources()
+    cuda, cpp = vms_patches._lab_sources(vms_patches.LAB_V1 if N == 1 else None)
     block = ('VMS_CUDA_SRC = r"""' + cuda + '"""\nVMS_CPP_SRC = r"""' + cpp + '"""\n'
-             + vms_patches.PY_BLOCK.replace("@MAXT@", str(MAXT)))
-    s = t.rstrip("\n") + "\n\n" + block + TAIL
+             + vms_patches.PY_BLOCK.replace("@MAXT@", str(MAXT)).replace("@FL@", str(FL)))
+    tail = TAIL
+    if N == 1:   # frozen v1 lab revision: run() has no fl argument
+        block = block.replace(", K2A_POST_NORM_EPS, 1, 0, VMS_FL)", ", K2A_POST_NORM_EPS, 1, 0)").replace(f"VMS_FL = {FL}\n", "")
+        tail = tail.replace(', int(data["config"]["local_start"]), VMS_FL)', ', int(data["config"]["local_start"]))')
+    s = t.rstrip("\n") + "\n\n" + block + tail
     names = [getattr(n, "name", None) or (n.targets[0].id if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
                                           else None) for n in ast.parse(s).body]
     dup = sorted({n for n in names if n and names.count(n) > 1})

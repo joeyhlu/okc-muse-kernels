@@ -54,7 +54,10 @@ def main():
         print(f"[vms] sm_90a build ok in {dt:.0f} s (compile only; attrs need an H200)")
         return 0
     G = torch.cuda.get_device_properties(0).multi_processor_count
-    mod, dt = V.build(G, 2, "sm_86", name="vms_lab86")
+    nw = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    flb = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    ns = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+    mod, dt = V.build(G, ns, "sm_86", name=f"vms_lab86_{nw}_{flb}_{ns}", nw=nw, fl=flb)
     print(f"[vms] sm_86 build ok in {dt:.0f} s: regs/local/smem/G/NS {list(mod.attrs())}")
     w = make_weights(dev)
     pk = V.prepack(w)
@@ -63,7 +66,7 @@ def main():
     cases = [(1, 1, "normal"), (1, 2, "normal"), (2, 3, "normal"), (4, 4, "skew"), (5, 5, "normal"), (8, 6, "normal"),
              (8, 7, "hot"), (12, 8, "skew"), (16, 9, "normal"), (16, 10, "hot"), (16, 11, "skew"), (3, 12, "nolocal"),
              (16, 13, "nolocal")]
-    for T, seed, kind, fl in [c + (fl,) for fl in (0, 12) for c in cases]:
+    for T, seed, kind, fl in [c + (flb,) for c in cases]:
         x, ids, tw = make_input(T, seed, dev, kind)
         ref = V.ref_fp32(x, ids, tw, w)
         cnt = torch.bincount(ids[ids >= 0].long(), minlength=32)

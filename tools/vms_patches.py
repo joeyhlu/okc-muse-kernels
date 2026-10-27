@@ -9,17 +9,22 @@ patch on the k3_m32_3 pre-strip layer text.
     two calls each, err flag); on any failure st["vms_ok"] = False with a loud print (K2A stays).
   * _v11_k2a33_call: tokens <= VMS_MAXT and st["vms_ok"] -> _vms_call (PDL launch, as K2A's K1); an exception disables it.
 
-    text = apply_vms(text, maxt=16)
+    text = apply_vms(text, maxt=16, fl=0)
+
+k3_vms_1 (commit 4a0dcf4) was generated from the lab revision before the `fl` flags (run() without the fl argument);
+regenerating it now gives a different file: new versions use --n >= 2.
 """
+import ast
 import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LAB = ROOT / "kernels/lab/vms_moe_lab.py"
+LAB_V1 = ROOT / "kernels/lab/vms_moe_lab_v1.py"   # frozen revision of k3_vms_1 / vms_1 (run() without fl)
 
 
-def _lab_sources():
-    t = LAB.read_text(encoding="utf-8")
+def _lab_sources(lab=None):
+    t = (lab or LAB).read_text(encoding="utf-8")
     cuda = t.split("CUDA_SRC = r'''", 1)[1].split("'''", 1)[0]
     cpp = t.split("CPP_SRC = r'''", 1)[1].split("'''", 1)[0]
     assert '"""' not in cuda and '"""' not in cpp
@@ -29,6 +34,7 @@ def _lab_sources():
 PY_BLOCK = r'''
 VMS_ENABLE = True
 VMS_MAXT = @MAXT@
+VMS_FL = @FL@
 VMS_UB = 36864
 VMS_POS = (((6, 7, 8, 15), (22, 23, 24, 31)), ((2, 3, 4, 11), (18, 19, 20, 27)),
            ((28, 29, 30, 5), (12, 13, 14, 21)), ((0, 1, 26, 9), (16, 17, 10, 25)))
@@ -83,7 +89,7 @@ def _vms_call(st, x, local_ids, topk_weights):
     m = x.shape[0]
     out = torch.empty((m, K2A_D_HIDDEN), dtype=torch.bfloat16, device=x.device)
     vs["mod"].run(x, ids, tw, vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"],
-                  out, vs["nomarks"], m, K2A_POST_NORM_EPS, 1, 0)
+                  out, vs["nomarks"], m, K2A_POST_NORM_EPS, 1, 0, VMS_FL)
     return out
 
 
@@ -191,15 +197,94 @@ def _once(text, old, new, what):
     return text.replace(old, new)
 
 
-def apply_vms(text, maxt=16):
-    cuda, cpp = _lab_sources()
+def apply_vms(text, maxt=16, fl=0, lab=None):
+    cuda, cpp = _lab_sources(lab)
     for nm in ("VMS_CUDA_SRC", "VMS_CPP_SRC", "_vms_call", "_vms_prepare", "VMS_ENABLE"):
         assert nm not in text, f"vms_patches: {nm} already in the text"
     assert re.search(r"^import hashlib$", text, re.M) and re.search(r"^import time$", text, re.M), "imports"
-    block = ('VMS_CUDA_SRC = r"""' + cuda + '"""\nVMS_CPP_SRC = r"""' + cpp + '"""\n' + PY_BLOCK.replace("@MAXT@", str(int(maxt)))
+    block = ('VMS_CUDA_SRC = r"""' + cuda + '"""\nVMS_CPP_SRC = r"""' + cpp + '"""\n' + PY_BLOCK.replace("@MAXT@", str(int(maxt))).replace("@FL@", str(int(fl)))
              + "\n")
     text = _once(text, DEF_ANCHOR, block + DEF_ANCHOR, "def _v11_k2a33_call")
     text = _once(text, CALL_OLD, CALL_NEW, "_v11_k2a33_call rep line")
     text = _once(text, PREP_OLD, PREP_NEW, "_sk1_prepare call")
     text = _once(text, PT1_OLD, PT1_NEW, "PT1 gd job")
+    if lab == LAB_V1:   # the frozen v1 run() has no fl argument
+        text = _once(text, ', K2A_POST_NORM_EPS, 1, 0, VMS_FL)', ', K2A_POST_NORM_EPS, 1, 0)', "v1 call")
+        text = _once(text, "VMS_MAXT = %d\nVMS_FL = %d\n" % (maxt, fl), "VMS_MAXT = %d\n" % maxt, "v1 VMS_FL")
     return text
+
+
+# ---------------------------------------------------------------- KL1: legacy K2A strip (parent-approved 2026-10-27)
+# K2A v2.2 / v3 / v3.1 are built only when K2A v3.3 fails a bucket's self-test (need_v31 / need_v3 / need_v2 in prepare());
+# the combined v10 build and every live route (VMS, v3.3 / v3.6 / v3.7 incl. PX, SK1, HOTCAP, KW1) use K2A33 only.
+# KL1 drops those sources, builds and prepares; the three prepares become loud stubs returning None, so a bucket v3.3
+# cannot serve goes straight to r1 Marlin (the existing fallback in _v8_experts).
+KL1_SEED = ("K2A_KERNEL_SRC", "K2A3_KERNEL_SRC", "K2A31_KERNEL_SRC", "K2A_CPP_SRC", "K2A3_CPP_SRC", "K2A31_CPP_SRC",
+            "_k2a_build_ext", "_k2a3_build_ext", "_k2a31_build_ext", "_k2a_v2_prepare", "_k2a3_prepare_st",
+            "_k2a31_prepare_st", "_v10_k2a31_build", "_K2A31_OWN_BUILD")
+KL1_STUBS = {"_k2a_prepare": "K2A v2.2", "_v8_k2a3_prepare": "K2A v3", "_v9_k2a31_prepare": "K2A v3.1"}
+
+
+def _top_names(tree):
+    out = {}
+    for n in tree.body:
+        nm = getattr(n, "name", None)
+        if nm is None and isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            nm = n.targets[0].id
+        if nm is not None:
+            out.setdefault(nm, []).append(n)
+    return out
+
+
+def apply_kl1(text, log=None):
+    tree = ast.parse(text)
+    tops = _top_names(tree)
+    for nm in KL1_SEED + tuple(KL1_STUBS):
+        assert len(tops.get(nm, ())) == 1, f"kl1: {nm} defined {len(tops.get(nm, ()))} times"
+    users = {}
+    for nm, nodes in tops.items():
+        for x in ast.walk(nodes[0]):
+            if isinstance(x, ast.Name) and x.id != nm:
+                users.setdefault(x.id, set()).add(nm)
+    for n in tree.body:   # module-level statements that are not named definitions (e.g. if blocks) also use names
+        if not (getattr(n, "name", None) or isinstance(n, ast.Assign)):
+            for x in ast.walk(n):
+                if isinstance(x, ast.Name):
+                    users.setdefault(x.id, set()).add("<module>")
+    gone = set(KL1_SEED) | set(KL1_STUBS)
+    changed = True
+    while changed:   # dead closure: definitions whose every user is dropped or stubbed (stubs keep only their names)
+        changed = False
+        for nm, nodes in tops.items():
+            if nm in gone or not isinstance(nodes[0], (ast.FunctionDef, ast.Assign)):
+                continue
+            u = users.get(nm, set())
+            if u and u <= gone:
+                gone.add(nm)
+                changed = True
+    drop = sorted(gone - set(KL1_STUBS))
+    lines = text.split("\n")
+    spans = []
+    for nm in gone:
+        n = tops[nm][0]
+        a = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])]) - 1
+        b = n.end_lineno
+        if nm in KL1_STUBS:
+            args = ", ".join(x.arg for x in n.args.args)
+            stub = [f"def {nm}({args}):",
+                    f'    print("[kl1] {KL1_STUBS[nm]} is not in this file (legacy strip): a bucket K2A v3.3 cannot serve '
+                    f'falls back to r1 Marlin", flush=True)',
+                    "    return None"]
+        else:
+            stub = []
+        spans.append((a, b, stub))
+    for a, b, stub in sorted(spans, reverse=True):
+        lines[a:b] = stub
+    out = "\n".join(lines)
+    t2 = ast.parse(out)
+    left = {x.id for x in ast.walk(t2) if isinstance(x, ast.Name)} & set(drop)
+    assert not left, f"kl1: dropped names still referenced: {sorted(left)}"
+    if log:
+        log(f"kl1: dropped {len(drop)} definitions {drop}; stubbed {sorted(KL1_STUBS)}; "
+            f"{len(text.encode())} -> {len(out.encode())} B pre-strip")
+    return out

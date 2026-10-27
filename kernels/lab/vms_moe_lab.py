@@ -44,11 +44,17 @@ CUDA_SRC = r'''
 #ifndef VMS_G
 #define VMS_G 132
 #endif
+#ifndef VMS_NW
+#define VMS_NW 8
+#endif
+#ifndef VMS_FL
+#define VMS_FL 0
+#endif
 
 namespace vms {
 constexpr int HD = 4096, ID = 4096, NE = 32, MAXP = 128, MAXJ = 64;
 constexpr int UB = 36864, UC = 32768, RBA = 512, RBB = 256;
-constexpr int NW = 8, NT = NW * 32, NTL = NT + 32, NRB = 4, NS = VMS_NS, G = VMS_G;
+constexpr int NW = VMS_NW, NCH = 64 / VMS_NW, NT = NW * 32, NTL = NT + 32, NRB = 4, NS = VMS_NS, G = VMS_G;
 constexpr int WAIT_MAX = 1 << 22;
 
 struct Params {
@@ -57,7 +63,7 @@ struct Params {
   const float* gsA; const float* gsB; const float* nw;
   __nv_bfloat16* inter; float* ybuf; float* ss; int* ctr;
   __nv_bfloat16* out; long long* marks; int m; float eps; int lo;
-  int fl;   // 1 probe: weights from 8 L2-resident units, 2 null consumer, 4 L1 prefetch of the next A job's x, 8 same for B (inter)
+  int fl;   // unused (flags are the compile-time VMS_FL: 1 L2 probe source, 2 null consumer, 4 / 8 next-job L1 prefetch)
 };
 
 struct __align__(16) Smem {
@@ -100,7 +106,7 @@ __device__ __forceinline__ void cta_sync_compute() { asm volatile("bar.sync 1, %
 
 // unit q of this CTA's sequence (phase-A units a0.., then phase-B units b0..) -> global source
 __device__ __forceinline__ const unsigned char* unit_src(const Params& p, const Smem& S, int q, int nA, int a0, int b0) {
-  if (p.fl & 1) return p.wA + (size_t)(blockIdx.x & 7) * UB;
+  if (VMS_FL & 1) return p.wA + (size_t)(blockIdx.x & 7) * UB;
   if (q < nA) { const int v = a0 + q; return p.wA + ((size_t)S.jE[v >> 9] * RBA + (v & 511)) * UB; }
   const int v = b0 + (q - nA); return p.wB + ((size_t)S.jE[v >> 8] * RBB + (v & 255)) * UB;
 }
@@ -215,7 +221,7 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
     }
     const uint32_t k16 = 16u + (uint32_t)(p.m >> 30);   // opaque 16: the scale build's multiply stays an IMAD
     const int g = lane >> 2, t = lane & 3;
-    uint4 xr[16];
+    uint4 xr[2 * NCH];
     int curj = -1;
     int sl = 0; uint32_t par = 0;
     for (int q = 0; q < N; ++q) {
@@ -242,46 +248,51 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
         if (g < cnt) {
           const uint4* src = PB ? reinterpret_cast<const uint4*>(p.inter + (size_t)(st + g) * ID)
                                 : reinterpret_cast<const uint4*>(p.x + (size_t)(S.ent[st + g] >> 3) * HD);
-          src += warp * 64 + 2 * t;
+          src += warp * (8 * NCH) + 2 * t;
 #pragma unroll
-          for (int cc = 0; cc < 8; ++cc) {
-            xr[2 * cc] = PB ? ((p.fl & 8) ? __ldca(src + cc * 8) : __ldcg(src + cc * 8)) : __ldg(src + cc * 8);
-            xr[2 * cc + 1] = PB ? ((p.fl & 8) ? __ldca(src + cc * 8 + 1) : __ldcg(src + cc * 8 + 1)) : __ldg(src + cc * 8 + 1);
+          for (int cc = 0; cc < NCH; ++cc) {
+            xr[2 * cc] = PB ? ((VMS_FL & 8) ? __ldca(src + cc * 8) : __ldcg(src + cc * 8)) : __ldg(src + cc * 8);
+            xr[2 * cc + 1] = PB ? ((VMS_FL & 8) ? __ldca(src + cc * 8 + 1) : __ldcg(src + cc * 8 + 1)) : __ldg(src + cc * 8 + 1);
           }
         } else {
 #pragma unroll
-          for (int cc = 0; cc < 16; ++cc) xr[cc] = make_uint4(0u, 0u, 0u, 0u);
+          for (int cc = 0; cc < 2 * NCH; ++cc) xr[cc] = make_uint4(0u, 0u, 0u, 0u);
         }
       }
-      if ((p.fl & 12) && q + 1 < N) {   // the next unit starts a new job: pull its x / inter fragments into L1 now
+      if ((VMS_FL & 12) && q + 1 < N) {   // the next unit starts a new job: pull its x / inter fragments into L1 now
         const bool PB1 = q + 1 >= nA;
         const int v1 = PB1 ? b0 + (q + 1 - nA) : a0 + q + 1;
         const int j1 = PB1 ? (v1 >> 8) + 4096 : (v1 >> 9);
         if (j1 != curj) {
           const int jj1 = PB1 ? j1 - 4096 : j1;
           bool okp = g < S.jC[jj1];
-          if (PB1) okp = okp && (p.fl & 8) && ld_acq(p.ctr + 8 + jj1) >= RBA;
-          else okp = okp && (p.fl & 4);
+          if (PB1) okp = okp && (VMS_FL & 8) && ld_acq(p.ctr + 8 + jj1) >= RBA;
+          else okp = okp && (VMS_FL & 4);
           if (okp) {
             const unsigned char* row = PB1 ? reinterpret_cast<const unsigned char*>(p.inter + (size_t)(S.jS[jj1] + g) * ID)
                                            : reinterpret_cast<const unsigned char*>(p.x + (size_t)(S.ent[S.jS[jj1] + g] >> 3) * HD);
-            row += warp * 1024 + t * 256;
+            row += warp * (128 * NCH) + t * (32 * NCH);
             asm volatile("prefetch.global.L1 [%0];\n" :: "l"(row));
-            asm volatile("prefetch.global.L1 [%0];\n" :: "l"(row + 128));
+            if (NCH == 8) asm volatile("prefetch.global.L1 [%0];\n" :: "l"(row + 128));
           }
         }
       }
       mbar_wait(&S.full[sl], par);
       if (mk && tid == 0 && q == 0) mrow[2] = gt();
       const unsigned char* slot = ring + sl * UB;
+#if VMS_NW == 16
+      const uint2 sc2 = *reinterpret_cast<const uint2*>(slot + UC + (warp >> 1) * 512 + lane * 16 + (warp & 1) * 8);
+      const uint4 sc = make_uint4(sc2.x, sc2.y, 0u, 0u);
+#else
       const uint4 sc = *reinterpret_cast<const uint4*>(slot + UC + warp * 512 + lane * 16);
+#endif
       float acc[4][4];
 #pragma unroll
       for (int s = 0; s < 4; ++s) { acc[s][0] = 0.f; acc[s][1] = 0.f; acc[s][2] = 0.f; acc[s][3] = 0.f; }
-      if (!(p.fl & 2))
+#if !(VMS_FL & 2)
 #pragma unroll
-      for (int cc = 0; cc < 8; ++cc) {
-        const uint4 w = *reinterpret_cast<const uint4*>(slot + (warp * 8 + cc) * 512 + lane * 16);
+      for (int cc = 0; cc < NCH; ++cc) {
+        const uint4 w = *reinterpret_cast<const uint4*>(slot + (warp * NCH + cc) * 512 + lane * 16);
         const uint32_t sw = cc < 4 ? (cc < 2 ? sc.x : sc.y) : (cc < 6 ? sc.z : sc.w);
         const uint32_t sel = (cc & 1) ? 0x4242u : 0x4040u;
         const uint32_t sg = scd(sw, sel, k16), sg8 = scd(sw, sel + 0x0101u, k16);
@@ -299,6 +310,7 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
           mma(acc[s], bmul(r0, sg), bmul(r1, sg8), bmul(r2, sg), bmul(r3, sg8), bb[2 * s], bb[2 * s + 1]);
         }
       }
+#endif
       float4 o;
       o.x = acc[0][0] + acc[1][0] + acc[2][0] + acc[3][0];
       o.y = acc[0][1] + acc[1][1] + acc[2][1] + acc[3][1];
@@ -400,7 +412,7 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
   const float* ssc = p.ss + (gen & 1) * MAXP;
   for (int it = c; it < p.m * 4; it += G) {
     const int tk = it >> 2, col = (it & 3) * 1024 + (tid & 255) * 4;
-    if (tid >= NT) break;
+    if (tid >= 256) break;
     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
@@ -464,10 +476,10 @@ std::vector<int64_t> attrs();
 '''
 
 
-def build(G, ns=3, arch="sm_90a", name="vms_lab", verbose=False):
+def build(G, ns=3, arch="sm_90a", name="vms_lab", verbose=False, nw=8, fl=0):
     from torch.utils.cpp_extension import load_inline
     gen = f"-gencode=arch=compute_{arch[3:].rstrip('a')}{'a' if arch.endswith('a') else ''},code={arch}"
-    flags = ["-O3", f"-DVMS_G={G}", f"-DVMS_NS={ns}", "-Xptxas=-warn-spills", gen]
+    flags = ["-O3", f"-DVMS_G={G}", f"-DVMS_NS={ns}", f"-DVMS_NW={nw}", f"-DVMS_FL={fl}", "-Xptxas=-warn-spills", gen]
     tag = hashlib.sha1((CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(name=f"{name}_{tag}", cpp_sources=CPP_SRC, cuda_sources=CUDA_SRC, functions=["run", "attrs"],
