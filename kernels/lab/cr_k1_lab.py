@@ -1080,8 +1080,16 @@ def cr_lab(w, dequant=cr_dequant, k_full=None, k1_only=None, k_reset=None, log=p
             P2 = cr_plan_w2(d, P, G, kappa=kappas[0])
             relF, worstF, eF, clF, nanF, BF = cr_check_full(full, d, w, P, P2, dequant)
             okF = relF <= 1.2e-2 and worstF <= 6e-2 and eF[0] == 0 and clF == 0 and not nanF
-            log(f"[cr]   full check: rel {relF:.2e} worst-row {worstF:.2e} err {eF} cnt-clean {clF == 0} nan {nanF} "
-                f"-> {'OK' if okF else 'FAIL'}")
+            relK = float("nan")
+            if k_full is not None:
+                try:
+                    ko = k_full(d)
+                    torch.cuda.synchronize()
+                    relK = float((BF["out"].float() - ko.float()).norm() / ko.float().norm().clamp(min=1e-30))
+                except Exception as ex:  # noqa: BLE001
+                    log(f"[cr]   K2A output for rel failed: {ex!r}")
+            log(f"[cr]   full check: rel {relF:.2e} worst-row {worstF:.2e} rel-vs-K2A {relK:.2e} err {eF} "
+                f"cnt-clean {clF == 0} nan {nanF} -> {'OK' if okF else 'FAIL'}")
             st.err.zero_(); st.cnt.zero_()
             inter = torch.zeros((max(P["R"], 1), 4096), dtype=torch.bfloat16, device=dev)
             arms = {"S": st.fn(P, inter, 1), "R": st.fn(P, inter, 0), "Rk": st.fn(Ps[1], inter, 0)}
