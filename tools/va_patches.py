@@ -451,6 +451,38 @@ def main_riders():
     return 0
 
 
+def main_va2():
+    """--va2 --base=k3_va_3 --n=4 [--lab-only]: k3_va_<n> = <stripped base with VA1 riders> + VA2 (tools/va2_src.py)."""
+    import va2_src
+    _argv, sys.argv = sys.argv, [sys.argv[0]]
+    import gen_k3_m32 as GM
+    sys.argv = _argv
+    _, chk_base, _ = GM.G37.generate()
+    base = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_va_3')}.py"
+    b = base.read_text(encoding="utf-8")
+    bn = b.split(chr(10))[1]
+    GM.check(GM.finish(b, bn, bn.split()[2], chk_base, []) == b, f"{base.name} is not a finish() fixed point")
+    tag = f"k3-va-{N}"
+    nonce = f"# nonce {tag} ({base.stem} + VA2: flat warp-specialized FP8-wgmma verify-full attention, B >= 2; VA2_ENABLE)"
+    t = va2_src.va2_patches(b.replace(bn, nonce))
+    rep = [f"base {base.name} {len(b.encode())} B is a finish() fixed point"]
+    lab_only = "--lab-only" in sys.argv
+    if lab_only:
+        chk0 = GM.check
+        GM.check = lambda ok, msg: chk0(ok or "file >= 1 MB" in msg, msg)
+    s = GM.finish(t, nonce, tag, chk_base, rep)
+    rep.append(f"size: {len(b.encode())} -> {len(s.encode())} B (headroom {1_000_000 - len(s.encode())} B)")
+    for r in rep:
+        print(f"[va_patches] OK  {r}")
+    out, lab = ROOT / f"kernels/muse_decode_layer/k3_va_{N}.py", ROOT / f"kernels/lab/va_k3_va_{N}_ab.py"
+    if not lab_only:
+        out.write_text(s, encoding="utf-8", newline=chr(10))
+    lab.write_text(s, encoding="utf-8", newline=chr(10))
+    print(f"[va_patches] wrote {'' if lab_only else str(out.relative_to(ROOT)) + ' and '}{lab.relative_to(ROOT)} "
+          f"({len(s.encode())} B, sha1 {hashlib.sha1(s.encode()).hexdigest()[:12]})")
+    return 0
+
+
 ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
 N = int(ARGS.get("n", 1))
 OUT = ROOT / f"kernels/muse_decode_layer/k3_va_{N}.py"
@@ -496,4 +528,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main_riders() if "--riders" in sys.argv else main())
+    sys.exit(main_va2() if "--va2" in sys.argv else main_riders() if "--riders" in sys.argv else main())
