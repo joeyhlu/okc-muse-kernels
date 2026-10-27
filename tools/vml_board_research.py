@@ -81,8 +81,9 @@ def _vml_board_prepare(state):
             continue
         ds = [norm(_k2a_self_test_inputs(rep, 900 + 7 * i + rep, dev, "normal" if i % 2 == 0 else "skewed"))
               for i in range(3)]
-        cost = _vml_fit(lambda d: marked(d, 65), ds, G)
-        arms = {"v1": (1, None), "v3": (3, None), "v65": (65, None), "v67": (67, None), "v65f": (65, cost)}
+        cost = _vml_fit(lambda d: marked(d, 193), ds, G)
+        cost65 = _vml_fit(lambda d: marked(d, 65), ds, G)
+        arms = {"v1": (1, None), "v65": (65, None), "v193": (193, None), "v65f": (65, cost65), "v193f": (193, cost)}
         good = {nm: True for nm in arms}
         for bs, seed, dist in _VML_CASES[rep]:
             d = norm(_k2a_self_test_inputs(bs, seed, dev, dist))
@@ -137,7 +138,7 @@ def _vml_board_prepare(state):
             _VML["route"][rep] = arms[best]
         print(f"[vmlb] bs={rep}: " + " ".join(f"{nm} {v:.1f}" for nm, v in med.items())
               + f" us | ok {ok_arms} -> {best if live else 'K2A'}", flush=True)
-        for nm in ("v1", "v65"):
+        for nm in ("v1", "v193f"):
             mv = marked(ds[1], *arms[nm]).double()
             t00 = float(mv[:, 0].min())
             r = lambda col: [(float(x) - t00) / 1e3 for x in mv[:, col]]  # noqa: E731

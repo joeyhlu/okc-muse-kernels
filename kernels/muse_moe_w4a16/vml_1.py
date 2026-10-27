@@ -3526,7 +3526,6 @@ int jE[JMAX], jC[JMAX], jS[JMAX + 1], jrow[JMAX + 1];
 uint32_t cpA[JMAX + 1], cpB[JMAX + 1];
 int bA[GMAX + 1], bB[GMAX + 1];
 int est[E_LOC];
-unsigned long long bperm[JMAX];
 };
 constexpr int SMEM = TAB_OFF + (int)sizeof(Tab);
 
@@ -3751,39 +3750,6 @@ if (lane == 0) { T.cpA[T.nj] = accA; T.cpB[T.nj] = accB; }
 __syncthreads();
 const int G = gridDim.x;
 if (tid <= G) { T.bA[tid] = stage_at(A, T, 0, tid, G, A.magG); T.bB[tid] = stage_at(A, T, 1, tid, G, A.magG); }
-if (A.flags & 32) {   // phase-B stage order by A readiness: estimated finish (cost units) of every A unit
-for (int i = tid; i < T.nj * 32; i += NTH) fin[i] = 0;
-__syncthreads();
-if (tid < G) {
-const int g0 = T.bA[tid], g1 = T.bA[tid + 1], sp = split_point(A, 0, g0, g1);
-uint32_t pos = 0;
-for (int gs = sp, ge = g1;;) {
-if (gs >= ge) {
-if (ge == g1 && sp > g0) { gs = g0; ge = sp; } else break;
-}
-const int u = gs >> 4, s0 = gs & 15, s1 = min(16, s0 + (ge - gs));
-pos += (uint32_t)(s1 - s0) * A.cost[((T.jC[u >> 5] + 7) >> 3) - 1];
-atomicMax(fin + u, pos);
-gs += s1 - s0;
-}
-}
-__syncthreads();
-if (tid < T.nj) {
-uint32_t r[16];
-int ord[16];
-#pragma unroll
-for (int k = 0; k < 16; ++k) { r[k] = max(fin[tid * 32 + 2 * k], fin[tid * 32 + 2 * k + 1]); ord[k] = k; }
-for (int a = 1; a < 16; ++a) {
-const int o = ord[a];
-int b = a - 1;
-while (b >= 0 && r[ord[b]] > r[o]) { ord[b + 1] = ord[b]; --b; }
-ord[b + 1] = o;
-}
-unsigned long long pk = 0;
-for (int k = 0; k < 16; ++k) pk |= (unsigned long long)ord[k] << (4 * k);
-T.bperm[tid] = pk;
-}
-}
 __syncthreads();
 }
 
@@ -3901,7 +3867,7 @@ for (int i = 0; i < g1 - g0; ++i, ++it) {
 const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
 const int u = gs >> 4;
 const int j = pb ? (u >> 4) : (u >> 5), ub = pb ? (u & 15) : (u & 31);
-const int s = (pb && (A.flags & 32)) ? (int)((T.bperm[j] >> (4 * (gs & 15))) & 15) : (gs & 15);
+const int s = gs & 15;
 const int e = T.jE[j];
 const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW
 : A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;
@@ -3924,7 +3890,7 @@ for (int i = 0; i < g1 - g0; ++i, ++it) {
 const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
 const int u = gs >> 4;
 const int j = pb ? (u >> 4) : (u >> 5);
-const int s = (pb && (A.flags & 32)) ? (int)((T.bperm[j] >> (4 * (gs & 15))) & 15) : (gs & 15);
+const int s = gs & 15;
 const int npad = (T.jC[j] + 7) & ~7;
 if (!pb && i < nf) continue;
 if (!pb) {
@@ -3997,6 +3963,55 @@ prevx = -1;
 prevx = xs;
 ++it;
 }
+__device__ __forceinline__ void mma16816(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+: "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+: "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+// small jobs (nt <= 2): mma.sync m16n8k16 per warp (its 16-row tile), B by ldmatrix.x4 from the shared x slot, 2 chains
+template <int N>
+__device__ __forceinline__ void stage_m(const Args& A, uint8_t* smem, uint32_t bars, int& it, float (&d2)[2][N / 2], int q,
+int wp, int lane) {
+const int ws = it % NS, xs = it % NX;
+mbar_wait(bars + 8 * ws, (it / NS) & 1, A.err);
+const uint8_t* st = smem + ws * US + (q >> 1) * SW;
+const int tile = (q & 1) * 4 + wp;
+const uint4* cp = reinterpret_cast<const uint4*>(st + tile * 2048) + lane;
+const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + 16384 + tile * 256) + lane;
+uint4 c[4];
+#pragma unroll
+for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
+const uint32_t sw0 = sp[0], sw1 = sp[32];
+__syncwarp();
+if (lane == 0) mbar_arrive(bars + 8 * (NS + ws));
+mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
+__syncwarp();
+const uint32_t xb = sa(smem + NS * US + xs * XS) + (uint32_t)(((lane >> 3) * 8 + (lane & 7)) * 16);
+#pragma unroll
+for (int i = 0; i < 4; ++i) {
+const uint32_t sw2 = (i < 2) ? sw0 : sw1, par = i & 1;
+const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
+const uint32_t S8 = __byte_perm(sw2, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+#pragma unroll
+for (int hf = 0; hf < 2; ++hf) {
+uint32_t hh[8];
+dec_half(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, Sg, S8, hh);
+#pragma unroll
+for (int nt = 0; nt < N / 8; ++nt) {
+uint32_t b0, b1, b2, b3;
+ldsm4(xb + (uint32_t)(((nt * 4 + i) * 8 + 4 * hf) * 128), b0, b1, b2, b3);
+mma16816(&d2[0][4 * nt], hh[0], hh[4], hh[1], hh[5], b0, b1);
+mma16816(&d2[1][4 * nt], hh[2], hh[6], hh[3], hh[7], b2, b3);
+}
+}
+}
+__syncwarp();
+if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + xs));
+++it;
+}
 template <bool PB, int N>
 __device__ __forceinline__ void epilogue(const Args& A, const Tab& T, int j, int ub, int q, int wp, int lane, const float* d) {
 const int g = lane >> 2, t = lane & 3, wt = (wp << 5) | lane;
@@ -4040,6 +4055,17 @@ template <bool PB, int N>
 __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32_t bars, int& it, int u, int s0, int s1,
 int q, int wp, int lane) {
 float d[N / 2];
+bool sync_path = false;
+if constexpr (N <= 16) sync_path = (A.flags & 128) != 0;
+if (sync_path) {
+float d2[2][N / 2];
+#pragma unroll
+for (int k = 0; k < N / 2; ++k) { d2[0][k] = 0.f; d2[1][k] = 0.f; }
+#pragma unroll 1
+for (int s = s0; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
+#pragma unroll
+for (int k = 0; k < N / 2; ++k) d[k] = d2[0][k] + d2[1][k];
+} else {
 uint32_t hb[2][8];
 int prevx = -1;
 stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true);
@@ -4047,6 +4073,7 @@ stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true);
 for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false);
 wg_wait<0>();
 if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
+}
 constexpr int UBL = PB ? 4 : 5;
 const int j = u >> UBL, ub = u & ((1 << UBL) - 1);
 if (!(s0 == 0 && s1 == 16)) {
@@ -4054,26 +4081,9 @@ const int wt = (wp << 5) | lane;
 const int slot = cta_of(T, PB, u << 4, gridDim.x);
 float* fb = A.fix + ((size_t)((PB * SLOTS + slot) * 4 + q)) * FIXW + wt * 4;
 int* fc = A.cnt + (PB * SLOTS + slot) * 4 + q;
-const bool dm = (A.flags & 16) && (PB || (A.flags & 1));
-if (dm && (PB ? s0 == 0 : s1 == 16)) {
-if (wt == 0) wait_flag(fc, 16 - (s1 - s0), A.err);
-bar_sync(1 + q, 128);
-fence_acq_rel();
-#pragma unroll
-for (int nt = 0; nt < N / 8; ++nt) {
-const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
-*reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
-d[4 * nt] += v.x; d[4 * nt + 1] += v.y; d[4 * nt + 2] += v.z; d[4 * nt + 3] += v.w;
-}
-if (wt == 0) *fc = 0;
-} else {
 #pragma unroll
 for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);
 bar_sync(1 + q, 128);
-if (dm) {
-if (wt == 0) red_release_add(fc, s1 - s0);
-return;
-}
 if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);
 bar_sync(1 + q, 128);
 if (!T.wlast[q]) return;
@@ -4085,7 +4095,6 @@ const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
 d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
 }
 if (wt == 0) *fc = 0;
-}
 }
 epilogue<PB, N>(A, T, j, ub, q, wp, lane, d);
 }
@@ -4115,90 +4124,6 @@ gs += s1 - s0;
 }
 }
 
-template <bool FUSED>
-__device__ __forceinline__ void fin_token(const Args& A, int t) {
-
-__shared__ int s_r[8];
-__shared__ float s_w[8];
-__shared__ float s_ss[8][8];
-__shared__ float s_fr[8];
-const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-if (tid < 8) { s_r[tid] = A.rmap[t * 8 + tid]; s_w[tid] = __ldg(A.wts + t * 8 + tid); }
-if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
-float ss[8];
-#pragma unroll
-for (int k = 0; k < 8; ++k) {
-ss[k] = 0.f;
-const int r = s_r[k];
-if (r >= 0) {
-#pragma unroll
-for (int m = 0; m < 4; ++m) {
-const int col = 1024 * m + 4 * tid;
-const float4 v = __ldcg(reinterpret_cast<const float4*>(A.y + (size_t)r * KDIM + col));
-const float4 w = __ldg(reinterpret_cast<const float4*>(A.nw + col));
-float f;
-f = bf16r(v.x) * w.x; ss[k] += f * f; f = bf16r(v.y) * w.y; ss[k] += f * f;
-f = bf16r(v.z) * w.z; ss[k] += f * f; f = bf16r(v.w) * w.w; ss[k] += f * f;
-}
-}
-#pragma unroll
-for (int o = 16; o > 0; o >>= 1) ss[k] += __shfl_xor_sync(0xffffffffu, ss[k], o);
-}
-if (lane == 0) {
-#pragma unroll
-for (int k = 0; k < 8; ++k) s_ss[warp][k] = ss[k];
-}
-if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
-if (tid < 8) {
-float s = 0.f;
-for (int w = 0; w < 8; ++w) s += s_ss[w][tid];
-s_fr[tid] = (s_r[tid] >= 0) ? rsqrtf(s * (1.f / 4096.f) + 1e-8f) * s_w[tid] : 0.f;
-}
-if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
-#pragma unroll
-for (int m = 0; m < 4; ++m) {
-const int col = 1024 * m + 4 * tid;
-const float4 w = __ldg(reinterpret_cast<const float4*>(A.nw + col));
-float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-#pragma unroll
-for (int k = 0; k < 8; ++k) {
-const int r = s_r[k];
-if (r >= 0) {
-const float4 v = __ldcg(reinterpret_cast<const float4*>(A.y + (size_t)r * KDIM + col));
-const float fr = s_fr[k];
-a0 += bf16r(v.x) * w.x * fr; a1 += bf16r(v.y) * w.y * fr;
-a2 += bf16r(v.z) * w.z * fr; a3 += bf16r(v.w) * w.w * fr;
-}
-}
-__nv_bfloat162 o0 = __floats2bfloat162_rn(a0, a1), o1 = __floats2bfloat162_rn(a2, a3);
-uint2 o;
-o.x = *reinterpret_cast<uint32_t*>(&o0); o.y = *reinterpret_cast<uint32_t*>(&o1);
-*reinterpret_cast<uint2*>(A.out + (size_t)t * KDIM + col) = o;
-}
-}
-__device__ __forceinline__ void reset_counters(const Args& A, int tid, int nth) {
-for (int i = tid; i < JMAX; i += nth) A.xready[i] = 0;
-for (int i = tid; i < JMAX * 16; i += nth) A.doneA[i] = 0;
-for (int i = tid; i < 2 * SLOTS * 4; i += nth) A.cnt[i] = 0;
-}
-__device__ __forceinline__ void grid_sync(const Args& A, int tid) {
-bar_sync(5, 32 * NCW);
-if (tid == 0) {
-fence_acq_rel();
-const int gen = ld_acquire(A.gbar + 1);
-if (atom_acqrel_add(A.gbar, 1) == (int)gridDim.x - 1) {
-A.gbar[0] = 0;
-red_release_add(A.gbar + 1, 1);
-} else {
-const long long t0 = clock64();
-while (ld_acquire(A.gbar + 1) == gen) {
-__nanosleep(64);
-if (clock64() - t0 > WAIT_BUDGET) { atomicExch(A.err, 3); break; }
-}
-}
-}
-bar_sync(5, 32 * NCW);
-}
 __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
 extern __shared__ __align__(1024) uint8_t smem[];
 Tab& T = *reinterpret_cast<Tab*>(smem + TAB_OFF);
@@ -4242,17 +4167,92 @@ phase<false>(A, T, smem, bars, it, q, wp, lane);
 if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * 32 + 6] = gtime();
 phase<true>(A, T, smem, bars, it, q, wp, lane);
 if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 1 + q] = gtime();
-if (A.flags & 8) {
-grid_sync(A, tid);
-if (blockIdx.x == 0) reset_counters(A, tid, 32 * NCW);
-if (warp < 8)
-for (int t = blockIdx.x; t < A.M; t += gridDim.x) fin_token<true>(A, t);
-}
 }
 
+// finalize (post-expert norm of every local route's y row, routing weight, sum in slot order = K2A K3 numerics; resets the
+// counters for the next call). VG-F's structure (glue builder, tools/vg_patches.py): the token's local slots compacted
+// first, then the y loads of up to 4 routes in flight at once; PDL launch, the wait after the norm-weight loads.
 __global__ void __launch_bounds__(256) vm_fin(const Args A) {
-if (blockIdx.x == 0) reset_counters(A, threadIdx.x, 256);
-fin_token<false>(A, blockIdx.x);
+__shared__ int s_r[8], s_r8[8];
+__shared__ float s_w[8], s_w8[8];
+__shared__ int s_n;
+__shared__ float s_ss[2][8][4];
+const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+float4 w4[4];
+#pragma unroll
+for (int m = 0; m < 4; ++m) w4[m] = __ldg(reinterpret_cast<const float4*>(A.nw + 1024 * m + 4 * tid));
+asm volatile("griddepcontrol.wait;\n" ::: "memory");
+if (t == 0) {
+for (int i = tid; i < JMAX; i += 256) A.xready[i] = 0;
+for (int i = tid; i < JMAX * 16; i += 256) A.doneA[i] = 0;
+for (int i = tid; i < 2 * SLOTS * 4; i += 256) A.cnt[i] = 0;
+}
+if (tid < 8) { s_r8[tid] = __ldcg(A.rmap + t * 8 + tid); s_w8[tid] = __ldg(A.wts + t * 8 + tid); }
+__syncthreads();
+if (tid == 0) {
+int n = 0;
+#pragma unroll
+for (int k = 0; k < 8; ++k) {
+const int r = s_r8[k];
+if (r >= 0) { s_r[n] = r; s_w[n] = s_w8[k]; ++n; }
+}
+s_n = n;
+}
+__syncthreads();
+const int nloc = s_n;
+const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+float a[4][4];
+#pragma unroll
+for (int m = 0; m < 4; ++m) { a[m][0] = 0.f; a[m][1] = 0.f; a[m][2] = 0.f; a[m][3] = 0.f; }
+int par = 0;
+for (int c0 = 0; c0 < nloc; c0 += 4, par ^= 1) {
+float4 v[4][4];
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) {
+const int r = (c0 + jj < nloc) ? s_r[c0 + jj] : -1;
+#pragma unroll
+for (int m = 0; m < 4; ++m)
+v[jj][m] = (r >= 0) ? __ldcg(reinterpret_cast<const float4*>(A.y + (size_t)r * KDIM + 1024 * m + 4 * tid)) : z4;
+}
+float ss[4];
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) {
+ss[jj] = 0.f;
+#pragma unroll
+for (int m = 0; m < 4; ++m) {
+float f;
+f = bf16r(v[jj][m].x) * w4[m].x; ss[jj] += f * f; f = bf16r(v[jj][m].y) * w4[m].y; ss[jj] += f * f;
+f = bf16r(v[jj][m].z) * w4[m].z; ss[jj] += f * f; f = bf16r(v[jj][m].w) * w4[m].w; ss[jj] += f * f;
+}
+#pragma unroll
+for (int o = 16; o > 0; o >>= 1) ss[jj] += __shfl_xor_sync(0xffffffffu, ss[jj], o);
+}
+if (lane == 0) {
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) s_ss[par][warp][jj] = ss[jj];
+}
+__syncthreads();
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) {
+if (c0 + jj < nloc) {
+float sm = 0.f;
+for (int w = 0; w < 8; ++w) sm += s_ss[par][w][jj];
+const float fr = rsqrtf(sm * (1.f / 4096.f) + 1e-8f) * s_w[c0 + jj];
+#pragma unroll
+for (int m = 0; m < 4; ++m) {
+a[m][0] += bf16r(v[jj][m].x) * w4[m].x * fr; a[m][1] += bf16r(v[jj][m].y) * w4[m].y * fr;
+a[m][2] += bf16r(v[jj][m].z) * w4[m].z * fr; a[m][3] += bf16r(v[jj][m].w) * w4[m].w * fr;
+}
+}
+}
+}
+#pragma unroll
+for (int m = 0; m < 4; ++m) {
+__nv_bfloat162 o0 = __floats2bfloat162_rn(a[m][0], a[m][1]), o1 = __floats2bfloat162_rn(a[m][2], a[m][3]);
+uint2 o;
+o.x = *reinterpret_cast<uint32_t*>(&o0); o.y = *reinterpret_cast<uint32_t*>(&o1);
+*reinterpret_cast<uint2*>(A.out + (size_t)t * KDIM + 1024 * m + 4 * tid) = o;
+}
 }
 }
 
@@ -4276,9 +4276,14 @@ cudaFuncSetAttribute(vm::vm_main, cudaFuncAttributeMaxDynamicSharedMemorySize, v
 vm::vm_main<<<(int)G, vm::NTH, vm::SMEM, stream>>>(a);
 C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-if ((mask & 2) && !(V[5] & 8)) {
-vm::vm_fin<<<(int)M, 256, 0, stream>>>(a);
-C10_CUDA_KERNEL_LAUNCH_CHECK();
+if ((mask & 2) && M > 0) {
+cudaLaunchConfig_t cfg = {};
+cfg.gridDim = dim3((unsigned)M); cfg.blockDim = dim3(256); cfg.dynamicSmemBytes = 0; cfg.stream = stream;
+cudaLaunchAttribute at[1];
+at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+at[0].val.programmaticStreamSerializationAllowed = 1;
+cfg.attrs = at; cfg.numAttrs = 1;
+C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vm::vm_fin, a));
 }
 }
 """
@@ -4313,7 +4318,7 @@ def _vml_alloc(dev, G):
             "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _vml_mag(G)}
 
 
-_vml_FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, bit 3: in-launch finalize (grid barrier), bit 4: designated finishers (needs bit 0 in phase A), bit 5: phase-B stages in A-readiness order, bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers
+_vml_FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments
 
 
 def _vml_call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
