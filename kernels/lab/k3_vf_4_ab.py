@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-vf-4 (k3_vsl_4 + VF front riders: lean T <= 8 FP32 router beside the GD pooler, prt tail one L2 trip, FFN boundary on SBB; on: t1,ppdl,galt; self-tested with fallback)
+# nonce k3-vf-4 (k3_vg_3 + VF front riders: lean T <= 8 FP32 router beside the GD pooler, prt tail one L2 trip, FFN boundary on SBB; on: t1,ppdl; self-tested with fallback)
 
 from typing import TypedDict
 
@@ -3702,6 +3702,9 @@ def _v9_bnd(which, stream, branch, router_dtype, state, tokens):
         r = _vf_sbb2(stream, branch, tokens)
         if r is not None:
             return r
+    vgr = _vg_bnd(which, stream, branch, router_dtype, state, tokens)
+    if vgr is not None:
+        return vgr
     if which == "attn" and SBB1_ROUTE.get(_k2a_bucket_of(tokens)):
         sbr = _sbb1(stream, branch, router_dtype, state, tokens)
         if sbr is not None:
@@ -8396,9 +8399,14 @@ def _vml_build_job():
 def _vml_route(st, data):
     x = data["hidden_states"].contiguous()
     rep = _k2a_bucket_of(x.shape[0])
-    return _vml_call(_VML["mod"], st, _VML["sc"], x, data["topk_ids"].to(torch.int32).contiguous(),
-                     data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]),
-                     flags=VML_FLAGS.get(rep), cost=VML_COST.get(rep))
+    ids = data["topk_ids"].to(torch.int32).contiguous()
+    wts = data["topk_weights"].to(torch.float32).contiguous()
+    fl, co, ls = VML_FLAGS.get(rep), VML_COST.get(rep), int(data["config"]["local_start"])
+    if _vgf_on() and not ((_vml_FLAGS_DEFAULT if fl is None else fl) & 8):
+        out = torch.empty((x.shape[0], _vml_KDIM), dtype=torch.bfloat16, device=x.device)
+        _vml_call(_VML["mod"], st, _VML["sc"], x, ids, wts, ls, mask=1, out=out, flags=fl, cost=co)
+        return _vml_fin(st, _VML["sc"], ids, wts, out, x.shape[0])
+    return _vml_call(_VML["mod"], st, _VML["sc"], x, ids, wts, ls, flags=fl, cost=co)
 
 
 def _vml_prepare(st, w, dev):
@@ -9703,6 +9711,8 @@ def _pt1_start():
         jobs.append(("su1", _su1_build))
     if SBB1_ENABLE:
         jobs.append(("sbb1", _sbb1_build))
+    if VG_ENABLE and (VGF_ENABLE or any(r[0] == "vgb" for r in list(VG_BND_ROUTE.values()) + [x for v in VG_BND_CAND.values() for x in v])):
+        jobs.append(("vg", _vg_build))
     if GD_BUILD:
         jobs.append(("gd", _gd_build))
     if VML_ENABLE:
@@ -9788,6 +9798,7 @@ def prepare(weights):
     _dg1_prepare(state, t0)
     _sbb1_prepare(state, t0)
     _vf_prepare(state, t0)
+    _vg_prepare(state, t0)
     _su1_prepare(state, t0)
     _gd_prepare(state, t0)
     _p206_prepare(state, t0)
@@ -14600,7 +14611,7 @@ def _r1_attention(qkv, data, state):
 G2_ENABLE = True
 
 
-G2_PRT = False
+G2_PRT = True
 
 
 G2_PRT_PDL = True
@@ -15031,6 +15042,8 @@ def _g2_prt_run(g2, P, ffn_input, router_input, state, data, pdl):
 def _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail):
     g2 = state.get("g2")
     if not (G2_ENABLE and G2_PRT and g2 is not None and g2.get("prt")) or tokens != 1:
+        return None
+    if _vf_t1_live(state):
         return None
     if mode != "f32" or tail != "sep" or router_input is None or state.get("v8") is None:
         return None
@@ -19159,7 +19172,7 @@ SBB1_DECL = 'void sbb1_run(torch::Tensor branch, torch::Tensor stream, torch::Te
 VF_ROUTER = {1: 'lean', 8: 'r32'}
 VF_PRT = False
 VF_SBB2 = {1: False, 8: False, 16: False}
-VF_GD_ON = {("qkv", 16): False, ("qkv", 32): False}
+VF_T1 = True
 VF_SELF_TEST_SEEDS = (731, 732, 733)
 _VF = {"r8": False, "prt": False, "st2": None, "seen": set()}
 
@@ -19177,6 +19190,17 @@ def _vf_sbb2(stream, branch, tokens):
         _VF["seen"].add(("sbb2", tokens))
         print(f"[vf] first call sbb2 T={tokens}", flush=True)
     return out, ns, None
+
+
+def _vf_t1_live(state):
+    if not VF_T1:
+        return False
+    ok = (VF_ROUTER.get(1) == "lean" and _VF["r8"] and _SBB1["mod"] is not None and state.get("v8") is not None
+          and _gd_live(state, "pooler", 1) is not None)
+    if not ok and "t1off" not in _VF["seen"]:
+        _VF["seen"].add("t1off")
+        print("[vf] FALLBACK t1: lean router / GD pooler T=1 not live -> G2 prt at T = 1", flush=True)
+    return ok
 
 
 def _vf_test_r8(state, mod):
@@ -19371,6 +19395,327 @@ def _sbb1_prepare(state, t0):
 
 
 
+VG_CU = ''
+VG_HOST = ''
+VG_DECL = ''
+VGF_CU = r'''
+#include <cuda_bf16.h>
+#include <stdint.h>
+#define VF_KDIM 4096
+__device__ __forceinline__ float vf_bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__global__ void __launch_bounds__(256) vgf_kernel(const float* __restrict__ y, const int* __restrict__ rmap,
+    const float* __restrict__ wts, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out, int* xready, int* doneA,
+    int* cnt, int n_xready, int n_doneA, int n_cnt) {
+  __shared__ int s_r[8], s_r8[8];
+  __shared__ float s_w[8], s_w8[8];
+  __shared__ int s_n;
+  __shared__ float s_ss[2][8][4];
+  const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  float4 w4[4];
+#pragma unroll
+  for (int m = 0; m < 4; ++m) w4[m] = __ldg(reinterpret_cast<const float4*>(nw + 1024 * m + 4 * tid));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  if (t == 0) {
+    for (int i = tid; i < n_xready; i += 256) xready[i] = 0;
+    for (int i = tid; i < n_doneA; i += 256) doneA[i] = 0;
+    for (int i = tid; i < n_cnt; i += 256) cnt[i] = 0;
+  }
+  if (tid < 8) {   // the slot loads in parallel (one L2 round trip), then thread 0 compacts the local slots in order
+    s_r8[tid] = __ldcg(rmap + t * 8 + tid);
+    s_w8[tid] = __ldg(wts + t * 8 + tid);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int n = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const int r = s_r8[k];
+      if (r >= 0) { s_r[n] = r; s_w[n] = s_w8[k]; ++n; }
+    }
+    s_n = n;
+  }
+  __syncthreads();
+  const int nloc = s_n;
+  const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+  float a[4][4];
+#pragma unroll
+  for (int m = 0; m < 4; ++m) { a[m][0] = 0.f; a[m][1] = 0.f; a[m][2] = 0.f; a[m][3] = 0.f; }
+  int par = 0;
+  for (int c0 = 0; c0 < nloc; c0 += 4, par ^= 1) {
+    float4 v[4][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int r = (c0 + j < nloc) ? s_r[c0 + j] : -1;
+#pragma unroll
+      for (int m = 0; m < 4; ++m)
+        v[j][m] = (r >= 0) ? __ldcg(reinterpret_cast<const float4*>(y + (size_t)r * VF_KDIM + 1024 * m + 4 * tid)) : z4;
+    }
+    float ss[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      ss[j] = 0.f;
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        float f;
+        f = vf_bf16r(v[j][m].x) * w4[m].x; ss[j] += f * f; f = vf_bf16r(v[j][m].y) * w4[m].y; ss[j] += f * f;
+        f = vf_bf16r(v[j][m].z) * w4[m].z; ss[j] += f * f; f = vf_bf16r(v[j][m].w) * w4[m].w; ss[j] += f * f;
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) ss[j] += __shfl_xor_sync(0xffffffffu, ss[j], o);
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) s_ss[par][warp][j] = ss[j];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (c0 + j < nloc) {
+        float s = 0.f;
+        for (int q = 0; q < 8; ++q) s += s_ss[par][q][j];
+        const float fr = rsqrtf(s * (1.f / 4096.f) + 1e-8f) * s_w[c0 + j];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          a[m][0] += vf_bf16r(v[j][m].x) * w4[m].x * fr; a[m][1] += vf_bf16r(v[j][m].y) * w4[m].y * fr;
+          a[m][2] += vf_bf16r(v[j][m].z) * w4[m].z * fr; a[m][3] += vf_bf16r(v[j][m].w) * w4[m].w * fr;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    __nv_bfloat162 o0 = __floats2bfloat162_rn(a[m][0], a[m][1]), o1 = __floats2bfloat162_rn(a[m][2], a[m][3]);
+    uint2 o;
+    o.x = *reinterpret_cast<uint32_t*>(&o0); o.y = *reinterpret_cast<uint32_t*>(&o1);
+    *reinterpret_cast<uint2*>(out + (size_t)t * VF_KDIM + 1024 * m + 4 * tid) = o;
+  }
+}
+'''
+VGF_HOST = r'''
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+void vgf_run(torch::Tensor y, torch::Tensor rmap, torch::Tensor wts, torch::Tensor nw, torch::Tensor out, torch::Tensor xready,
+             torch::Tensor doneA, torch::Tensor cnt, int64_t M, int64_t pdl) {
+  TORCH_CHECK(y.scalar_type() == at::kFloat && rmap.scalar_type() == at::kInt && wts.scalar_type() == at::kFloat
+              && nw.scalar_type() == at::kFloat && out.scalar_type() == at::kBFloat16 && nw.numel() == VF_KDIM
+              && out.size(1) == VF_KDIM && out.is_contiguous() && wts.is_contiguous() && rmap.numel() >= 8 * M
+              && out.size(0) >= M, "vgf: tensors");
+  if (M == 0) return;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)M); cfg.blockDim = dim3(256); cfg.dynamicSmemBytes = 0;
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  at[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vgf_kernel, (const float*)y.data_ptr(), (const int*)rmap.data_ptr(),
+      (const float*)wts.data_ptr(), (const float*)nw.data_ptr(), (__nv_bfloat16*)out.data_ptr(), (int*)xready.data_ptr(),
+      (int*)doneA.data_ptr(), (int*)cnt.data_ptr(), (int)xready.numel(), (int)doneA.numel(), (int)cnt.numel()));
+}
+'''
+VGF_DECL = 'void vgf_run(torch::Tensor y, torch::Tensor rmap, torch::Tensor wts, torch::Tensor nw, torch::Tensor out, torch::Tensor xready, torch::Tensor doneA, torch::Tensor cnt, int64_t M, int64_t pdl);'
+
+VG_ENABLE = True
+VG_BND_ROUTE = {}
+VG_BND_CAND = {}
+VG_PREPARE_BY_S = 255.0
+VGF_ENABLE = True
+VGF_PDL = True
+_VG = {"mod": None, "w": {}, "ok": set(), "build_s": 0.0, "vgf_ok": False}
+
+
+def _vgf_on():
+    return VGF_ENABLE and _VG["vgf_ok"] and _VG["mod"] is not None
+
+
+def _vml_fin(st, sc, ids, wts, out, m):
+    _VG["mod"].vgf_run(sc["y"], sc["rmap"], wts, st["nw"], out, sc["xready"], sc["doneA"], sc["cnt"], m, 1 if VGF_PDL else 0)
+    return out
+
+
+def _vgf_fc(rep):
+    return globals().get("VML_FLAGS", {}).get(rep), globals().get("VML_COST", {}).get(rep)
+
+
+def _vgf_prepare(state):
+    _VG["vgf_ok"] = False
+    if not VGF_ENABLE:
+        return
+    k33 = state.get("k2a33")
+    if k33 is None or _VML.get("sc") is None or _VML.get("mod") is None or not any(_VML["ok"].values()):
+        print("[vg] VG-F: VML1 not live -> vm_fin stays", flush=True)
+        return
+    try:
+        _vg_build()
+        st, sc = k33["st"], _VML["sc"]
+        dev = st["nw"].device
+        good, n = True, 0
+        for bs, seed, dist in ((100, 41, "normal"), (128, 42, "skewed"), (160, 43, "skewed"), (200, 44, "skewed"),
+                               (256, 45, "normal"), (320, 47, "normal")):
+            if not _VML["ok"].get(_k2a_bucket_of(bs)):
+                continue
+            d = _k2a_self_test_inputs(bs, seed, dev, dist)
+            x = d["hidden_states"].contiguous()
+            ids = d["topk_ids"].to(torch.int32).contiguous()
+            wts = d["topk_weights"].to(torch.float32).contiguous()
+            fl, co = _vgf_fc(_k2a_bucket_of(bs))
+            if (_vml_FLAGS_DEFAULT if fl is None else fl) & 8:
+                continue
+            prev = None
+            for call in range(3):
+                sc["err"].zero_()
+                out = torch.full((bs, _vml_KDIM), 3.0, dtype=torch.bfloat16, device=dev)
+                ref = torch.full((bs, _vml_KDIM), -3.0, dtype=torch.bfloat16, device=dev)
+                _vml_call(_VML["mod"], st, sc, x, ids, wts, 0, mask=1, out=out, flags=fl, cost=co)
+                _vml_fin(st, sc, ids, wts, out, bs)
+                torch.cuda.synchronize()
+                clean = int(sc["xready"].abs().sum()) + int(sc["doneA"].abs().sum()) + int(sc["cnt"].abs().sum())
+                _vml_call(_VML["mod"], st, sc, x, ids, wts, 0, mask=2, out=ref, flags=fl, cost=co)
+                torch.cuda.synchronize()
+                eq = bool(torch.equal(out, ref))
+                ok = eq and not int(sc["err"][0]) and clean == 0 and bool(torch.isfinite(out.float()).all())
+                rep_eq = "-" if prev is None else str(bool(torch.equal(prev, ref)))
+                prev = ref
+                good &= ok
+                n += 1
+                if not ok or call in (0, 2):
+                    print(f"[vg] VG-F self-test bs={bs} {dist} call {call}: bitwise vs vm_fin {eq} err {int(sc['err'][0])} "
+                          f"counters {clean} (vm_main reproducible across calls: {rep_eq}) -> {'ok' if ok else 'FAIL'}",
+                          flush=True)
+        _VG["vgf_ok"] = bool(good and n)
+    except Exception as ex:
+        _VG["vgf_ok"] = False
+        print(f"[vg] VG-F self-test raised {ex!r} -> vm_fin stays", flush=True)
+    try:
+        _k2a33_reset(state["k2a33"]["st"])
+    except Exception:
+        pass
+    print(f"[vg] VG-F (VML1 finalize) {'LIVE' if _VG['vgf_ok'] else 'FALLBACK to vm_fin'}", flush=True)
+
+
+def _vg_build():
+    _pt1_wait("vg")
+    if _VG["mod"] is not None:
+        return _VG["mod"]
+    from torch.utils.cpp_extension import load_inline
+    t1 = time.time()
+    _VG["mod"] = load_inline("vg_k3", cpp_sources=VG_DECL + chr(10) + VGF_DECL, cuda_sources=VG_CU + VG_HOST + VGF_CU + VGF_HOST,
+                             functions=(["vgb_run"] if VG_DECL else []) + ["vgf_run"],
+                             extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
+    _VG["build_s"] = time.time() - t1
+    print(f"[vg] VG-B / VG-F compiled in {_VG['build_s']:.1f}s", flush=True)
+    return _VG["mod"]
+
+
+def _vg_key(route):
+    return tuple(_vg_key(x) if isinstance(x, (list, tuple)) else x for x in route)
+
+
+def _vg_run(which, route, stream, branch):
+    pw, qw, al, bt, isc, pe, qe = _VG["w"][which]
+    T = branch.shape[0]
+    if route[0] == "vgb":
+        out = torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=branch.device)
+        ns = torch.empty((T, HIDDEN), dtype=torch.float32, device=branch.device)
+        if not _VG["mod"].vgb_run(branch.contiguous(), stream.contiguous(), out, ns, pw, qw, al, bt, pe, qe, int(route[1])):
+            raise RuntimeError(f"vgb geometry {int(route[1]):#x} not built")
+        return out, ns, None
+    if route[0] == "fnr":
+        lc = tuple(route[2]) if route[2] is not None else None
+        o = _V9_FNR(branch.contiguous(), stream.contiguous(), pe, qe, post_norm_is_input_scale=isc,
+                    post_weight=pw if pw.numel() else None, pre_weight=qw if qw.numel() else None, alpha=al, beta=bt,
+                    want_router=False, launch_config=lc, cluster_size=int(route[1]))
+        return o[0], o[1], None
+    raise ValueError(f"vg route {route!r}")
+
+
+def _vg_bnd(which, stream, branch, router_dtype, state, tokens):
+    if not VG_ENABLE or router_dtype is not None or not VG_BND_ROUTE:
+        return None
+    rep = _k2a_bucket_of(tokens)
+    route = VG_BND_ROUTE.get((which, rep))
+    if route is None or (which, rep, _vg_key(route)) not in _VG["ok"]:
+        return None
+    if branch.dtype != torch.bfloat16 or stream.dtype != torch.float32:
+        return None
+    return _vg_run(which, route, stream, branch)
+
+
+def _vg_prepare(state, t0):
+    _VG["ok"] = set()
+    if not VG_ENABLE:
+        return
+    if time.time() - t0 <= VG_PREPARE_BY_S:
+        _vgf_prepare(state)
+    else:
+        print(f"[vg] VG-F SKIPPED (prepare already at {time.time() - t0:.0f}s): vm_fin stays", flush=True)
+    routes = {}
+    for k, r in list(VG_BND_ROUTE.items()) + [(k, r) for k, rs in VG_BND_CAND.items() for r in rs]:
+        lst = routes.setdefault(k, [])
+        if _vg_key(r) not in [_vg_key(x) for x in lst]:
+            lst.append(r)
+    if not routes:
+        return
+    if time.time() - t0 > VG_PREPARE_BY_S:
+        print(f"[vg] SKIPPED (prepare already at {time.time() - t0:.0f}s): base boundaries stay", flush=True)
+        return
+    t1 = time.time()
+    try:
+        if any(r[0] == "vgb" for rs in routes.values() for r in rs):
+            _vg_build()
+        for which in ("attn", "ffn"):
+            op = state["attn_boundary" if which == "attn" else "ffn_boundary"]
+            op._ensure_cached_weights(torch.bfloat16)
+            dev = state["router"].device
+            e = torch.empty(0, device=dev, dtype=torch.bfloat16)
+            pw = op._cc_post_weight.to(torch.bfloat16).contiguous() if op._post_norm.has_weight else e
+            qw = op._cc_pre_weight.to(torch.bfloat16).contiguous() if op._pre_norm.has_weight else e
+            if not op._use_residual_gate or op._cc_alpha.numel() != HIDDEN:
+                raise RuntimeError(f"{which}: no channel-wise residual gate")
+            isc = bool(op._post_norm_is_input_scale)
+            if pw.numel() and not isc:
+                raise RuntimeError(f"{which}: post weight after the norm is not supported")
+            _VG["w"][which] = (pw, qw, op._cc_alpha.float().contiguous(), op._cc_beta.float().contiguous(), isc,
+                               float(op._post_norm.eps), float(op._pre_norm.eps))
+        gen = torch.Generator(device=state["router"].device).manual_seed(6363)
+        for (which, rep), rs in sorted(routes.items(), key=str):
+            lo, hi = [(a, b) for a, b, r in K2A_BUCKETS if r == rep][0]
+            op = state["attn_boundary" if which == "attn" else "ffn_boundary"]
+            for r in rs:
+                if r[0] == "fnr" and _V9_FNR is None:
+                    print(f"[vg] {which} bucket {rep} {r}: SGLang fused_norm_residual unavailable", flush=True)
+                    continue
+                if r[0] == "vgb" and which == "ffn" and (int(r[1]) >> 21) & 1:
+                    print(f"[vg] {which} bucket {rep} {r}: stream before the PDL wait is illegal here -> dropped", flush=True)
+                    continue
+                good, worst = True, (0.0, 0.0)
+                for T in sorted({lo, rep, min(hi, K2A_M_MAX)}):
+                    stream = torch.randn((T, HIDDEN), generator=gen, device=state["router"].device) * 2.0
+                    branch = torch.randn((T, HIDDEN), generator=gen, device=state["router"].device).to(torch.bfloat16)
+                    ref = op(stream, branch, branch_dtype=torch.bfloat16, router_dtype=None)
+                    for _ in range(2):
+                        got = _vg_run(which, r, stream, branch)
+                        torch.cuda.synchronize()
+                        e0 = float((got[0].float() - ref[0].float()).norm() / ref[0].float().norm())
+                        e1 = float((got[1] - ref[1]).norm() / ref[1].norm())
+                        worst = (max(worst[0], e0), max(worst[1], e1))
+                        good &= e0 < 1e-2 and e1 < 1e-4 and bool(torch.isfinite(got[1]).all()) and bool(
+                            torch.isfinite(got[0].float()).all())
+                tag = "ok" if good else "FAIL"
+                print(f"[vg] self-test {which} bucket {rep} {r}: out {worst[0]:.1e} stream {worst[1]:.1e} -> {tag}", flush=True)
+                if good:
+                    _VG["ok"].add((which, rep, _vg_key(r)))
+        live = sorted(f"{w}/{b}" for (w, b), r in VG_BND_ROUTE.items() if (w, b, _vg_key(r)) in _VG["ok"])
+        dead = sorted(f"{w}/{b}" for (w, b), r in VG_BND_ROUTE.items() if (w, b, _vg_key(r)) not in _VG["ok"])
+        print(f"[vg] VG-B boundaries LIVE {live}{' FALLBACK (base boundary) ' + str(dead) if dead else ''} "
+              f"({len(_VG['ok'])} routes ok, {time.time() - t1:.1f}s; prepare so far {time.time() - t0:.1f}s)", flush=True)
+    except Exception as ex:
+        _VG["ok"] = set()
+        print(f"[vg] FAILED -> base boundaries everywhere: {ex!r}", flush=True)
+
+
 GD_ENABLE = True
 GD_BUILD = True
 GD_REQUIRE = False
@@ -19383,13 +19728,12 @@ GD_ROUTE = {("qkv", 1): (1, 1, 4, 8, 2, 4, 1), ("qkv", 8): (1, 1, 4, 8, 2, 4, 1)
             ("o", 32): (4, 2, 4, 4, 1, 1, 0),
             ("pooler", 1): (1, 1, 8, 16, 2, 1, 1), ("pooler", 8): (1, 1, 8, 16, 2, 1, 1),
             ("unpooler", 1): (1, 1, 16, 4, 2, 1, 0), ("unpooler", 8): (1, 1, 16, 4, 2, 1, 0),
-            ("unpooler", 16): (2, 2, 4, 16, 2, 1, 0), ("unpooler", 32): (4, 2, 4, 16, 1, 1, 0),
-            ("qkv@vf", 16): (2, 1, 2, 32, 4, 2, 0), ("qkv@vf", 32): (4, 1, 2, 32, 3, 2, 0)}
+            ("unpooler", 16): (2, 2, 4, 16, 2, 1, 0), ("unpooler", 32): (4, 2, 4, 16, 1, 1, 0)}
 GD_PDL = {"qkv": False, "o": True, "pooler": True, "unpooler": True}
 GD_TRIG = {"qkv": True, "o": True, "pooler": True, "unpooler": True}
 GD_K3_TRIG = True
-GD_DIMS = {"qkv@vf": (2304, HIDDEN), "qkv": (2304, HIDDEN), "o": (HIDDEN, 1024), "pooler": (D_EXPERT, HIDDEN), "unpooler": (HIDDEN, D_EXPERT)}
-GD_WEIGHT = {"qkv@vf": "qkv_gate", "qkv": "qkv_gate", "o": "o", "pooler": "pooler", "unpooler": "unpooler"}
+GD_DIMS = {"qkv": (2304, HIDDEN), "o": (HIDDEN, 1024), "pooler": (D_EXPERT, HIDDEN), "unpooler": (HIDDEN, D_EXPERT)}
+GD_WEIGHT = {"qkv": "qkv_gate", "o": "o", "pooler": "pooler", "unpooler": "unpooler"}
 GD_SELF_TEST_T = {1: (1,), 8: (8, 2, 5), 16: (16, 9), 32: (32, 17)}
 GD_TOL = (2e-3, 1e-2)
 GD_SELF_TEST_PDL = (0, 3, 3)
@@ -20068,8 +20412,7 @@ def _gd_live(state, proj, tokens):
 
 def _gd(state, proj, x, out=None, ldo=None):
     T = x.shape[0]
-    r = ((_gd_live(state, proj + "@vf", T) if VF_GD_ON.get((proj, _gd_bucket(T))) else None)
-         or _gd_live(state, proj, T))
+    r = _gd_live(state, proj, T)
     if r is None or not (x.dtype == torch.bfloat16 and x.dim() == 2 and x.shape[1] == r["K"] and x.is_contiguous()
                          and x.data_ptr() % 16 == 0):
         return None
