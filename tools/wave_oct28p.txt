@@ -1,0 +1,2 @@
+muse_bf16_proj kernels/muse_bf16_proj/vp_4.py
+muse_bf16_proj kernels/muse_bf16_proj/vp_r1.py

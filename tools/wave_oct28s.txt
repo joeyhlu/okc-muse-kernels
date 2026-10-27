@@ -1,3 +1,3 @@
+muse_decode_layer kernels/muse_decode_layer/k3_vml_3_s1.py
 muse_decode_layer kernels/muse_decode_layer/k3_va_1_s1.py
-muse_decode_layer kernels/muse_decode_layer/k3_vms_1_s1.py
 muse_decode_layer kernels/muse_decode_layer/k3_m32_2_s1.py
