@@ -40,6 +40,9 @@ BODY = r"""
 #ifndef PG_W2
 #define PG_W2 0
 #endif
+#ifndef PG_MMA
+#define PG_MMA 0
+#endif
 #ifndef PG_W2NP
 #define PG_W2NP 2
 #endif
@@ -256,6 +259,81 @@ __device__ __forceinline__ void unit_run_w2(const Args& A, uint8_t* smem, uint32
   }
 }
 
+// ---------------- M: mma.sync m16n8k16 consumer (every warp its own 16-row tile, no warpgroup sync, B by ldmatrix) -------
+__device__ __forceinline__ void mma16816(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+template <int N>
+__device__ __forceinline__ void stage_m(const Args& A, uint8_t* smem, uint32_t bars, int& it, float (&d)[2][N / 2], int warp,
+                                        int lane) {
+  constexpr int NT = N / 8;
+  const int ws = it % NS, xs = it % NX;
+  mbar_wait(bars + 8 * ws, (it / NS) & 1, A.err);
+  const uint8_t* st = smem + ws * US + (warp >> 3) * SW;
+  const int tile = warp & 7;
+  const uint4* cp = reinterpret_cast<const uint4*>(st + tile * 2048) + lane;
+  const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + 16384 + tile * 256) + lane;
+  uint4 c[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
+  const uint32_t sw0 = sp[0], sw1 = sp[32];
+  __syncwarp();
+  if (lane == 0) mbar_arrive(bars + 8 * (NS + ws));
+  mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
+  __syncwarp();
+  // x slot [n8][i 4][q 8][r 8][16 B]: ldmatrix.x4 of core matrices q = 4 hf .. 4 hf + 3 of group i = steps 2 hf, 2 hf + 1
+  const uint32_t xb = sa(smem + NS * US + xs * XS) + (uint32_t)(((lane >> 3) * 8 + (lane & 7)) * 16);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t sw2 = (i < 2) ? sw0 : sw1, par = i & 1;
+    const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
+    const uint32_t S8 = __byte_perm(sw2, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf) {
+      uint32_t hh[8];
+      dec_half(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, Sg, S8, hh);
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        uint32_t b0, b1, b2, b3;
+        ldsm4(xb + (uint32_t)(((nt * 4 + i) * 8 + 4 * hf) * 128), b0, b1, b2, b3);
+        mma16816(&d[0][4 * nt], hh[0], hh[4], hh[1], hh[5], b0, b1);
+        mma16816(&d[1][4 * nt], hh[2], hh[6], hh[3], hh[7], b2, b3);
+      }
+    }
+  }
+  __syncwarp();
+  if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + xs));
+  ++it;
+}
+template <int N>
+__device__ __forceinline__ void unit_run_m(const Args& A, uint8_t* smem, uint32_t bars, int& it, int u, int warp, int lane) {
+  float d[2][N / 2];
+#pragma unroll
+  for (int k = 0; k < N / 2; ++k) { d[0][k] = 0.f; d[1][k] = 0.f; }
+#pragma unroll 1
+  for (int s = 0; s < 16; ++s) stage_m<N>(A, smem, bars, it, d, warp, lane);
+  const int2 un = A.unit[u];
+  const int4 jb = A.job[un.x];
+  const float gs = __ldg(A.gsc13 + jb.x);
+  const int g = lane >> 2, t = lane & 3;
+  const int col = 8 * ((2 * un.y + (warp >> 3)) * 8 + (warp & 7)) + g;
+  const int rb = A.jbase[un.x];
+#pragma unroll
+  for (int nt = 0; nt < N / 8; ++nt)
+#pragma unroll
+    for (int hh = 0; hh < 2; ++hh) {
+      const int n = 8 * nt + 2 * t + hh;
+      if (n < jb.y)
+        A.inter[(size_t)(rb + n) * KDIM + col] = __float2bfloat16_rn(swiglu((d[0][4 * nt + hh] + d[1][4 * nt + hh]) * gs,
+                                                                           (d[0][4 * nt + 2 + hh] + d[1][4 * nt + 2 + hh]) * gs));
+    }
+}
+
 __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
   extern __shared__ __align__(1024) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -302,7 +380,15 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
   }
   const int q = warp >> 2, wp = warp & 3;
   int it = 0;
-  if constexpr (PG_W2) {
+  if constexpr (PG_MMA) {
+    for (int u = rg.x; u < rg.y; ++u) {
+      switch (A.job[A.unit[u].x].z >> 3) {
+        case 1: unit_run_m<8>(A, smem, bars, it, u, warp, lane); break;
+        case 2: unit_run_m<16>(A, smem, bars, it, u, warp, lane); break;
+        default: unit_run_m<32>(A, smem, bars, it, u, warp, lane); break;
+      }
+    }
+  } else if constexpr (PG_W2) {
     for (int u = rg.x; u < rg.y; ++u) {
       switch (A.job[A.unit[u].x].z >> 3) {
         case 1: unit_run_w2<8>(A, smem, bars, it, u, q, wp, lane); break;
@@ -364,7 +450,7 @@ void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::
              torch::Tensor cta, torch::Tensor xp, torch::Tensor inter, torch::Tensor err, torch::Tensor marks, int64_t G);
 """
 ARMS = {"F": {}, "PP": {"PG_PP": 1}, "C": {"PG_RES": 1},
-        "W2": {"PG_W2": 1, "PG_W2NP": 2}, "W2a": {"PG_W2": 1, "PG_W2NP": 1}}
+        "W2": {"PG_W2": 1, "PG_W2NP": 2}, "W2a": {"PG_W2": 1, "PG_W2NP": 1}, "M": {"PG_MMA": 1}}
 
 
 def flags_of(arm):
