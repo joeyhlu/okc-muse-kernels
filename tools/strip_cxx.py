@@ -9,8 +9,8 @@ What is kept, byte for byte:
   * a `//` line that ends with a backslash, or follows a line ending with a backslash (line splicing would change meaning);
   * a `//` line that mentions a license or copyright (strip_layer.LICENSE);
   * a `//` line containing a string the Python code searches text for (first argument of str.index / find / split / replace /
-    ... or the left side of an `in` test; e.g.
-    the CUDA source for it, e.g. `p1_src.index("// D = 1: <= 64 registers")` in G2; dropping such a line broke G2 once).
+    ..., or the left side of an `in` test), e.g. `p1_src.index("// D = 1: <= 64 registers")` in G2; dropping that line
+    broke G2 once.
 Check (`equivalent`): ast.dump of the output equals ast.dump of the original after applying the same line filter to every
 plain string constant at the value level (f-string parts untouched); the header lines are unchanged; and every single-line
 string constant (>= 4 chars) occurs in the multi-line constants exactly as often as before. Any escape sequence that makes
