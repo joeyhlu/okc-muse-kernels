@@ -7645,7 +7645,7 @@ __device__ void gemm36(const Params& P, Route& S, const int16_t* s_list, uint8_t
   constexpr int NRB = (MODE == 1) ? 64 : 32;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   __shared__ int s_fin[14];   // FIN1: [0] consumers done, [2 + 6 k .. 7 + 6 k] posted finalize k & 1
-  const bool fin1 = (P.probe >> 6) & 1;
+  const bool fin1 = ((P.probe >> 6) & 1) && (MODE == 1 || !((P.probe >> 5) & 1));   // bit 5: K1 only
   if (tid == 0) s_fin[0] = 0;   // read by the epilogue only after a barrier with consumer warp 0
   const uint8_t* wsrc = (MODE == 1) ? P.ws13 : P.ws2;
   const uint32_t ring_a = sa(ring);
@@ -8850,17 +8850,34 @@ def _fin1_ulp(a, b):
     return int((ka - kb).abs().max()) if ia.numel() else 0
 
 
-def _fin1_selftest(st, dev):
-    """FIN1 on vs off, vid 3 at T = 16 / 32, three inputs each, two calls per mode (off, off, on, on).
+FIN1_FLOOR = {"inter": 2, "y": 1e-6, "ss": 2e-6, "oulp": 2, "ol2": 1e-4}   # absolute floors of the off-vs-off envelope
 
-    FIN1 changes who runs the finalize code, not its arithmetic. K2's per-route sum of squares ss takes one FP32 atomic
-    per (rb item, warp) from many CTAs, so its rounding (and with it the output's last bits) already varies run to run
-    with FIN1 off: a bitwise on-vs-off output test cannot pass by design (R-study-a-6). Checked instead, every on call:
-    (a) no error flag; (b) K1's inter and K2's y bitwise equal to FIN1 off (route order is fixed; split items have <= 2
-    contributors onto zero, which commute); (c) h / cnt / cnt2 back at zero whenever FIN1 off leaves them so (no lost or
-    doubled finalize); (d) every route's ss within 3e-5 of an exact FP64 recomputation from y (bound for <= 266 FP32
-    roundings in any order; a lost / doubled item moves ss by ~3e-2); (e) output rel L2 vs FIN1 off <= 1e-3 (the judge
-    sees ~3.7e-3 vs FP32). Off vs off is printed alongside. Any failure turns FIN1 off."""
+
+def _fin1_metrics(a, b):
+    """Distance of call a from call b per value: inter (bf16 ulps), y (max over routes of max |dy| / max |y|), ss (max
+    rel), out (bf16 ulps, rel L2), plus elements of out differing and the bitwise flags of inter / y."""
+    x, w = a["out"].float(), b["out"].float()
+    yd = (a["y"] - b["y"]).abs()
+    return {"inter": _fin1_ulp(a["inter"], b["inter"]),
+            "y": float((yd.amax(1) / b["y"].abs().amax(1).clamp_min(1e-30)).max()) if yd.numel() else 0.0,
+            "ss": float(((a["ss"] - b["ss"]).abs() / b["ss"].abs().clamp_min(1e-30)).max()) if a["ss"].numel() else 0.0,
+            "oulp": _fin1_ulp(a["out"], b["out"]), "ol2": float((x - w).norm() / w.norm().clamp_min(1e-30)),
+            "odiff": int((a["out"] != b["out"]).sum()),
+            "inter_eq": bool(torch.equal(a["inter"], b["inter"])), "y_eq": bool(torch.equal(a["y"], b["y"]))}
+
+
+def _fin1_selftest(st, dev):
+    """FIN1 on vs off, vid 3 at T = 16 / 32, three inputs each: three calls with FIN1 off, then two with it on.
+
+    FIN1 changes who runs the finalize code, not its arithmetic, but it moves timing, and K2A has shipped values whose
+    FP32 atomic order follows timing: K2's per-route ss (one atomic per rb item and warp, every input) and K2's y on
+    skewed routings (items cut across >= 3 CTAs; R-study-a-7: y differed between two FIN1-off calls on input 72). So
+    each value is judged against its own off-vs-off envelope, measured here (A22): inter and y must be bitwise equal to
+    the first off call if every off call was; otherwise inter / y and always ss / out must stay within max(2 x the
+    off-vs-off distance, FIN1_FLOOR). Hard checks on every on call: no error flag; h / cnt / cnt2 back at zero whenever
+    FIN1 off leaves them so (no lost or doubled finalize); every route's ss within 3e-5 of an exact FP64 recomputation
+    from y (bound for <= 266 FP32 roundings in any order; a lost / doubled item moves ss by ~3e-2); output rel L2 vs off
+    <= 1e-3. Any failure turns FIN1 off."""
     global FIN1_ENABLE
     if not FIN1_ENABLE or not st.get("r36"):
         return
@@ -8877,7 +8894,7 @@ def _fin1_selftest(st, dev):
                 ids = d["topk_ids"]
                 nr = int(((ids >= 0) & (ids < K2A_E_LOC)).sum())
                 runs = []
-                for on in (False, False, True, True):
+                for on in (False, False, False, True, True):
                     FIN1_ENABLE = on
                     st["err"].zero_()
                     out = _k2a36_call(st, data, r[0], r[1]).clone()
@@ -8889,46 +8906,47 @@ def _fin1_selftest(st, dev):
                                  "ssx": float(((ss - ref).abs() / ref.clamp_min(1e-30)).max()) if nr else 0.0,
                                  "zero": not bool(st["h"].any() or st["cnt"].any() or st["cnt2"].any()),
                                  "err": int(st["err"][0])})
-                o1, o2, n1, n2 = runs
-
-                def det(a, b):
-                    return f"{int(torch.equal(a['inter'], b['inter']))}{int(torch.equal(a['y'], b['y']))}"
-
-                def ssd(a, b):
-                    return float(((a["ss"] - b["ss"]).abs() / b["ss"].abs().clamp_min(1e-30)).max()) if nr else 0.0
-
-                def od(a, b):
-                    x, w = a["out"].float(), b["out"].float()
-                    return (int((a["out"] != b["out"]).sum()), _fin1_ulp(a["out"], b["out"]),
-                            float((x - w).norm() / w.norm().clamp_min(1e-30)))
-
-                why = []
+                offs, ons = runs[:3], runs[3:]
+                mo = [_fin1_metrics(x, offs[0]) for x in offs[1:]]
+                mn = [_fin1_metrics(x, offs[0]) for x in ons]
+                env = {k: max(m[k] for m in mo) for k in FIN1_FLOOR}
+                got = {k: max(m[k] for m in mn) for k in FIN1_FLOOR}
+                why, rule = [], {}
                 if any(x["err"] for x in runs):
                     why.append("err")
-                if det(n1, o1) != "11" or det(n2, o1) != "11":
-                    why.append("det")
-                if o1["zero"] and o2["zero"] and not (n1["zero"] and n2["zero"]):
+                if all(x["zero"] for x in offs) and not all(x["zero"] for x in ons):
                     why.append("zero")
-                if max(n1["ssx"], n2["ssx"]) > 3e-5:
-                    why.append("ss")
-                if max(od(n1, o1)[2], od(n2, o1)[2]) > 1e-3:
-                    why.append("out")
+                if max(x["ssx"] for x in ons) > 3e-5:
+                    why.append("ss-exact")
+                if got["ol2"] > 1e-3:
+                    why.append("out-l2")
+                for k in FIN1_FLOOR:
+                    if k in ("inter", "y") and all(m[k + "_eq"] for m in mo):
+                        rule[k] = "bitwise"
+                        if not all(m[k + "_eq"] for m in mn):
+                            why.append(k)
+                    else:
+                        lim = max(2 * env[k], FIN1_FLOOR[k])
+                        rule[k] = f"<={lim:.2g}"
+                        if got[k] > lim:
+                            why.append(k)
                 if why:
                     bad.append((bs, seed, "+".join(why)))
-                print(f"[fin1] bs={bs} seed={seed} {dist} routes {nr}: inter/y bitwise off2 {det(o2, o1)} on {det(n1, o1)} "
-                      f"on2 {det(n2, o1)} | zero after off {int(o1['zero'])}{int(o2['zero'])} on "
-                      f"{int(n1['zero'])}{int(n2['zero'])} | ss vs exact max rel off {max(o1['ssx'], o2['ssx']):.2e} on "
-                      f"{max(n1['ssx'], n2['ssx']):.2e} | ss max rel off2-off {ssd(o2, o1):.2e} on-off {ssd(n1, o1):.2e} "
-                      f"on2-on {ssd(n2, n1):.2e} | out (n diff, max ulp, rel L2) off2-off {od(o2, o1)} on-off "
-                      f"{od(n1, o1)} on2-on {od(n2, n1)} -> {'ok' if not why else '+'.join(why)}", flush=True)
+                print(f"[fin1] bs={bs} seed={seed} {dist} routes {nr}: "
+                      + " | ".join(f"{k} off {env[k]:.2g} on {got[k]:.2g} ({rule[k]})" for k in FIN1_FLOOR)
+                      + f" | out elems differing off {max(m['odiff'] for m in mo)} on {max(m['odiff'] for m in mn)}"
+                      f" | zero off {''.join(str(int(x['zero'])) for x in offs)} on {''.join(str(int(x['zero'])) for x in ons)}"
+                      f" | ss vs exact off {max(x['ssx'] for x in offs):.2e} on {max(x['ssx'] for x in ons):.2e}"
+                      f" -> {'ok' if not why else '+'.join(why)}", flush=True)
         FIN1_ENABLE = not bad
-        print(f"[fin1] self-test FIN1 on vs off (vid 3 T=16/32; deterministic parts bitwise, ss vs exact, out rel L2): "
-              f"{'ok' if not bad else bad} -> FIN1_ENABLE={FIN1_ENABLE}", flush=True)
+        print(f"[fin1] self-test FIN1 on vs off (vid 3 T=16/32; off-vs-off envelope per value, bitwise where off is; ss "
+              f"vs exact, out rel L2): {'ok' if not bad else bad} -> FIN1_ENABLE={FIN1_ENABLE}", flush=True)
     except Exception as ex:  # noqa: BLE001
         FIN1_ENABLE = False
         print(f"[fin1] self-test raised {ex!r}: FIN1 off", flush=True)
 
 
+FIN1_K1_ONLY = False   # FIN1 in K1 only (probe bit 5; K2 keeps the shipped single-warp finalize), read at call time
 KW3_W4 = {}   # KW3 (R-study-a-3): bucket rep -> vid 3 role-split hot_w4 override, read at call time ({} = the plan)
 
 
@@ -8944,7 +8962,7 @@ def _k2a33_call(st, data, vid, probe=K2A33_HINT, mask=7, hot_t=None, hot_w4=None
     st["mod"].run3(vid, mask, x, ids, wts, st["ws13"], st["ws2"], st["gsc13"], st["gsc2"], st["nw"], st["h"],
                    st["inter"], st["y"], st["meta"], st["cnt"], st["err"], out, st["sink"], st["ss"], st["cnt2"],
                    st["xw"], st["xw2"], hot_t, m,
-                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 6) if FIN1_ENABLE else 0))
+                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 6) if FIN1_ENABLE else 0) | ((1 << 5) if FIN1_K1_ONLY else 0))
     return out
 
 def _k2a33_reset(st):
@@ -9117,7 +9135,7 @@ def _k2a36_call(st, data, vid, hot=None, probe=K2A33_HINT, mask=7):
     st["mod"].run3(vid, mask, x, ids, wts, st["ws13"], st["ws2"], st["gsc13"], st["gsc2"], st["nw"], st["h"],
                    st["inter"], st["y"], st["meta"], st["cnt"], st["err"], out, st["sink"], st["ss"], st["cnt2"],
                    st["xw"], st["xw2"], _k2a36_hot_code(st["variants"][vid], hot), m,
-                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 6) if FIN1_ENABLE else 0))
+                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 6) if FIN1_ENABLE else 0) | ((1 << 5) if FIN1_K1_ONLY else 0))
     return out
 
 
