@@ -1,5 +1,5 @@
 # okc: problem=muse_bf16_proj
-# nonce gv1-c (gv1 + pinned cuBLASLt at m = 128 / 256 + router buckets 128 / 256; P11 parked after R-dense-1)
+# nonce gv1-d (gv1-c + PT: P12 weights + RS-wgmma at m = 128 / 256 and m = 32, exact-m search incl. cuBLASLt)
 """gv1: lossless 12-bit weight-streaming skinny GEMMs for the dense projections (M <= 32), cuBLAS (SGLang's own
 call) above that.
 
@@ -34,6 +34,7 @@ GV_REPS = 25                # cold-L2 graph replays per candidate (paired with t
 GV_THREADS = 6              # parallel load_inline builds
 GV_PREPARE_BUDGET = 240.0   # seconds; candidates past it are skipped (loudly)
 GV_FORCE_FMT = None         # test knob: keep only this format's candidates where a bucket has any
+GV_FORCE_PT = False         # test knob: use a PT route at m = 128 / 256 whenever one passes its self-test
 ESC_CAP = 32
 MAX_GV_M = 32               # BF16 layers: GV up to 32 tokens; the router also runs token slices above that
 
@@ -141,6 +142,21 @@ std::vector<int64_t> gv_info(int64_t inst) {
   std::vector<int64_t> r(4, 0);
   const int e = gv_info_raw(inst, r.data());
   TORCH_CHECK(e == 0, "gv_info: inst ", inst, " error ", e);
+  return r;
+}
+int pt_run_raw(int64_t inst, const void* w, const void* esc, const void* x, void* out, int M, int K, int ldo,
+               uint32_t tb, int nbx, int nz, cudaStream_t st);
+int pt_info_raw(int64_t inst, int64_t* res);
+void pt_run(int64_t inst, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, int64_t M, int64_t K,
+            int64_t ldo, int64_t tb, int64_t nbx, int64_t nz) {
+  const int e = pt_run_raw(inst, w.data_ptr(), esc.data_ptr(), x.data_ptr(), out.data_ptr(), (int)M, (int)K, (int)ldo,
+                           (uint32_t)tb, (int)nbx, (int)nz, at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(e == 0, "pt_run: inst ", inst, " CUDA error ", e, " ", cudaGetErrorString((cudaError_t)(e < 0 ? 1 : e)));
+}
+std::vector<int64_t> pt_info(int64_t inst) {
+  std::vector<int64_t> r(4, 0);
+  const int e = pt_info_raw(inst, r.data());
+  TORCH_CHECK(e == 0, "pt_info: inst ", inst, " error ", e);
   return r;
 }
 void gv_unpack(torch::Tensor w, torch::Tensor esc, torch::Tensor out, int64_t fmt, int64_t K, int64_t G, int64_t nbx,
@@ -551,8 +567,9 @@ static int info(int64_t* res) {
   return e;
 }
 
-// bit-exact unpack of a packed matrix back to [N, K] (verification); one warp per (global warp, step)
-template <int FMT>
+// bit-exact unpack of a packed matrix back to [N, K] (verification); one warp per (global warp, step).
+// PERM 1: the GV k order inside a 64-k unit (k = 16 t + 4 q + 2 a + b); 0: the plain order (k = 16 q + 2 t + 8 a + b, PT)
+template <int FMT, int PERM>
 __global__ void unpack_kernel(const uint8_t* __restrict__ w, const uint32_t* __restrict__ esc, uint32_t* __restrict__ out,
                               int K, int G, int nbx, int WR, int WK, int KU, uint32_t tb) {
   const int gw = (int)blockIdx.x, s = (int)blockIdx.y, lane = (int)threadIdx.x;
@@ -574,9 +591,242 @@ __global__ void unpack_kernel(const uint8_t* __restrict__ w, const uint32_t* __r
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int row = rt * 16 + g + 8 * (i & 1);
-      const int k = u * 64 + 16 * t + 4 * q + 2 * (i >> 1);
+      const int k = PERM ? (u * 64 + 16 * t + 4 * q + 2 * (i >> 1)) : (u * 64 + 16 * q + 2 * t + 8 * (i >> 1));
       out[((size_t)row * K + k) >> 1] = a[4 * q + i];
     }
+}
+
+// ================================================================================================================
+// PT: m >= 64 tokens. P12 weights (plain k order) decoded into A registers; x tiles staged in shared memory.
+// CTA = 4 warps = 64 weight rows (warp w: row tile 4 bx + w), N tokens (slice blockIdx.z), K units [by KU, (by+1) KU).
+// WG 1: wgmma m64nNk16 RS (A = registers, as K2A's hot role), B = x stage in the no-swizzle K-major core-matrix layout
+// [n8][kc 8][row 8][16 B] (LBO 128 B, SBO 1024 B, +256 B per k16). WG 0: the same pipeline with mma.sync + ldmatrix.
+// ================================================================================================================
+struct PArgs {
+  const uint8_t* w; const uint32_t* esc; const uint16_t* x; void* out;
+  int M, K, ldo; uint32_t tb;
+};
+
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t a, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void mma16816p(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+#define GV_WGMMA 1
+__device__ __forceinline__ uint64_t wg_desc(uint32_t a, uint32_t sbo) {   // K2A's wg_desc_sa: no swizzle, LBO 128 B
+  return (uint64_t)((a & 0x3FFFF) >> 4) | ((uint64_t)(128u >> 4) << 16) | ((uint64_t)(sbo >> 4) << 32);
+}
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
+template <int NPEND>
+__device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(NPEND) : "memory"); }
+__device__ __forceinline__ void fence_async_smem() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void wgmma_rs(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                          uint64_t db);
+@WGSPECS@
+#else
+#define GV_WGMMA 0
+#endif
+
+template <int WG, int N, int KU, int ST, int S>
+__global__ void __launch_bounds__(128, 1) pt_kernel(const __grid_constant__ PArgs A) {
+  constexpr int XS = 4;                  // x stages: current, wgmma in flight, landed / in flight, refill
+  constexpr int XB = N * 128;            // bytes per x stage (N tokens x 64 k)
+  constexpr int NA = N / 2;              // accumulator floats per thread (64 x N per warpgroup)
+  extern __shared__ __align__(1024) uint8_t smem[];
+  __shared__ __align__(8) unsigned long long mbar;
+  uint8_t* xs = smem;
+  float* pbuf = reinterpret_cast<float*>(smem + XS * XB);   // leader: (S - 1) x [NA / 4][128][4] floats
+  const int tid = (int)threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+  const int split = S > 1 ? (int)blockIdx.y : 0;
+  const int G = (int)(gridDim.x * gridDim.y) * 4;
+  const int gw = ((int)blockIdx.y * (int)gridDim.x + (int)blockIdx.x) * 4 + warp;
+  const int u0 = split * KU;
+  const int tok0 = (int)blockIdx.z * N;
+  const size_t wstep = (size_t)G * UB<0>::v;
+  const uint8_t* wp = A.w + (size_t)gw * UB<0>::v;
+  uint4 R[ST][4];
+#pragma unroll
+  for (int i = 0; i < ST; ++i)
+    if (i < KU) ldunit<0>(wp + (size_t)i * wstep, lane, R[i]);
+  const uint32_t em = lde(A.esc + (size_t)gw * 32 + lane);
+  // x stage fill: thread tid copies 16-B chunks ch = tid + 128 j: token n = ch >> 3, k chunk c = ch & 7
+  const uint32_t xs0 = smem_u32(xs);
+  auto stage_x = [&](int u, int st) {
+#pragma unroll
+    for (int j = 0; j < N / 16; ++j) {
+      const int ch = tid + 128 * j, n = ch >> 3, c = ch & 7;
+      int tok = tok0 + n;
+      tok = tok < A.M ? tok : A.M - 1;
+      cp_async16(xs0 + st * XB + (n >> 3) * 1024 + c * 128 + (n & 7) * 16,
+                 A.x + (size_t)tok * A.K + (size_t)(u0 + u) * 64 + 8 * c);
+    }
+    cp_async_commit();
+  };
+  stage_x(0, 0);
+  if (KU > 1) stage_x(1, 1); else cp_async_commit();
+#if GV_CLUSTER_OK
+  int crank = 0;
+  if constexpr (S > 1) {
+    crank = (int)cl_rank();
+    if (crank == 0 && tid == 0) mb_init_expect(smem_u32(&mbar), (uint32_t)((S - 1) * 64 * N * 4));
+    cl_arrive();
+  }
+#endif
+  int ecur = 0;
+  uint32_t enx = __shfl_sync(0xffffffffu, em, 0);
+  float acc[NA];
+#pragma unroll
+  for (int i = 0; i < NA; ++i) acc[i] = 0.f;
+  uint32_t a[2][16];
+#pragma unroll 1
+  for (int ub = 0; ub < KU; ub += 4) {
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+      const int u = ub + d;
+      const int slot = d % ST, ab = d & 1, xst = d % XS;   // u % 4 == d: ST divides 4, XS = 4
+#if GV_WGMMA
+      if constexpr (WG) wg_wait<1>();     // wgmma(u - 2) done: a[ab] and stage (u + 2) % 4 are free
+#endif
+      decode<0>(R[slot], A.tb, a[ab]);
+      if (u + ST < KU) ldunit<0>(wp + (size_t)(u + ST) * wstep, lane, R[slot]);
+      while ((int)(enx >> 20) == u) {
+        patch(a[ab], enx, lane);
+        ++ecur;
+        enx = ecur < 32 ? __shfl_sync(0xffffffffu, em, ecur & 31) : 0xFFFFFFFFu;
+      }
+      cp_async_wait<1>();                 // unit u's x stage landed (this thread's copies)
+#if GV_WGMMA
+      if constexpr (WG) fence_async_smem();
+#endif
+      __syncthreads();
+      if (u + 2 < KU) stage_x(u + 2, (d + 2) % XS); else cp_async_commit();
+      const uint32_t sb = xs0 + xst * XB;
+      if constexpr (WG) {
+#if GV_WGMMA
+        wg_fence();
+        const uint64_t d0 = wg_desc(sb, 1024u);
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          wgmma_rs<N>(acc, a[ab][4 * q], a[ab][4 * q + 1], a[ab][4 * q + 2], a[ab][4 * q + 3], d0 + 16 * q);
+        wg_commit();
+#endif
+      } else {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+#pragma unroll
+          for (int j = 0; j < N / 8; j += 2) {
+            uint32_t b0, b1, b2, b3;
+            const int mtx = lane >> 3;   // 0: (j, 2q), 1: (j, 2q + 1), 2: (j + 1, 2q), 3: (j + 1, 2q + 1)
+            ldsm_x4(sb + (j + (mtx >> 1)) * 1024 + (2 * q + (mtx & 1)) * 128 + (lane & 7) * 16, b0, b1, b2, b3);
+            mma16816p(acc + 4 * j, &a[ab][4 * q], b0, b1);
+            mma16816p(acc + 4 * j + 4, &a[ab][4 * q], b2, b3);
+          }
+        }
+      }
+    }
+  }
+#if GV_WGMMA
+  if constexpr (WG) wg_wait<0>();
+#endif
+  // epilogue: acc[4 j + e] = (row 16 warp + g + 8 (e >> 1), token 8 j + 2 t + (e & 1)) of this CTA's tile
+  auto store = [&](int j4, float v) {
+    const int j = j4 >> 2, e = j4 & 3;
+    const int row = (int)blockIdx.x * 64 + 16 * warp + g + 8 * (e >> 1);
+    const int tok = tok0 + 8 * j + 2 * t + (e & 1);
+    if (tok < A.M) reinterpret_cast<__nv_bfloat16*>(A.out)[(size_t)tok * A.ldo + row] = __float2bfloat16_rn(v);
+  };
+  if constexpr (S == 1) {
+#pragma unroll
+    for (int i = 0; i < NA; ++i) store(i, acc[i]);
+  } else {
+#if GV_CLUSTER_OK
+    if (crank != 0) {
+      cl_wait();
+      const uint32_t rb = mapa0(smem_u32(pbuf + (size_t)(crank - 1) * 64 * N));
+      const uint32_t rm = mapa0(smem_u32(&mbar));
+#pragma unroll
+      for (int i = 0; i < NA; i += 4) {
+        const uint32_t ad = rb + 16u * (uint32_t)((i >> 2) * 128 + tid);
+        asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1,%2,%3,%4}, [%5];\n"
+                     :: "r"(ad), "r"(__float_as_uint(acc[i])), "r"(__float_as_uint(acc[i + 1])),
+                        "r"(__float_as_uint(acc[i + 2])), "r"(__float_as_uint(acc[i + 3])), "r"(rm) : "memory");
+      }
+      return;
+    }
+    const uint32_t mb = smem_u32(&mbar);
+    bool ok = true;
+    for (uint32_t it = 0; !mb_try(mb); ++it)
+      if (it > (1u << 22)) {
+        ok = false;
+        break;
+      }
+#pragma unroll
+    for (int i = 0; i < NA; i += 4) {
+      float4 v = make_float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+#pragma unroll
+      for (int r = 0; r < S - 1; ++r) {
+        const float4 p = reinterpret_cast<const float4*>(pbuf + (size_t)r * 64 * N)[(i >> 2) * 128 + tid];
+        v.x += p.x; v.y += p.y; v.z += p.z; v.w += p.w;
+      }
+      const float nan = __int_as_float(0x7fc00000);
+      store(i, ok ? v.x : nan); store(i + 1, ok ? v.y : nan); store(i + 2, ok ? v.z : nan); store(i + 3, ok ? v.w : nan);
+    }
+#endif
+  }
+}
+
+template <int WG, int N, int KU, int ST, int S>
+static int pt_launch(const PArgs& A, int nbx, int nz, cudaStream_t st) {
+  constexpr int SM = 4 * N * 128 + (S > 1 ? (S - 1) * 64 * N * 4 : 0);
+  auto fn = pt_kernel<WG, N, KU, ST, S>;
+  static bool attr = false;
+  if (!attr) {
+    int e = (int)cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+    if (e) return e;
+    attr = true;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)nbx, (unsigned)S, (unsigned)nz);
+  cfg.blockDim = dim3(128, 1, 1);
+  cfg.dynamicSmemBytes = SM;
+  cfg.stream = st;
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeClusterDimension;
+  at[0].val.clusterDim.x = 1;
+  at[0].val.clusterDim.y = (unsigned)S;
+  at[0].val.clusterDim.z = 1;
+  cfg.attrs = at;
+  cfg.numAttrs = S > 1 ? 1u : 0u;
+  return (int)cudaLaunchKernelEx(&cfg, fn, A);
+}
+
+template <int WG, int N, int KU, int ST, int S>
+static int pt_info(int64_t* res) {
+  constexpr int SM = 4 * N * 128 + (S > 1 ? (S - 1) * 64 * N * 4 : 0);
+  cudaFuncAttributes fa;
+  auto fn = pt_kernel<WG, N, KU, ST, S>;
+  int e = (int)cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+  if (e) return e;
+  e = (int)cudaFuncGetAttributes(&fa, fn);
+  if (e) return e;
+  int occ = 0;
+  e = (int)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 128, SM);
+  res[0] = fa.numRegs; res[1] = (int64_t)fa.localSizeBytes; res[2] = occ; res[3] = SM;
+  return e;
 }
 
 }  // namespace gv
@@ -617,12 +867,38 @@ int gv_unpack_raw(const void* w, const void* esc, void* out, int fmt, int K, int
   const uint32_t* eb = reinterpret_cast<const uint32_t*>(esc);
   uint32_t* ob = reinterpret_cast<uint32_t*>(out);
   if (fmt == 0)
-    unpack_kernel<0><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
+    unpack_kernel<0, 1><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
   else if (fmt == 1)
-    unpack_kernel<1><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
+    unpack_kernel<1, 1><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
+  else if (fmt == 2)
+    unpack_kernel<2, 1><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
   else
-    unpack_kernel<2><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
+    unpack_kernel<0, 0><<<grid, 32, 0, st>>>(wb, eb, ob, K, G, nbx, wr, wk, ku, tb);
   return (int)cudaGetLastError();
+}
+
+#define PT_INST(ID, WG, N, KU, ST, S) case ID: return pt_launch<WG, N, KU, ST, S>(A, nbx, nz, st);
+#define PT_INFO(ID, WG, N, KU, ST, S) case ID: return pt_info<WG, N, KU, ST, S>(res);
+
+int pt_run_raw(int64_t inst, const void* w, const void* esc, const void* x, void* out, int M, int K, int ldo,
+               uint32_t tb, int nbx, int nz, cudaStream_t st) {
+  PArgs A;
+  A.w = reinterpret_cast<const uint8_t*>(w);
+  A.esc = reinterpret_cast<const uint32_t*>(esc);
+  A.x = reinterpret_cast<const uint16_t*>(x);
+  A.out = out;
+  A.M = M; A.K = K; A.ldo = ldo; A.tb = tb;
+  switch (inst) {
+@PTINST@
+    default: return -1;
+  }
+}
+
+int pt_info_raw(int64_t inst, int64_t* res) {
+  switch (inst) {
+@PTINFO@
+    default: return -1;
+  }
 }
 """
 
@@ -677,7 +953,7 @@ void lt_run(int64_t pid, int64_t ai, torch::Tensor w, torch::Tensor x, torch::Te
 }
 """
 LT_ENABLE = True
-LT_M = (128, 256)
+LT_M = (32, 128, 256)   # exact-m search (Lt, addmm, PT, GV bucket route); 32 = decode-32
 LT_MAX_ALGOS = 24
 LT_WS = 32 << 20
 
@@ -729,29 +1005,50 @@ def _inst_key(layer, b, route):
     return (fmt, 2 if layer == "router" else 0, mt, wr, wk, ku, st, s, mb, xp)
 
 
-def _src_for(keys):
+def _wg_specs(ns=(32, 64, 128, 256)):
+    """wgmma.mma_async m64nNk16 RS (f32 += bf16 x bf16) specializations: K2A's operand order and immediates."""
+    out = []
+    for n in ns:
+        na = n // 2
+        regs = ",".join("%%%d" % i for i in range(na))
+        outs = ", ".join('"+f"(d[%d])' % i for i in range(na))
+        out.append(
+            "template <> __device__ __forceinline__ void wgmma_rs<%d>(float* d, uint32_t a0, uint32_t a1, uint32_t a2, "
+            "uint32_t a3, uint64_t db) {\n"
+            '  asm volatile("{\\n.reg .pred p;\\nsetp.ne.b32 p, 1, 0;\\nwgmma.mma_async.sync.aligned.m64n%dk16.f32.bf16.bf16 "\n'
+            '               "{%s}, {%%%d,%%%d,%%%d,%%%d}, %%%d, p, 1, 1, 0;\\n}\\n"\n'
+            '               : %s\n               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(db));\n}'
+            % (n, n, regs, na, na + 1, na + 2, na + 3, na + 4, outs))
+    return "\n".join(out)
+
+
+def _src_for(keys, pt_keys=()):
     inst = "\n".join("    GV_INST(%d, %s)" % (i, ", ".join(str(v) for v in k)) for i, k in enumerate(keys))
     info = "\n".join("    GV_INFO(%d, %s)" % (i, ", ".join(str(v) for v in k)) for i, k in enumerate(keys))
-    return CUDA_SRC.replace("@INST@", inst).replace("@INFO@", info)
+    pinst = "\n".join("    PT_INST(%d, %s)" % (i, ", ".join(str(v) for v in k)) for i, k in enumerate(pt_keys))
+    pinfo = "\n".join("    PT_INFO(%d, %s)" % (i, ", ".join(str(v) for v in k)) for i, k in enumerate(pt_keys))
+    return (CUDA_SRC.replace("@INST@", inst).replace("@INFO@", info).replace("@PTINST@", pinst)
+            .replace("@PTINFO@", pinfo).replace("@WGSPECS@", _wg_specs()))
 
 
-def _build_one(name, keys, flags):
+def _build_one(name, keys, flags, pt_keys=()):
     from torch.utils.cpp_extension import load_inline
-    src = _src_for(keys)
+    src = _src_for(keys, pt_keys)
     tag = hashlib.sha1((CPP_SRC + src + " ".join(flags)).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(name=f"{name}_{tag}", cpp_sources=CPP_SRC, cuda_sources=src,
-                      functions=["gv_run", "gv_info", "gv_unpack"], extra_cuda_cflags=flags, verbose=False)
+                      functions=["gv_run", "gv_info", "gv_unpack", "pt_run", "pt_info"], extra_cuda_cflags=flags,
+                      verbose=False)
     return mod, time.time() - t0
 
 
-def _build_all(groups, flags):
+def _build_all(groups, flags, pt_keys=None):
     """groups: {module name: [template keys]} -> {module name: (module, {key: inst id})}, built in threads."""
     out, errs = {}, {}
 
     def work(name, keys):
         try:
-            mod, dt = _build_one(name, keys, flags)
+            mod, dt = _build_one(name, keys, flags, (pt_keys or {}).get(name, ()))
             out[name] = (mod, {k: i for i, k in enumerate(keys)})
             print(f"[gv1] built {name}: {len(keys)} kernels in {dt:.1f}s", flush=True)
         except Exception as ex2:  # noqa: BLE001
@@ -779,7 +1076,7 @@ def _i32(t64):
     return torch.where(t64 >= 2 ** 31, t64 - 2 ** 32, t64).to(torch.int32)
 
 
-def _frag(wv):
+def _frag(wv, perm=True):
     """[N, K] bf16 -> F [NRT, NU, 32 lanes, 4 k-steps, 8] int32 (16-bit patterns) in fragment order:
     j = 0..7 -> (row g, k0), (g, k0+1), (g+8, k0), (g+8, k0+1), (g, k0+2), (g, k0+3), (g+8, k0+2), (g+8, k0+3),
     k0 = 16 t + 4 q (k permuted inside the 64-k unit so lane t's x operand is 16 contiguous k)."""
@@ -792,7 +1089,10 @@ def _frag(wv):
     q = torch.arange(4, device=dev).view(1, 4, 1)
     j = torch.arange(8, device=dev).view(1, 1, 8)
     row16 = (g + 8 * ((j >> 1) & 1)).expand(32, 4, 8)
-    k64 = (16 * t + 4 * q + (j & 1) + 2 * (j >> 2)).expand(32, 4, 8)
+    if perm:   # GV: lane t owns 16 contiguous k of the unit (x straight from global)
+        k64 = (16 * t + 4 * q + (j & 1) + 2 * (j >> 2)).expand(32, 4, 8)
+    else:      # PT: plain mma order (x from shared memory)
+        k64 = (16 * q + 2 * t + (j & 1) + 8 * (j >> 2)).expand(32, 4, 8)
     nrt, nu = n // 16, k // 64
     rows = torch.arange(nrt, device=dev).view(nrt, 1, 1, 1, 1) * 16 + row16.view(1, 1, 32, 4, 8)
     cols = torch.arange(nu, device=dev).view(1, nu, 1, 1, 1) * 64 + k64.view(1, 1, 32, 4, 8)
@@ -831,7 +1131,7 @@ def _warp_of(rt, u, wr, wk, ku, nbx):
     return ((by * nbx + bx) * wr + wri) * wk + wki, st_
 
 
-def pack(wv, fmt, wr, wk, ku, s, bases):
+def pack(wv, fmt, wr, wk, ku, s, bases, perm=True):
     """Pack the virtual matrix wv [N, K] bf16 for one geometry. bases = (base rows 0-7, base rows 8-15) of every
     16-row tile. fmt 0 = P12 (16-exponent window, <= ESC_CAP XOR escapes per warp; raises ValueError beyond),
     1 = RAW bf16 fragments, 2 = P11 (8-exponent window, escapes as an FP32 correction list per warp).
@@ -841,7 +1141,7 @@ def pack(wv, fmt, wr, wk, ku, s, bases):
     nbx = nrt // wr
     G = nbx * s * wr * wk
     dev = wv.device
-    fr = _frag(wv)
+    fr = _frag(wv, perm)
     dummy_off = torch.zeros((G + 1,), dtype=torch.int32, device=dev)
     if fmt == 1:
         lo16 = fr[..., 0::2].to(torch.int64)
@@ -944,6 +1244,7 @@ _SEEN = set()
 # was captured on that stream breaks the newer one (measured locally: cuBLAS state inside the older graph's pool). The
 # graphs are small (their pools hold only output buffers), so they are parked here for the life of the process.
 _KEEP_GRAPHS = []
+_PT_KEYS = []   # PT template keys of the built module, in instantiation order
 
 
 def _bf16_gemm(x, w):
@@ -987,6 +1288,8 @@ def _lt_call(r, x, n_out):
 
 
 def _route_call(r, x, n_out, layer):
+    if r["kind"] == "pt":
+        return _pt_call(r, x, n_out)
     if r["kind"] == "gv":
         return _gv_call(r, x, n_out, torch.float32 if layer == "router" else torch.bfloat16)
     if r["kind"] == "lt":
@@ -1143,42 +1446,85 @@ def _build_lt(box):
         box["err"] = f"{str(ex)[-1500:]} (flags {flags})"
 
 
-def _lt_search(state, mod, timer, floor, dev, budget_end):
-    """Pinned cuBLASLt (and addmm) routes at the exact timed m >= 128: time every heuristic algorithm, keep the best if it
-    beats both SGLang's call and any GV route of that bucket. Returns summary strings."""
+def _pt_candidates(cap):
+    """{(layer, m): [(WG, N, S, ST, KU, key)]}: PT routes at m = 128 / 256 (WG 1 = wgmma, sm_90a only; S > 1 = cluster)."""
+    sm90 = cap == (9, 0)
+    spec = {
+        ("pooler", 128): [(1, 128, 2, 4), (1, 64, 2, 4), (0, 128, 2, 4)],
+        ("pooler", 256): [(1, 256, 2, 2), (1, 256, 2, 1), (1, 128, 2, 4), (0, 128, 2, 4)],
+        ("qkv_gate", 128): [(1, 64, 2, 4), (1, 128, 2, 4), (0, 128, 2, 4)],
+        ("qkv_gate", 256): [(1, 128, 2, 4), (1, 256, 2, 1)],
+        ("unpooler", 128): [(1, 128, 1, 4), (0, 128, 1, 4)],
+        ("unpooler", 256): [(1, 256, 1, 2), (1, 256, 1, 1), (1, 128, 1, 4)],
+        ("o", 128): [(1, 128, 1, 4), (0, 128, 1, 4)],
+        ("o", 256): [(1, 256, 1, 1), (1, 128, 1, 4)],
+        # decode-32: x staged once per CTA (shared by its 4 warps) instead of re-read by every warp
+        ("o", 32): [(1, 32, 1, 4), (1, 32, 2, 4)],
+        ("unpooler", 32): [(1, 32, 1, 4), (1, 32, 2, 4)],
+        ("pooler", 32): [(1, 32, 2, 4), (1, 32, 4, 4)],
+        ("qkv_gate", 32): [(1, 32, 4, 4)],
+    }
+    if not sm90:   # local GPU: the mma.sync twin without clusters, for correctness
+        spec = {k: [(0, min(128, k[1]), 1, 4)] for k in spec}
+    out = {}
+    for (layer, m), lst in spec.items():
+        nu = LAYERS[layer][1] // 64
+        res = []
+        for wg, n, s, st in lst:
+            ku = nu // s
+            if nu % s or ku % 4 or 4 % st:
+                continue
+            res.append((wg, n, s, st, ku, (wg, n, ku, st, s)))
+        out[(layer, m)] = res
+    return out
+
+
+def _pt_call(r, x, n_out):
+    m, k = x.shape
+    out = torch.empty((m, n_out), dtype=torch.bfloat16, device=x.device)
+    nz = -(-m // r["n"])
+    r["mod"].pt_run(r["inst"], r["w"], r["esc"], x, out, m, k, n_out, r["tb"], r["nbx"], nz)
+    return out
+
+
+def _lt_search(state, mod, timer, floor, dev, budget_end, built=None, ptl=None, bases=None, mats=None):
+    """Routes at the exact timed m >= 128: pinned cuBLASLt algorithms, addmm, the GV bucket route (router) and the PT
+    kernels (P12 + wgmma / mma.sync). Every candidate is checked against FP64; the fastest is kept if it beats SGLang's
+    call by GV_MARGIN. Returns summary strings."""
     summary = []
     ws = torch.empty((LT_WS,), dtype=torch.uint8, device=dev)
+    ptpacks = {}
     for layer in ("qkv_gate", "o", "pooler", "unpooler", "router"):
         for m in LT_M:
             if time.time() > budget_end:
-                print(f"[gv1] LT {layer} m={m}: prepare budget exhausted -> skipped", flush=True)
+                print(f"[gv1] BIG {layer} m={m}: prepare budget exhausted -> skipped", flush=True)
                 continue
             router = layer == "router"
             n = 256 if router else LAYERS[layer][0]
             k = LAYERS[layer][1]
             w = state["router_hi"] if router else state[layer]
-            try:
-                code = int(mod.lt_plan(m, n, k, 1 if router else 0, LT_WS, LT_MAX_ALGOS))
-            except Exception as ex:  # noqa: BLE001
-                print(f"[gv1] LT {layer} m={m}: plan failed {ex!r}", flush=True)
-                continue
-            pid, cnt = code >> 8, code & 255
             x, probes = _test_input(m, k, 31337 + m, dev)
             ref = (x.double() @ (state["router"] if router else w).double().T).to(
                 torch.float32 if router else torch.bfloat16).double()
-            cands = []
-            for ai in range(cnt):
-                r = {"kind": "lt", "mod": mod, "pid": pid, "ai": ai, "w": w, "w2": state["router_lo"] if router else None,
-                     "ws": ws, "router": router, "desc": f"lt{ai}"}
+            cands, cnt = [], 0
+            if mod is not None:
                 try:
-                    got = _lt_call(r, x, n)
-                    torch.cuda.synchronize()
-                    ok, msg = _check(got, x, state["router"] if router else w, probes, router, ref,
-                                     None if router else 5e-3)
+                    code = int(mod.lt_plan(m, n, k, 1 if router else 0, LT_WS, LT_MAX_ALGOS))
+                    pid, cnt = code >> 8, code & 255
                 except Exception as ex:  # noqa: BLE001
-                    ok, msg = False, repr(ex)[:120]
-                if ok:
-                    cands.append(r)
+                    print(f"[gv1] LT {layer} m={m}: plan failed {ex!r}", flush=True)
+                for ai in range(cnt):
+                    r = {"kind": "lt", "mod": mod, "pid": pid, "ai": ai, "w": w,
+                         "w2": state["router_lo"] if router else None, "ws": ws, "router": router, "desc": f"lt{ai}"}
+                    try:
+                        got = _lt_call(r, x, n)
+                        torch.cuda.synchronize()
+                        ok, msg = _check(got, x, state["router"] if router else w, probes, router, ref,
+                                         None if router else 5e-3)
+                    except Exception as ex:  # noqa: BLE001
+                        ok, msg = False, repr(ex)[:120]
+                    if ok:
+                        cands.append(r)
             if not router:
                 bias = torch.zeros((n,), dtype=torch.bfloat16, device=dev)
                 r = {"kind": "addmm", "bias": bias, "wt": w.t(), "desc": "addmm0"}
@@ -1189,8 +1535,54 @@ def _lt_search(state, mod, timer, floor, dev, budget_end):
             gvr = state["routes"].get((layer, _bucket(layer, m)))
             if gvr is not None:
                 cands.append(gvr)
+            # PT: P12 plain-order pack (4 row tiles per CTA), bit-exact unpack, then outputs vs FP64 at m and 3m/4 + 1
+            for wg, nn, sp, st, ku, key in (ptl or {}).get((layer, m), []):
+                desc = f"pt{'W' if wg else 'M'}n{nn}s{sp}t{st}"
+                if built is None:
+                    continue
+                pmod = built
+                try:
+                    pinst = _PT_KEYS.index(key)
+                    info = pmod.pt_info(pinst)
+                    nrt = w.shape[0] // 16
+                    if info[1] > 64 or info[2] < 1:
+                        print(f"[gv1] PT {layer} m={m} {desc}: regs {info[0]} spill {info[1]} occ {info[2]} -> skipped",
+                              flush=True)
+                        continue
+                    pk_key = (layer, sp, ku)
+                    if pk_key not in ptpacks:
+                        pk = pack(w, 0, 4, 1, ku, sp, bases[layer], perm=False)
+                        un = torch.empty_like(w)
+                        pmod.gv_unpack(pk["w"], pk["esc"], un, 3, k, pk["G"], pk["nbx"], 4, 1, ku, pk["tb"])
+                        torch.cuda.synchronize()
+                        pk["ok"] = bool(torch.equal(un.view(torch.int16), w.view(torch.int16)))
+                        del un
+                        ptpacks[pk_key] = pk
+                        if not pk["ok"]:
+                            print(f"[gv1] PT {layer} S={sp}: pack NOT bit-exact -> PT off for it", flush=True)
+                    pk = ptpacks[pk_key]
+                    if not pk["ok"]:
+                        continue
+                    r = {"kind": "pt", "mod": pmod, "inst": pinst, "w": pk["w"], "esc": pk["esc"], "tb": pk["tb"],
+                         "nbx": nrt // 4, "n": nn, "desc": desc + f"r{info[0]}"}
+                    good = True
+                    for mm in (m, 3 * m // 4 + 1):
+                        xx, pp = (x, probes) if mm == m else _test_input(mm, k, 4711 + mm, dev)
+                        got = _pt_call(r, xx, n)
+                        got2 = _pt_call(r, xx, n)
+                        torch.cuda.synchronize()
+                        ok, msg = _check(got, xx, w, pp, False, ref if mm == m else None)
+                        ok = ok and bool(torch.equal(got, got2))
+                        if not ok:
+                            print(f"[gv1] PT SELF-TEST FAIL {layer} m={mm} {desc}: {msg}", flush=True)
+                            good = False
+                            break
+                    if good:
+                        cands.append(r)
+                except Exception as ex:  # noqa: BLE001
+                    print(f"[gv1] PT {layer} m={m} {desc}: EXC {repr(ex)[:300]}", flush=True)
             if not cands:
-                print(f"[gv1] LT {layer} m={m}: no algorithm passed ({cnt} tried)", flush=True)
+                print(f"[gv1] BIG {layer} m={m}: no candidate passed ({cnt} Lt algorithms tried)", flush=True)
                 continue
             # first pass: every candidate, few reps; second pass: the best 3 vs SGLang
             try:
@@ -1203,20 +1595,29 @@ def _lt_search(state, mod, timer, floor, dev, budget_end):
                 tt2 = timer.times([gs[0]] + [gs[i + 1] for i in order], GV_REPS)
                 timer.release()
             except Exception as ex:  # noqa: BLE001
-                print(f"[gv1] LT {layer} m={m}: timing failed {ex!r}", flush=True)
+                print(f"[gv1] BIG {layer} m={m}: timing failed {ex!r}", flush=True)
                 timer.release()
                 continue
             base = max(tt2[0] - floor, 0.1)
             best_i = min(range(len(top)), key=lambda i: tt2[i + 1])
             best, bt = top[best_i], max(tt2[best_i + 1] - floor, 0.1)
-            first = " ".join(f"{c['desc']}:{t - floor:.1f}" for c, t in sorted(zip(cands, tt[1:]), key=lambda z: z[1])[:6])
-            print(f"[gv1] LT {layer} m={m}: sgl {base:.2f} | best {best['desc']} {bt:.2f} | first pass {first}", flush=True)
+            if GV_FORCE_PT and any(c["kind"] == "pt" for c in cands):
+                best, bt = [c for c in cands if c["kind"] == "pt"][0], 0.1
+            first = " ".join(f"{c['desc']}:{t - floor:.1f}" for c, t in sorted(zip(cands, tt[1:]), key=lambda z: z[1])[:5])
+            pts = " ".join(f"{c['desc']}:{t - floor:.1f}" for c, t in zip(cands, tt[1:]) if c["kind"] == "pt")
+            print(f"[gv1] LT {layer} m={m}: sgl {base:.2f} | best {best['desc']} {bt:.2f} | first pass {first}"
+                  + (f" | PT {pts}" if pts else ""), flush=True)
             if bt <= GV_MARGIN * base:
                 state["exact"][(layer, m)] = best
                 summary.append(f"{layer}/m{m}: {best['kind']} {best['desc']} x{base / bt:.3f}")
             else:
-                state["why"][(layer, m)] = f"no Lt/GV route beats SGLang (best x{base / bt:.3f})"
+                state["why"][(layer, m)] = f"no Lt/GV/PT route beats SGLang (best x{base / bt:.3f})"
                 summary.append(f"{layer}/m{m}: SGLang (best x{base / bt:.3f})")
+    # keep only the PT packs a chosen route uses
+    used = {id(r["w"]) for r in state["exact"].values() if r["kind"] == "pt"}
+    for kk in list(ptpacks):
+        if id(ptpacks[kk]["w"]) not in used:
+            del ptpacks[kk]
     return summary
 
 
@@ -1301,8 +1702,19 @@ def prepare(weights):
                 allkeys.append(key)
             if key not in groups.setdefault(f"gv1_{layer}", []):
                 groups[f"gv1_{layer}"].append(key)
-    flags = ["-O3"]
-    one = _build_all({"gv1_all": allkeys}, flags)
+    # sm_90: compile the whole module for sm_90a (wgmma); an explicit gencode makes torch add no arch flags of its own
+    flags = ["-O3"] + (["-gencode=arch=compute_90a,code=sm_90a"] if cap == (9, 0) else [])
+    ptl = _pt_candidates(cap)
+    pt_keys = []
+    for lst in ptl.values():
+        for rt_ in lst:
+            if rt_[5] not in pt_keys:
+                pt_keys.append(rt_[5])
+    _PT_KEYS[:] = pt_keys
+    one = _build_all({"gv1_all": allkeys}, flags, {"gv1_all": pt_keys})
+    pt_mod = one["gv1_all"][0] if "gv1_all" in one else None
+    if pt_mod is None:
+        print("[gv1] FALLBACK PT routes off (single-module build failed)", flush=True)
     if "gv1_all" in one:
         built = {g: one["gv1_all"] for g in groups}
     else:   # a bad instantiation should only cost its own layer
@@ -1437,9 +1849,12 @@ def prepare(weights):
     if lt_thread is not None:
         lt_thread.join()
         if "mod" in lt_box:
-            summary += _lt_search(state, lt_box["mod"], timer, floor, dev, t_start + 270.0)
+            summary += _lt_search(state, lt_box["mod"], timer, floor, dev, t_start + 270.0, pt_mod, ptl, bases, mats)
         else:
             print(f"[gv1] FALLBACK cuBLASLt routes off (module build failed): {lt_box.get('err')}", flush=True)
+            summary += _lt_search(state, None, timer, floor, dev, t_start + 270.0, pt_mod, ptl, bases, mats)
+    else:
+        summary += _lt_search(state, None, timer, floor, dev, t_start + 270.0, pt_mod, ptl, bases, mats)
     # free packs that no route uses
     used = {id(r["w"]) for r in list(state["routes"].values()) + list(state["exact"].values()) if r["kind"] == "gv"}
     for kk in list(packs):
