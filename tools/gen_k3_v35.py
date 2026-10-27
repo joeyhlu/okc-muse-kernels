@@ -17,7 +17,7 @@ Composition (each step's patches assert they hit exactly once in their scope; th
 Checks: base sha1 pinned; step 1+2 reproduce x_4 except the documented master-switch line and the nonce; py_compile; ASCII;
 line 1; nonce; no duplicate top-level names; judge-checker scan (tools/gen_k3_fa.py SCAN) identical to the base; < 1 MB.
 
-    python -I tools/gen_k3_v35.py [--with-fa206] [--check]
+    python -I tools/gen_k3_v35.py [--with-fa206] [--strip] [--check]   # --with-fa206 implies --strip (k3_v35_fa.py)
 """
 import ast
 import hashlib
@@ -36,7 +36,9 @@ BASE = ROOT / "kernels/muse_decode_layer/k3_v34.py"
 BASE_SHA1 = "1d5e2a5ddee39134e4cb9960bf08884d61671d45"
 X4 = ROOT / ".claude/worktrees/explorer-baba5f/kernels/muse_decode_layer/x_4.py"   # reference (optional, checked when present)
 WITH_FA = "--with-fa206" in sys.argv
-OUT = ROOT / ("kernels/muse_decode_layer/k3_v35_fa.py" if WITH_FA else "kernels/muse_decode_layer/k3_v35.py")
+STRIP = "--strip" in sys.argv or WITH_FA   # PR206 needs it to fit < 1 MB (parent: keep the K2A fallbacks, strip comments instead)
+OUT = ROOT / ("kernels/muse_decode_layer/k3_v35_fa.py" if WITH_FA else
+              "kernels/muse_decode_layer/k3_v35_s.py" if STRIP else "kernels/muse_decode_layer/k3_v35.py")
 NONCE_OLD = "# nonce k3-v34-1 (k3_v19 + the v20 levers listed in tools/gen_k3_v20.py)"
 NONCE = ("# nonce k3-v35-1 (k3_v34 + explorer x_4 levers: SU1 at T=1, K3 trigger -> P1 unpooler at T=8, DG1 o at T=32; "
          "+ KW1 K2 hot weight 5 at T=128" + ("; + PR206 full verify B>=16" if WITH_FA else "") + ")")
@@ -114,6 +116,17 @@ def generate():
         rep.append("PR206 hook applied (fa206_patches.apply minus its nonce patch; every patch hit once)")
     check(text.count(NONCE_OLD) == 1, "base nonce line")
     text = text.replace(NONCE_OLD, NONCE)
+    if STRIP:   # tools/strip_layer.py: comments + docstrings only, license blocks and lines 1-2 kept, kernel strings untouched
+        import strip_layer
+        before = len(text.encode())
+        stripped = strip_layer.strip(text)
+        ok, msg = strip_layer.equivalent(text, stripped)
+        check(ok, f"strip: {msg}")
+        lic0 = [l for l in text.splitlines() if strip_layer.LICENSE.search(l)]
+        lic1 = [l for l in stripped.splitlines() if strip_layer.LICENSE.search(l)]
+        check(lic0 == lic1, "strip: license lines changed")
+        text = stripped
+        rep.append(f"stripped {before} -> {len(text.encode())} B; {msg}; {len(lic1)} license lines kept")
     return text, base, rep
 
 
@@ -133,7 +146,10 @@ def verify(text, base):
     dup = sorted({n for n in names if n and names.count(n) > 1})
     check(not dup, f"duplicate top-level names {dup}")
     s0, s1 = scan(base), scan(text)
-    check(s0 == s1, f"judge-checker scan differs: { {k: (s0[k], s1[k]) for k in s0 if s0[k] != s1[k]} }")
+    if STRIP:   # removing comments may only remove scan hits, never add one
+        check(all(s1[k] <= s0[k] for k in s0), f"judge-checker scan grew: { {k: (s0[k], s1[k]) for k in s0 if s1[k] > s0[k]} }")
+    else:
+        check(s0 == s1, f"judge-checker scan differs: { {k: (s0[k], s1[k]) for k in s0 if s0[k] != s1[k]} }")
     check(len(text.encode()) < 1_000_000, "file >= 1 MB")
     rep.append(f"compiles, ASCII, line 1, nonce, no duplicate names, checker scan == base, {len(text.encode())} B")
     return rep
