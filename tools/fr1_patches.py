@@ -32,6 +32,15 @@ def _line(text, head):
     return i, text.index("\n", i) + 1
 
 
+def apply_order(text):
+    """k3_v39 (parent 2026-10-27, after R15): _su1_prepare moved ahead of _p206_prepare (SBB1 already precedes both); no switch."""
+    a0, a1 = _line(text, P206_HEAD)
+    b0, b1 = _line(text, SU1_HEAD)
+    if b0 != a1:
+        _fail("_su1_prepare does not directly follow _p206_prepare")
+    return text[:a0] + text[b0:b1] + text[a0:a1] + text[b1:]
+
+
 def apply(text):
     for old, new in ((GEO_DEF_OLD, GEO_DEF_NEW), (GEO_USE_OLD, GEO_USE_NEW)):
         if text.count(old) != 1:
