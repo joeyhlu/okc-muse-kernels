@@ -1,5 +1,5 @@
 # okc: problem=muse_bf16_proj
-# nonce gv1-b (gv1 + P11 11-bit format at m <= 8, pinned cuBLASLt at m = 128 / 256, router buckets 128 / 256)
+# nonce gv1-c (gv1 + pinned cuBLASLt at m = 128 / 256 + router buckets 128 / 256; P11 parked after R-dense-1)
 """gv1: lossless 12-bit weight-streaming skinny GEMMs for the dense projections (M <= 32), cuBLAS (SGLang's own
 call) above that.
 
@@ -86,6 +86,11 @@ CANDIDATES = {
     ("router", 128): [(0, 4, 1, 4, 4, 1, 8, 0), (0, 4, 1, 8, 4, 1, 4, 0), (0, 4, 1, 8, 16, 1, 1, 0)],
     ("router", 256): [(0, 4, 1, 4, 4, 1, 8, 0), (0, 4, 1, 8, 4, 1, 4, 0), (0, 4, 1, 8, 16, 1, 1, 0)],
 }
+# P11 (fmt 2, 11-bit) is parked: R-dense-1 (H200 judge clone) measured it 19-87 % slower than P12 at m <= 8 (its escape
+# correction tail costs more than the 4.6 % bytes it saves). The code stays for reference; no fmt-2 kernel is built.
+P11_ENABLE = False
+if not P11_ENABLE:
+    CANDIDATES = {key: [r for r in v if r[0] != 2] for key, v in CANDIDATES.items()}
 TIMED_M = {1: 1, 8: 8, 16: 16, 32: 32, 128: 128, 256: 256}   # bucket -> the judge's timed m (router 128/256: slices)
 LAYERS = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096),
           "router": (256, 8192)}
