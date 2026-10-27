@@ -87,7 +87,7 @@ constexpr int SMEM = TAB_OFF + (int)sizeof(Tab);
 struct Args {
   const __nv_bfloat16* x; const int* ids; const float* wts; int M; int ls;
   const uint8_t* ws13; const uint8_t* ws2; const float* gsc13; const float* gsc2; const float* nw;
-  __nv_bfloat16* xA; __nv_bfloat16* xB; float* y; float* fix; int* cnt; int* xready; int* doneA; int* rmap;
+  __nv_bfloat16* xA; __nv_bfloat16* xB; float* y; float* fix; int* cnt; int* xready; int* doneA; int* rmap; int* gbar;
   __nv_bfloat16* out; int* err; long long* marks; unsigned long long magG; int flags;
 uint32_t cost[16]; unsigned long long mag[16];
 };
@@ -512,21 +512,39 @@ __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32
     const int wt = (wp << 5) | lane;
     const int slot = cta_of(T, PB, u << 4, gridDim.x);
     float* fb = A.fix + ((size_t)((PB * SLOTS + slot) * 4 + q)) * FIXW + wt * 4;
-#pragma unroll
-    for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);
-    bar_sync(1 + q, 128);
     int* fc = A.cnt + (PB * SLOTS + slot) * 4 + q;
-    if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);
-    bar_sync(1 + q, 128);
-    if (!T.wlast[q]) return;
-    fence_acq_rel();
+    const bool dm = (A.flags & 16) && (PB || (A.flags & 1));
+    if (dm && (PB ? s0 == 0 : s1 == 16)) {
+      if (wt == 0) wait_flag(fc, 16 - (s1 - s0), A.err);
+      bar_sync(1 + q, 128);
+      fence_acq_rel();
 #pragma unroll
-    for (int nt = 0; nt < N / 8; ++nt) {
-      const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
-      *reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
-      d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
+      for (int nt = 0; nt < N / 8; ++nt) {
+        const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
+        *reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+        d[4 * nt] += v.x; d[4 * nt + 1] += v.y; d[4 * nt + 2] += v.z; d[4 * nt + 3] += v.w;
+      }
+      if (wt == 0) *fc = 0;
+    } else {
+#pragma unroll
+      for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);
+      bar_sync(1 + q, 128);
+      if (dm) {
+        if (wt == 0) red_release_add(fc, s1 - s0);
+        return;
+      }
+      if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);
+      bar_sync(1 + q, 128);
+      if (!T.wlast[q]) return;
+      fence_acq_rel();
+#pragma unroll
+      for (int nt = 0; nt < N / 8; ++nt) {
+        const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
+        *reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+        d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
+      }
+      if (wt == 0) *fc = 0;
     }
-    if (wt == 0) *fc = 0;
   }
   epilogue<PB, N>(A, T, j, ub, q, wp, lane, d);
 }
@@ -556,59 +574,16 @@ __device__ __forceinline__ void phase(const Args& A, Tab& T, uint8_t* smem, uint
   }
 }
 
-__global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
-  extern __shared__ __align__(1024) uint8_t smem[];
-  Tab& T = *reinterpret_cast<Tab*>(smem + TAB_OFF);
-  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const uint32_t bars = sa(smem + BAR_OFF);
-  if (tid == 0) {
-    for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW); }
-    for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
-    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-    if (A.marks) A.marks[(size_t)blockIdx.x * 32] = gtime();
-  } else if (tid == 32 && (A.flags & 2)) {
-    const uint32_t tot = (uint32_t)A.M * (KDIM * 2), S = (mdiv(tot + gridDim.x - 1, A.magG) + 15u) & ~15u, off = blockIdx.x * S;
-    if (off < tot)
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
-                   "r"(min(S, tot - off)) : "memory");
-  }
-  int* hist = reinterpret_cast<int*>(smem + NS * US);
-  uint16_t* ent = reinterpret_cast<uint16_t*>(smem + NS * US + 4096);
-  route(A, T, hist, ent);
-  if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 7] = gtime();
-  if (warp >= NCW) {
-    if (warp == NCW) {
-      if (lane == 0) prod_w(A, T, sa(smem), bars);
-    } else {
-      bar_sync(6, 32 * NCW + 32);
-      if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
-    }
-    return;
-  }
-  gather(A, T, ent);
-  bar_arrive(6, 32 * NCW + 32);
-  if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 5] = gtime();
-  const int q = warp >> 2, wp = warp & 3;
-  int it = 0;
-  phase<false>(A, T, smem, bars, it, q, wp, lane);
-  if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * 32 + 6] = gtime();
-  phase<true>(A, T, smem, bars, it, q, wp, lane);
-  if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 1 + q] = gtime();
-}
+template <bool FUSED>
+__device__ __forceinline__ void fin_token(const Args& A, int t) {
 
-__global__ void __launch_bounds__(256) vm_fin(const Args A) {
   __shared__ int s_r[8];
   __shared__ float s_w[8];
   __shared__ float s_ss[8][8];
   __shared__ float s_fr[8];
-  const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  if (t == 0) {
-    for (int i = tid; i < JMAX; i += 256) A.xready[i] = 0;
-    for (int i = tid; i < JMAX * 16; i += 256) A.doneA[i] = 0;
-    for (int i = tid; i < 2 * SLOTS * 4; i += 256) A.cnt[i] = 0;
-  }
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   if (tid < 8) { s_r[tid] = A.rmap[t * 8 + tid]; s_w[tid] = __ldg(A.wts + t * 8 + tid); }
-  __syncthreads();
+  if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
   float ss[8];
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
@@ -632,13 +607,13 @@ __global__ void __launch_bounds__(256) vm_fin(const Args A) {
 #pragma unroll
     for (int k = 0; k < 8; ++k) s_ss[warp][k] = ss[k];
   }
-  __syncthreads();
+  if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
   if (tid < 8) {
     float s = 0.f;
     for (int w = 0; w < 8; ++w) s += s_ss[w][tid];
     s_fr[tid] = (s_r[tid] >= 0) ? rsqrtf(s * (1.f / 4096.f) + 1e-8f) * s_w[tid] : 0.f;
   }
-  __syncthreads();
+  if constexpr (FUSED) bar_sync(8, 256); else __syncthreads();
 #pragma unroll
   for (int m = 0; m < 4; ++m) {
     const int col = 1024 * m + 4 * tid;
@@ -660,6 +635,81 @@ __global__ void __launch_bounds__(256) vm_fin(const Args A) {
     *reinterpret_cast<uint2*>(A.out + (size_t)t * KDIM + col) = o;
   }
 }
+__device__ __forceinline__ void reset_counters(const Args& A, int tid, int nth) {
+  for (int i = tid; i < JMAX; i += nth) A.xready[i] = 0;
+  for (int i = tid; i < JMAX * 16; i += nth) A.doneA[i] = 0;
+  for (int i = tid; i < 2 * SLOTS * 4; i += nth) A.cnt[i] = 0;
+}
+__device__ __forceinline__ void grid_sync(const Args& A, int tid) {
+  bar_sync(5, 32 * NCW);
+  if (tid == 0) {
+    fence_acq_rel();
+    const int gen = ld_acquire(A.gbar + 1);
+    if (atom_acqrel_add(A.gbar, 1) == (int)gridDim.x - 1) {
+      A.gbar[0] = 0;
+      red_release_add(A.gbar + 1, 1);
+    } else {
+      const long long t0 = clock64();
+      while (ld_acquire(A.gbar + 1) == gen) {
+        __nanosleep(64);
+        if (clock64() - t0 > WAIT_BUDGET) { atomicExch(A.err, 3); break; }
+      }
+    }
+  }
+  bar_sync(5, 32 * NCW);
+}
+__global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
+  extern __shared__ __align__(1024) uint8_t smem[];
+  Tab& T = *reinterpret_cast<Tab*>(smem + TAB_OFF);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const uint32_t bars = sa(smem + BAR_OFF);
+  if (tid == 0) {
+    for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW); }
+    for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    if (A.marks) A.marks[(size_t)blockIdx.x * 32] = gtime();
+  } else if (tid == 32 && (A.flags & 2)) {
+    const uint32_t tot = (uint32_t)A.M * (KDIM * 2), S = (mdiv(tot + gridDim.x - 1, A.magG) + 15u) & ~15u, off = blockIdx.x * S;
+    if (off < tot)
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
+                   "r"(min(S, tot - off)) : "memory");
+  }
+  int* hist = reinterpret_cast<int*>(smem + NS * US);
+  uint16_t* ent = reinterpret_cast<uint16_t*>(smem + NS * US + 4096);
+  route(A, T, hist, ent);
+  if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 7] = gtime();
+  if (warp >= NCW) {
+    if (warp == NCW) {
+      if (A.flags & 4) bar_sync(7, 32 * NCW + 32);
+      if (lane == 0) prod_w(A, T, sa(smem), bars);
+    } else {
+      bar_sync(6, 32 * NCW + 32);
+      if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
+    }
+    return;
+  }
+  gather(A, T, ent);
+  bar_arrive(6, 32 * NCW + 32);
+  if (A.flags & 4) bar_arrive(7, 32 * NCW + 32);
+  if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 5] = gtime();
+  const int q = warp >> 2, wp = warp & 3;
+  int it = 0;
+  phase<false>(A, T, smem, bars, it, q, wp, lane);
+  if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * 32 + 6] = gtime();
+  phase<true>(A, T, smem, bars, it, q, wp, lane);
+  if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 32 + 1 + q] = gtime();
+  if (A.flags & 8) {
+    grid_sync(A, tid);
+    if (blockIdx.x == 0) reset_counters(A, tid, 32 * NCW);
+    if (warp < 8)
+      for (int t = blockIdx.x; t < A.M; t += gridDim.x) fin_token<true>(A, t);
+  }
+}
+
+__global__ void __launch_bounds__(256) vm_fin(const Args A) {
+  if (blockIdx.x == 0) reset_counters(A, threadIdx.x, 256);
+  fin_token<false>(A, blockIdx.x);
+}
 }
 
 void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V) {
@@ -671,7 +721,7 @@ void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V) {
   a.gsc13 = T[5].data_ptr<float>(); a.gsc2 = T[6].data_ptr<float>(); a.nw = T[7].data_ptr<float>();
   a.xA = reinterpret_cast<__nv_bfloat16*>(T[8].data_ptr()); a.xB = reinterpret_cast<__nv_bfloat16*>(T[9].data_ptr());
   a.y = T[10].data_ptr<float>(); a.fix = T[11].data_ptr<float>(); a.cnt = T[12].data_ptr<int>();
-  a.xready = T[13].data_ptr<int>(); a.doneA = T[14].data_ptr<int>(); a.rmap = T[15].data_ptr<int>();
+  a.xready = T[13].data_ptr<int>(); a.doneA = T[14].data_ptr<int>(); a.rmap = T[15].data_ptr<int>(); a.gbar = T[19].data_ptr<int>();
   a.out = reinterpret_cast<__nv_bfloat16*>(T[16].data_ptr()); a.err = T[17].data_ptr<int>();
   a.marks = T[18].numel() >= G * 32 ? reinterpret_cast<long long*>(T[18].data_ptr()) : nullptr;
   a.magG = (unsigned long long)V[3]; a.flags = (int)V[5];
@@ -682,7 +732,7 @@ void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V) {
     vm::vm_main<<<(int)G, vm::NTH, vm::SMEM, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  if (mask & 2) {
+  if ((mask & 2) && !(V[5] & 8)) {
     vm::vm_fin<<<(int)M, 256, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -716,10 +766,10 @@ def alloc(dev, G):
     return {"xA": z((xrows * KDIM,), torch.bfloat16), "xB": z((xrows * KDIM,), torch.bfloat16),
             "y": z((RMAX * KDIM,), torch.float32), "fix": z((2 * SLOTS * 4 * FIXW,), torch.float32),
             "cnt": z((2 * SLOTS * 4,)), "xready": z((JMAX,)), "doneA": z((JMAX * 16,)), "rmap": z((RMAX,)),
-            "err": z((4,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
+            "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
 
-FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows prefetched to L2 at kernel start
+FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, bit 3: in-launch finalize (grid barrier), bit 4: designated finishers (needs bit 0 in phase A)
 
 
 def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
@@ -729,6 +779,6 @@ def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None
     if out is None:
         out = torch.empty((m, KDIM), dtype=torch.bfloat16, device=x.device)
     mod.vml_run([x, ids, wts, k["ws13"], k["ws2"], k["gsc13"], k["gsc2"], k["nw"], sc["xA"], sc["xB"], sc["y"], sc["fix"],
-                 sc["cnt"], sc["xready"], sc["doneA"], sc["rmap"], out, sc["err"], sc["nomark"] if marks is None else marks],
+                 sc["cnt"], sc["xready"], sc["doneA"], sc["rmap"], out, sc["err"], sc["nomark"] if marks is None else marks, sc["gbar"]],
                 [m, ls, sc["G"], sc["magG"], mask, flags] + list(COST + COST if cost is None else cost))
     return out
