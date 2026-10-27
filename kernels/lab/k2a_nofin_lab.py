@@ -19,7 +19,8 @@ import k2a_fb_lab as F  # noqa: E402
 
 REC = F.REC
 _ORIG = F.patched_source   # captured before lab_source() swaps it
-PROBE = "    if (MODE == 2 && (P.hp & 32) != 0) return;   // NOFIN2 lab probe: no K2 split-item finalize (timing only)\n"
+PROBE = ("    if (MODE == 2 && (P.hp & 32) != 0) return;   // NOFIN2 lab probe: no K2 split-item finalize (timing only)\n"
+         "    if (MODE == 1 && (P.hp & 64) != 0) return;   // NOFIN1 lab probe (R13): no K1 split-item finalize (timing only)\n")
 ANCHORS = [
     ("__device__ void gemm(const Params& P, Route& S,", "__device__ __forceinline__ void setup_bars(",
      "  if (warp == 9) {\n    // ---------------- epilogue warp: split-item counters; the last contributor finishes the item ----------------\n"),
