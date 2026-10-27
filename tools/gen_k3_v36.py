@@ -34,9 +34,11 @@ import pt1_patches  # noqa: E402
 import strip_layer  # noqa: E402
 import tie1_patches  # noqa: E402
 import tl1_patches  # noqa: E402
+import rs1_patches  # noqa: E402
 
-OUT = ROOT / "kernels/muse_decode_layer/k3_v36.py"
-LAB = ROOT / "kernels/lab/k3_v36_ab.py"
+RS1 = "--rs1" in sys.argv   # lab only: + tools/rs1_patches.py (R-setup rider; A/B file kernels/lab/k3_v36_rs1_ab.py)
+OUT = ROOT / ("kernels/lab/k3_v36_rs1_ab.py" if RS1 else "kernels/muse_decode_layer/k3_v36.py")
+LAB = ROOT / ("kernels/lab/k3_v36_rs1_ab.py" if RS1 else "kernels/lab/k3_v36_ab.py")
 NONCE = ("# nonce k3-v36-1 (k3_v35_fa_pt1 [k3_v34 + x_4 levers + KW1 + PR206 + PT1] + TIE1 tie-tolerant top-8 self-tests + "
          "TL1 tail routing warp + K3P: K3B every bucket, K3 grid 4T at T>=128)")
 
@@ -64,6 +66,10 @@ def generate():
     text = k3p_patches.apply(text)
     check(text.count("k3_kernel_b(const Params P)") == 1 and text.count("| _k3p_bits(m))") == 3, "K3P anchors")
     rep.append("K3P applied (K3B kernel + 3 launches + 3 call sites + module globals)")
+    if RS1:
+        text = rs1_patches.apply(text)
+        check(text.count("(64 if RS1_ENABLE else 0)") == 2, "RS1 call sites")
+        rep.append("RS1 applied (tail_first / tail_first2 ballot, ranges36 lane-parallel, segs36 on warp 0; probe bit 6)")
     check(text.count(G.NONCE_OLD) == 1, "base nonce line")
     text = text.replace(G.NONCE_OLD, NONCE)
     before = len(text.encode())
