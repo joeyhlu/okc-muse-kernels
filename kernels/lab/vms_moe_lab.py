@@ -52,6 +52,8 @@ CUDA_SRC = r'''
 #endif
 #define VMS_DW ((VMS_FL & 64) != 0)
 #define VMS_SKT ((VMS_FL & 128) ? 16 : 8)
+#define VMS_CLK ((VMS_FL & 256) != 0)
+#define VMS_WSBL ((VMS_FL & 512) != 0 && !VMS_DW && VMS_SKT == 8)
 #define VMS_STAG ((VMS_FL & 16) ? 1 : (VMS_FL & 32) ? 2 : VMS_NS)
 
 namespace vms {
@@ -185,7 +187,7 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
   unsigned char* ring = smem + RING_OFF;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, c = blockIdx.x;
   const bool mk = p.marks != nullptr;
-  long long* mrow = p.marks + (size_t)c * 16;
+  long long* mrow = p.marks + (size_t)c * 64;
   if (tid == 0) {
     if (mk) mrow[0] = gt();
 #if __CUDA_ARCH__ >= 900
@@ -270,11 +272,17 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
 #endif
     int curj = -1;
     int sl = 0; uint32_t par = 0;
+#if VMS_CLK
+    long long ck[5] = {0, 0, 0, 0, 0};
+#endif
     for (int q = 0; q < N; ++q) {
       const bool PB = q >= nA;
       const int v = PB ? b0 + (q - nA) : a0 + q;
       const int j = PB ? (v >> 8) + 4096 : (v >> 9);
       if (j != curj) {
+#if VMS_CLK
+        const long long tsw = clock64();
+#endif
         curj = j;
         const int jj = PB ? j - 4096 : j;
         const int cnt = S.jC[jj], st = S.jS[jj];
@@ -322,6 +330,9 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
           }
         }
 #endif
+#if VMS_CLK
+        ck[4] += clock64() - tsw;
+#endif
       }
       if ((VMS_FL & 12) && q + 1 < N) {   // the next unit starts a new job: pull its x / inter fragments into L1 now
         const bool PB1 = q + 1 >= nA;
@@ -341,7 +352,14 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
           }
         }
       }
+#if VMS_CLK
+      const long long tq0 = clock64();
+#endif
       mbar_wait(&S.full[sl], par);
+#if VMS_CLK
+      const long long tq1 = clock64();
+      ck[0] += tq1 - tq0;
+#endif
       if (mk && tid == 0 && q == 0) mrow[2] = gt();
 #if VMS_STAG < VMS_NS && !(VMS_DW && __CUDA_ARCH__ < 900)
       if (q == 0) {
@@ -397,7 +415,15 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       o.z = acc[0][2] + acc[1][2] + acc[2][2] + acc[3][2];
       o.w = acc[0][3] + acc[1][3] + acc[2][3] + acc[3][3];
       const int bq = q & (NRB - 1);
+#if VMS_CLK
+      const long long tq2 = clock64();
+      ck[1] += tq2 - tq1;
+#endif
       mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));
+#if VMS_CLK
+      const long long tq3 = clock64();
+      ck[2] += tq3 - tq2;
+#endif
       S.red[bq][warp][lane] = o;
 #if VMS_SKT == 16
       if (two) {
@@ -414,17 +440,55 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       if (lane == 0) mbar_arrive(&S.pfull[bq]);   // the helper refills the slot once all NW warps are in
 #else
       cta_sync_compute();
+#if VMS_CLK
+      ck[3] += clock64() - tq3;
+#endif
       if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
         if (tid == 0)
 #endif
         issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
       }
+#if VMS_WSBL
+      if (q == N - 1 && PB) {
+        if (warp == 0) {
+          const int g = lane >> 2, t = lane & 3;
+          float4 sm = S.red[bq][0][lane];
+#pragma unroll
+          for (int w = 1; w < NW; ++w) { const float4 u = S.red[bq][w][lane]; sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w; }
+          const int vv = b0 + (q - nA), jb = vv >> 8, rb = vv & 255;
+          const int cnt = S.jC[jb], st = S.jS[jb];
+          const float gs = __ldg(p.gsB + S.jE[jb]);
+          const int n0 = rb * 16 + g;
+          const float w0 = __ldg(p.nw + n0) * gs, w1 = __ldg(p.nw + n0 + 8) * gs;
+          float* ssc = p.ss + (S.gen & 1) * MAXP;
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int tk = 2 * t + h;
+            const float y0 = (h ? sm.y : sm.x) * w0, y1 = (h ? sm.w : sm.z) * w1;
+            float sq = y0 * y0 + y1 * y1;
+            if (tk < cnt) {
+              p.ybuf[(size_t)(st + tk) * HD + n0] = y0;
+              p.ybuf[(size_t)(st + tk) * HD + n0 + 8] = y1;
+            }
+            sq += __shfl_xor_sync(0xffffffffu, sq, 4);
+            sq += __shfl_xor_sync(0xffffffffu, sq, 8);
+            sq += __shfl_xor_sync(0xffffffffu, sq, 16);
+            if (g == 0 && tk < cnt) atomicAdd(ssc + st + tk, sq);
+          }
+          __threadfence();
+        }
+      } else if (tid == 0) mbar_arrive(&S.pfull[bq]);
+#else
       if (tid == 0) mbar_arrive(&S.pfull[bq]);
+#endif
 #endif
       if (++sl == NS) { sl = 0; par ^= 1u; }
     }
     if (mk && tid == 0) mrow[5] = gt();
+#if VMS_CLK
+    if (mk && lane == 0) for (int k = 0; k < 5; ++k) mrow[16 + warp * 5 + k] = ck[k];
+#endif
   } else {
     // ================= helper warp: per-unit K reduction + epilogue
     const int g = lane >> 2, t = lane & 3;
@@ -433,9 +497,26 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
     for (int q = 0; q < NS && q < N; ++q) issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], lane, 32);
 #endif
     int hsl = 0;
-    for (int q = 0; q < N; ++q) {
+#if VMS_WSBL
+    const int NH = (N > nA) ? N - 1 : N;
+#else
+    const int NH = N;
+#endif
+#if VMS_CLK
+    long long hk[3] = {0, 0, 0};
+    long long th0 = clock64();
+#endif
+    for (int q = 0; q < NH; ++q) {
       const int bq = q & (NRB - 1);
+#if VMS_CLK
+      const long long th1 = clock64();
+      hk[1] += th1 - th0;
+#endif
       mbar_wait(&S.pfull[bq], (uint32_t)((q / NRB) & 1));
+#if VMS_CLK
+      th0 = clock64();
+      hk[0] += th0 - th1;
+#endif
 #if VMS_DW
       if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
@@ -507,7 +588,15 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
         }
       }
     }
+#if VMS_CLK
+    const long long th2 = clock64();
+    hk[1] += th2 - th0;
+#endif
     __threadfence();
+#if VMS_CLK
+    hk[2] = clock64() - th2;
+    if (mk && lane == 0) for (int k = 0; k < 3; ++k) mrow[56 + k] = hk[k];
+#endif
     if (mk && lane == 0) mrow[7] = gt();
   }
   __syncthreads();
