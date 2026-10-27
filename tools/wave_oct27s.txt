@@ -1,0 +1,6 @@
+muse_decode_layer kernels/muse_decode_layer/k3_v33_s1.py
+muse_decode_layer kernels/muse_decode_layer/k3_v34_s1.py
+muse_decode_layer kernels/muse_decode_layer/k3_v33_s2.py
+muse_decode_layer kernels/muse_decode_layer/k3_v34_s2.py
+muse_decode_layer kernels/muse_decode_layer/k3_v33_s3.py
+muse_decode_layer kernels/muse_decode_layer/k3_v34_s3.py
