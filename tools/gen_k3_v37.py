@@ -23,6 +23,7 @@ V38 = "--v38" in sys.argv   # k3_v38 = the R12 binary (FIN1 code present) with S
 FIN1 = "--fin1" in sys.argv or V38
 SS3 = "--ss3" in sys.argv or V38   # lab: + tools/ss3_patches.py (ss in K3, 4-CTA clusters; R12 A/B file)
 CHECK = "--check" in sys.argv
+FR1 = "--fr1" in sys.argv   # lab: + tools/fr1_patches.py (R15: fresh-review levers as call-time switches)
 PM8 = "--pm8" in sys.argv   # lab: + tools/pm8_patches.py (persistent T <= 8 MoE; component / in-layer A/B file)
 _argv, sys.argv = sys.argv, [sys.argv[0]]   # gen_k3_v35 reads its flags at import; library use only
 import gen_k3_v35 as G  # noqa: E402
@@ -30,6 +31,7 @@ sys.argv = _argv
 import fa206_patches  # noqa: E402
 import k3p_patches  # noqa: E402
 import kw1_patches  # noqa: E402
+import fr1_patches  # noqa: E402
 import pm8_patches  # noqa: E402
 import pt1_patches  # noqa: E402
 import rs1_patches  # noqa: E402
@@ -39,14 +41,14 @@ import strip_layer  # noqa: E402
 import tie1_patches  # noqa: E402
 import tl1_patches  # noqa: E402
 
-_LABNAME = "k3_v37" + ("_ss3" if SS3 else "") + ("_fin1" if FIN1 else "") + ("_pm8" if PM8 else "")
-OUT = ROOT / ("kernels/muse_decode_layer/k3_v38.py" if V38 else "kernels/muse_decode_layer/k3_v37.py" if not (SS3 or FIN1 or PM8)
+_LABNAME = "k3_v37" + ("_ss3" if SS3 else "") + ("_fin1" if FIN1 else "") + ("_pm8" if PM8 else "") + ("_fr1" if FR1 else "")
+OUT = ROOT / ("kernels/muse_decode_layer/k3_v38.py" if V38 else "kernels/muse_decode_layer/k3_v37.py" if not (SS3 or FIN1 or PM8 or FR1)
               else f"kernels/lab/{_LABNAME}_ab.py")
 LAB = ROOT / ("kernels/lab/k3_v38_ab.py" if V38 else f"kernels/lab/{_LABNAME}_ab.py")
 NONCE = ("# nonce k3-v38-1 (k3_v37 [k3_v36 + RS1 + SBB1] + SS3 ss in K3 via 4-CTA DSMEM clusters on; FIN1 code present, off)"
          if V38 else
          "# nonce k3-v37-1 (k3_v36 [v35_fa_pt1 + TIE1 + TL1 + K3P] + RS1 warp-parallel K2A setup + SBB1 attention boundary"
-         + (" + FIN1 vid-3 9-warp finalize" if FIN1 else "") + (" + PM8 persistent T<=8 MoE lab" if PM8 else "") + ")")
+         + (" + FIN1 vid-3 9-warp finalize" if FIN1 else "") + (" + PM8 persistent T<=8 MoE lab" if PM8 else "") + (" + FR1 fresh-review switches lab" if FR1 else "") + ")")
 
 
 def check(cond, msg):
@@ -77,6 +79,10 @@ def generate():
     text = sbb1_patches.apply(text)
     check(text.count("SBB1_ENABLE = True") == 1 and 'jobs.append(("sbb1", _sbb1_build))' in text, "SBB1 + PT1 job")
     rep.append("SBB1 applied (attention boundary, PT1 job)")
+    if FR1:
+        text = fr1_patches.apply(text)
+        check(text.count("FR1_P1_GEO.get(") == 1 and text.count("if FR1_SU1_FIRST:") == 1, "FR1 anchors")
+        rep.append("FR1 applied (call-time P1 geometry overrides; SU1 before PR206 in prepare)")
     if PM8:
         text = pm8_patches.apply(text)
         check(text.count("pm8_kernel(const Params P)") == 1 and text.count("    _pm8_prepare(state, weights)   #") == 1, "PM8 anchors")
