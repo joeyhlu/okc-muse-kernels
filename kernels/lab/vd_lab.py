@@ -244,10 +244,12 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
       mbar_init(rbar, 1);
       mbar_expect_tx(rbar, (uint32_t)((CL - 1) * (jhi - jlo) * C::NTH * 16));   // the peers' pushes of my blocks
     }
-    *reinterpret_cast<volatile int*>(gbase + C::CTR_OFF) = 0;
-    *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) = 0x7fffffff;
+    if (CL > 1 && (flags & F_DYN) != 0) {   // dynamic split only: a cluster-scope fence costs ~0.5 us at entry (R-vd-3)
+      *reinterpret_cast<volatile int*>(gbase + C::CTR_OFF) = 0;
+      *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) = 0x7fffffff;
+      asm volatile("fence.acq_rel.cluster;\n" ::: "memory");   // the counter init is visible before the cluster arrive
+    }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-    asm volatile("fence.acq_rel.cluster;\n" ::: "memory");   // the counter init is visible before the cluster arrive
   }
   __syncthreads();
   if constexpr (CL > 1) cluster_arrive_relaxed();   // phase 0: "my barriers are initialized" (waited before any push)
