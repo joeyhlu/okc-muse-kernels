@@ -25,7 +25,10 @@ def parse_routes(spec):
         if not item:
             continue
         lay, m, inst = item.split(":")
-        out.setdefault((lay, int(m)), []).append(tuple(int(v) for v in inst.split("-")))
+        fl = None
+        if "@" in inst:
+            inst, fl = inst.split("@")
+        out.setdefault((lay, int(m)), []).append((tuple(int(v) for v in inst.split("-")), None if fl is None else int(fl)))
     return out
 
 
@@ -37,7 +40,7 @@ VD_INSTS = @INSTS@
 VD_BOARD = @ROUTE@
 VD_CPP_SRC = @CPP@
 VD_CUDA_SRC = @CUDA@
-_VD = {"mod": None, "err": None, "w": {}, "errt": None}
+_VD = {"mod": None, "err": None, "errt": None}
 
 
 def _vd_build_job():
@@ -69,7 +72,7 @@ def _vd_pack(w, bm):
 
 
 def _vd_call(r, x, out):
-    r["mod"].vd_run(r["kid"], x, r["w"], r["w"], out, r["err"], r["stamps"], r["nrb"], r["w_rb"], r["w_s"], VD_FLAGS, 0, 0)
+    r["mod"].vd_run(r["kid"], x, r["w"], r["w"], out, r["err"], r["stamps"], r["nrb"], r["w_rb"], r["w_s"], r["flags"], 0, r["pf"])
 
 
 def _vd_cands(state, layer, m, w):
@@ -86,20 +89,23 @@ def _vd_cands(state, layer, m, w):
         _VD["errt"] = torch.zeros((4,), dtype=torch.int32, device=w.device)
         _VD["stt"] = torch.zeros((4,), dtype=torch.int64, device=w.device)
     out = []
-    for kid in VD_BOARD[(layer, m)]:
+    for kid, fl, pf in VD_BOARD[(layer, m)]:
         nwg, bn, nst, cl, f32, rbd = VD_INSTS[kid]
+        fl = VD_FLAGS if fl is None else fl
         bm = 64 * nwg
         if f32 or m > bn or w.shape[0] % bm or w.shape[1] % 64:
             continue
+        packs = state.setdefault("vd_w", {})   # per prepare() (never a module-level cache of weights)
         try:
-            if (layer, bm) not in _VD["w"]:
-                _VD["w"][(layer, bm)] = _vd_pack(w, bm)
+            if (layer, bm) not in packs:
+                packs[(layer, bm)] = _vd_pack(w, bm)
         except Exception as ex:  # noqa: BLE001
             print(f"[vd] {layer} pack bm {bm} failed: {ex!r}", flush=True)
             continue
-        flat, w_rb, w_s = _VD["w"][(layer, bm)]
+        flat, w_rb, w_s = packs[(layer, bm)]
         out.append({"kind": "vd", "mod": _VD["mod"], "kid": kid, "w": flat, "w_rb": w_rb, "w_s": w_s, "nrb": w.shape[0] // bm,
-                    "err": _VD["errt"], "stamps": _VD["stt"], "desc": f"vd{kid}(bm{bm},cl{cl},st{nst},rb{rbd})"})
+                    "err": _VD["errt"], "stamps": _VD["stt"], "flags": fl, "pf": pf,
+                    "desc": f"vd{kid}(bm{bm},cl{cl},st{nst},rb{rbd},f{fl},p{pf})"})
     return out
 
 '''
@@ -161,8 +167,8 @@ def main():
     routes = parse_routes(ARGS["routes"]) if "routes" in ARGS else DEFAULT_ROUTES
     assert routes, "no routes"
     L = _lab()
-    insts = sorted({i for v in routes.values() for i in v})
-    board = {k: [insts.index(i) for i in v] for k, v in sorted(routes.items())}
+    insts = sorted({i for v in routes.values() for i, _ in v})
+    board = {k: [(insts.index(i), fl, 0) for i, fl in v] for k, v in sorted(routes.items())}
     cuda = L.vd_cuda_src(insts)
     code = (PY_TMPL.replace("@INSTS@", repr(insts)).replace("@ROUTE@", repr(board))
             .replace("@CPP@", 'r"""' + L.VD_CPP_SRC + '"""').replace("@CUDA@", 'r"""' + cuda + '"""'))

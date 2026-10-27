@@ -1284,7 +1284,7 @@ def _build_lt(box):
 VD_ENABLE = True
 VD_FLAGS = 8   # L2 evict_first on the weight tiles (R-vd-2: >= neutral on every shape)
 VD_INSTS = [(1, 128, 8, 2, 0, 1), (1, 128, 8, 3, 0, 1), (1, 128, 9, 1, 0, 0), (2, 128, 6, 2, 0, 1)]
-VD_BOARD = {('o', 128): [2], ('pooler', 128): [0], ('qkv_gate', 128): [1], ('unpooler', 128): [3]}
+VD_BOARD = {('o', 128): [(2, None, 0)], ('pooler', 128): [(0, None, 0)], ('qkv_gate', 128): [(1, None, 0)], ('unpooler', 128): [(3, None, 0)]}
 VD_CPP_SRC = r"""
 #include <torch/extension.h>
 #include <vector>
@@ -1305,7 +1305,8 @@ VD_CUDA_SRC = r"""
 namespace vd {
 
 constexpr long long WAIT_BUDGET = 2000000000LL;   // ~1 s of clock64: a hang becomes err[0] = 1 (R9)
-enum : int { F_EXIT = 1, F_NOMMA = 2, F_NOX = 4, F_EFW = 8, F_ELX = 16, F_STAMP = 32, F_WMAP = 64, F_TRIG = 128, F_WAIT0 = 256 };
+enum : int { F_EXIT = 1, F_NOMMA = 2, F_NOX = 4, F_EFW = 8, F_ELX = 16, F_STAMP = 32, F_WMAP = 64, F_TRIG = 128, F_WAIT0 = 256,
+             F_DYN = 512 };
 
 struct Params {
   const uint8_t* w;          // packed tiles (bulk mode): tile (rb, s) at w + rb * w_rb + s * w_s (bytes)
@@ -1334,6 +1335,8 @@ struct Cfg {
   static constexpr int RB_OFF = RBD ? NST * SB : 0;
   static constexpr int BAR_OFF = NST * SB + (RBD ? RB_BYTES : 0);
   static constexpr int SMEM = 1024 + BAR_OFF + 16 * NST + 64;
+  static constexpr int CTR_OFF = BAR_OFF + 16 * NST + 8;    // dynamic split: stage counter (rank 0's is used)
+  static constexpr int ENDF_OFF = CTR_OFF + 4;               // dynamic split: ring index of this rank's end marker
   static constexpr int OB = F32 ? 4 : 2;           // output element bytes
   static constexpr int SROW = F32 ? (BM + 4) : (BM + 8);   // staging row pitch (elements), 16-B multiple
   static constexpr int S_OFF = RBD ? 0 : RB_BYTES;  // staging tile [owned tokens][BM] in the drained ring
@@ -1414,6 +1417,11 @@ __device__ __forceinline__ void st_async_f4(uint32_t raddr, float a, float b, fl
                :: "r"(raddr), "r"(__float_as_uint(a)), "r"(__float_as_uint(b)), "r"(__float_as_uint(c)), "r"(__float_as_uint(d)),
                   "r"(rbar) : "memory");
 }
+__device__ __forceinline__ int atom_add_cl(uint32_t raddr, int v) {
+  int old;
+  asm volatile("atom.relaxed.cluster.shared::cluster.add.u32 %0, [%1], %2;\n" : "=r"(old) : "r"(raddr), "r"(v) : "memory");
+  return old;
+}
 __device__ __forceinline__ bool mbar_try_cl(uint32_t b, uint32_t par) {
   uint32_t ok;
   asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n"
@@ -1474,13 +1482,18 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
       mbar_init(rbar, 1);
       mbar_expect_tx(rbar, (uint32_t)((CL - 1) * (jhi - jlo) * C::NTH * 16));   // the peers' pushes of my blocks
     }
+    *reinterpret_cast<volatile int*>(gbase + C::CTR_OFF) = 0;
+    *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) = 0x7fffffff;
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    asm volatile("fence.acq_rel.cluster;\n" ::: "memory");   // the counter init is visible before the cluster arrive
   }
   __syncthreads();
   if constexpr (CL > 1) cluster_arrive_relaxed();   // phase 0: "my barriers are initialized" (waited before any push)
 
+  const bool dyn = CL > 1 && (flags & F_DYN) != 0;
   if (warp == NWG * 4) {
     // ------------------------------------------------------------------ producer (one lane)
+    bool pw0 = false;   // lane 0 already did its phase-0 cluster wait (dynamic split)
     if (lane == 0) {
       const bool nox = (flags & F_NOX) != 0, wmap = (flags & F_WMAP) != 0;
       const bool efw = (flags & F_EFW) != 0, elx = (flags & F_ELX) != 0;
@@ -1504,6 +1517,7 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
         const int s = kst(i);
         if (elx) tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); else tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
       };
+      if (!dyn) {
       const int npro = nk < NST ? nk : NST;
       const int pf = P.pf < npro ? P.pf : npro;
 #pragma unroll 1
@@ -1529,11 +1543,66 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
         issue_x(i, dst, bar);
         issue_w(i, dst, bar);
       }
+      } else if constexpr (CL > 1) {
+        // dynamic split inside the cluster: rank r first takes stages r, r + CL, .. (NST of them, static), then claims the
+        // rest from a counter in rank 0's smem (DSMEM atomic, one claim ahead), so the ranks finish together; an end
+        // marker (ring index in smem + a plain arrive on that slot's full barrier) tells the consumers where the list ends
+        const int nkt = P.nks;
+        const int offd = P.rot > 0 ? (int)(((long long)rb * P.rot) % nkt) : 0;
+        auto ks = [&](int c) { int j = c + offd; if (j >= nkt) j -= nkt; return j; };
+        auto put_w = [&](int s, uint32_t dst, uint32_t bar) {
+          if (wmap) { if (efw) tma2d_h(dst, &tmw, s * 64, rb * C::BM, bar, pw); else tma2d(dst, &tmw, s * 64, rb * C::BM, bar); }
+          else { const void* src = wbase + (long long)s * P.w_s;
+                 if (efw) bulk_g2s_h(dst, src, C::WB, bar, pw); else bulk_g2s(dst, src, C::WB, bar); }
+        };
+        auto put_x = [&](int s, uint32_t dst, uint32_t bar) {
+          if (nox) return;
+          if (elx) tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); else tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
+        };
+        int npre = 0;
+        while (npre < NST && (int)crank + CL * npre < nkt) ++npre;
+        const int pf = P.pf < npre ? P.pf : npre;
+#pragma unroll 1
+        for (int i = 0; i < pf; ++i) { mbar_expect_tx(full0 + 8 * i, txb); put_w(ks((int)crank + CL * i), sbase + i * C::SB, full0 + 8 * i); }
+        pdl_wait();
+#pragma unroll 1
+        for (int i = 0; i < pf; ++i) put_x(ks((int)crank + CL * i), sbase + i * C::SB, full0 + 8 * i);
+#pragma unroll 1
+        for (int i = pf; i < npre; ++i) {
+          mbar_expect_tx(full0 + 8 * i, txb);
+          put_x(ks((int)crank + CL * i), sbase + i * C::SB, full0 + 8 * i);
+          put_w(ks((int)crank + CL * i), sbase + i * C::SB, full0 + 8 * i);
+        }
+        int iend = npre;
+        if (npre == NST) {
+          asm volatile("barrier.cluster.wait.acquire;\n" ::: "memory");   // phase 0: rank 0's counter is initialized
+          pw0 = true;
+          const uint32_t ctr = mapa(sbase + C::CTR_OFF, 0u);
+          int c = atom_add_cl(ctr, 1) + CL * NST;
+#pragma unroll 1
+          for (int i = NST; ; ++i) {
+            const int slot = i % NST;
+            mbar_wait(empty0 + 8 * slot, (uint32_t)(((i / NST) - 1) & 1), P.err, dead);
+            if (c >= nkt || dead) { iend = i; break; }
+            const int cn = atom_add_cl(ctr, 1) + CL * NST;   // claim ahead: its latency hides behind this stage's issue
+            const uint32_t dst = sbase + slot * C::SB, bar = full0 + 8 * slot;
+            mbar_expect_tx(bar, txb);
+            put_x(ks(c), dst, bar);
+            put_w(ks(c), dst, bar);
+            c = cn;
+          }
+        }
+        *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) = iend;
+        mbar_arrive(full0 + 8 * (iend % NST));                // release: the consumers read the marker after their wait
+      }
     }
     __syncwarp();
     if constexpr (CL > 1) {
-      cluster_wait();                                   // phase 0
-      if constexpr (!RBD) { cluster_arrive(); cluster_wait(); }   // phase 1: rings drained
+      if (!(lane == 0 && pw0)) asm volatile("barrier.cluster.wait.acquire;\n" ::: "memory");   // phase 0
+      if constexpr (!RBD) {   // phase 1: rings drained
+        asm volatile("barrier.cluster.arrive.release;\n" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire;\n" ::: "memory");
+      }
     }
     return;
   }
@@ -1547,9 +1616,10 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
   const bool w0 = (flags & F_WAIT0) != 0;
   unsigned long long t_first = 0;
 #pragma unroll 1
-  for (int i = 0; i < nk; ++i) {
+  for (int i = 0; dyn || i < nk; ++i) {
     const int slot = i % NST;
     mbar_wait(full0 + 8 * slot, (uint32_t)((i / NST) & 1), P.err, dead);
+    if (dyn && (i == *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) || dead)) break;   // this rank's end marker
     if (stamp && i == 0 && tid == 0) t_first = gtime();
     if (!nomma) {
       const uint32_t st = sbase + slot * C::SB;
@@ -1798,7 +1868,7 @@ std::vector<int64_t> vd_info(int64_t kid) {
   return {};
 }
 """
-_VD = {"mod": None, "err": None, "w": {}, "errt": None}
+_VD = {"mod": None, "err": None, "errt": None}
 
 
 def _vd_build_job():
@@ -1830,7 +1900,7 @@ def _vd_pack(w, bm):
 
 
 def _vd_call(r, x, out):
-    r["mod"].vd_run(r["kid"], x, r["w"], r["w"], out, r["err"], r["stamps"], r["nrb"], r["w_rb"], r["w_s"], VD_FLAGS, 0, 0)
+    r["mod"].vd_run(r["kid"], x, r["w"], r["w"], out, r["err"], r["stamps"], r["nrb"], r["w_rb"], r["w_s"], r["flags"], 0, r["pf"])
 
 
 def _vd_cands(state, layer, m, w):
@@ -1847,20 +1917,23 @@ def _vd_cands(state, layer, m, w):
         _VD["errt"] = torch.zeros((4,), dtype=torch.int32, device=w.device)
         _VD["stt"] = torch.zeros((4,), dtype=torch.int64, device=w.device)
     out = []
-    for kid in VD_BOARD[(layer, m)]:
+    for kid, fl, pf in VD_BOARD[(layer, m)]:
         nwg, bn, nst, cl, f32, rbd = VD_INSTS[kid]
+        fl = VD_FLAGS if fl is None else fl
         bm = 64 * nwg
         if f32 or m > bn or w.shape[0] % bm or w.shape[1] % 64:
             continue
+        packs = state.setdefault("vd_w", {})   # per prepare() (never a module-level cache of weights)
         try:
-            if (layer, bm) not in _VD["w"]:
-                _VD["w"][(layer, bm)] = _vd_pack(w, bm)
+            if (layer, bm) not in packs:
+                packs[(layer, bm)] = _vd_pack(w, bm)
         except Exception as ex:  # noqa: BLE001
             print(f"[vd] {layer} pack bm {bm} failed: {ex!r}", flush=True)
             continue
-        flat, w_rb, w_s = _VD["w"][(layer, bm)]
+        flat, w_rb, w_s = packs[(layer, bm)]
         out.append({"kind": "vd", "mod": _VD["mod"], "kid": kid, "w": flat, "w_rb": w_rb, "w_s": w_s, "nrb": w.shape[0] // bm,
-                    "err": _VD["errt"], "stamps": _VD["stt"], "desc": f"vd{kid}(bm{bm},cl{cl},st{nst},rb{rbd})"})
+                    "err": _VD["errt"], "stamps": _VD["stt"], "flags": fl, "pf": pf,
+                    "desc": f"vd{kid}(bm{bm},cl{cl},st{nst},rb{rbd},f{fl},p{pf})"})
     return out
 
 
