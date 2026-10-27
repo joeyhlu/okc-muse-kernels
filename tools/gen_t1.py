@@ -27,6 +27,8 @@ OUTS = (   # (tag, nonce, T1 patch, marks, paths). R-t1-1 killed the vid 7 fix (
      "t1", True, [ROOT / "kernels/lab/k3_t1m_ab.py"]),
     ("k3-t1p", "# nonce k3-t1p (LAB: k3_m32_3 + T1P0 W2 L2 prefetch from vid 0's K1 (T1_W2PF) + per-CTA marks in xw2's tail)",
      "t1p0", True, [ROOT / "kernels/lab/k3_t1p_ab.py"]),
+    ("k3-t1r", "# nonce k3-t1r (LAB: k3_m32_3 + raw per-CTA marks incl. SM arrival slot and first stage landed, R-t1-4)",
+     "none", "raw", [ROOT / "kernels/lab/k3_t1r_ab.py"]),
     # k3_m32_4 (k3_m32_3 + T1P0) was dropped: R-t1-2 measured T1P0 +3..+10 us at T=8 (killed).
 )
 
@@ -45,9 +47,9 @@ def main():
     rep = ["k3_m32_3 reproduced byte-identically"]
     for tag, nonce, which, marks, paths in OUTS:
         t = sk1_patches.apply_sk1(t2.replace(nonce2, nonce))
-        t = t1_patches.apply_t1(t) if which == "t1" else t1_patches.apply_t1p0(t)
+        t = t1_patches.apply_t1(t) if which == "t1" else (t1_patches.apply_t1p0(t) if which == "t1p0" else t)
         if marks:
-            t = t1_marks_patches.apply_marks(t)
+            t = t1_marks_patches.apply_marks(t, raw=(marks == "raw"))
         s = GM.finish(t, nonce, tag, base, rep)
         for p in paths:
             p.write_text(s, encoding="utf-8", newline="\n")

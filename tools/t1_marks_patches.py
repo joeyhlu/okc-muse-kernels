@@ -30,6 +30,13 @@ GEMM_HEAD = "template <int NC, int NST, int MODE, int HM, int STG, bool SKF = fa
 K3B_HEAD = "__global__ void __launch_bounds__(256) k3_kernel_b(const Params P) {"
 ENTRY = ("  if (T1M && threadIdx.x == 0) { unsigned sm; asm volatile(\"mov.u32 %%0, %%%%smid;\" : \"=r\"(sm)); "
          "t1m(P, %d, 0, sm); t1m(P, %d, 1, t1m_gt()); }\n")
+# raw (R-t1-4): + field 12 = arrival slot on the SM (atomicAdd on a per-SM counter at row 512 + smid of the kernel's block)
+ENTRY_RAW = ("  if (T1M && threadIdx.x == 0) { unsigned sm; asm volatile(\"mov.u32 %%0, %%%%smid;\" : \"=r\"(sm)); "
+             "t1m(P, %d, 0, sm); t1m(P, %d, 1, t1m_gt()); unsigned long long* ctr = reinterpret_cast<unsigned long long*>("
+             "P.xw2 + ((size_t)64 << 20)) + ((size_t)%d * 1024 + 512 + sm) * 16; t1m(P, %d, 12, (long long)atomicAdd(ctr, 1ull)); }\n")
+FIRST_LAND = ("      mbar_wait(full_a + 8 * slot, (it / NST) & 1, P.err);\n",
+              "      mbar_wait(full_a + 8 * slot, (it / NST) & 1, P.err);\n"
+              "      if (T1M && tid == 0 && it == 0) t1m(P, MODE - 1, 11, t1m_gt());   // R-t1-4: first stage landed\n")
 
 
 def _region(text, head, end, edits, what):
@@ -45,7 +52,8 @@ def _region(text, head, end, edits, what):
     return text[:a] + seg + text[b:]
 
 
-def apply_marks(text):
+def apply_marks(text, raw=False):
+    """raw (R-t1-4): + field 11 (first stage landed: consumer warp 0 past its first full wait) and 12 (arrival slot on the SM)."""
     if text.count(K33_HEAD) != 1:
         raise ValueError("marks: K2A33 head")
     k0 = text.index(K33_HEAD)
@@ -56,7 +64,7 @@ def apply_marks(text):
     src = src.replace(ROUTE_HEAD, HELPER + ROUTE_HEAD)
     t1m = "  constexpr bool T1M = (NC == 1 && !HOTCAP);\n"
     src = _region(src, K1_HEAD, "\n}\n", (
-        ("  pdl_launch();\n", "  pdl_launch();\n" + t1m + ENTRY % (0, 0)),
+        ("  pdl_launch();\n", "  pdl_launch();\n" + t1m + (ENTRY_RAW % (0, 0, 0, 0) if raw else ENTRY % (0, 0))),
         ("  if constexpr (!HOTCAP) pdl_wait();   // v4.7: K1 is a PDL secondary of the routing tail (vid 0 / 1)\n",
          "  if constexpr (!HOTCAP) pdl_wait();   // v4.7: K1 is a PDL secondary of the routing tail (vid 0 / 1)\n"
          "  if (T1M && threadIdx.x == 0) t1m(P, 0, 2, t1m_gt());\n"),
@@ -70,10 +78,12 @@ def apply_marks(text):
     K2G = next(g for g in ("    gemm<NC, NST, 2, 0, STG, SK1>(P, S, s_list, smem, bars, true, blockIdx.x, gridDim.x);\n",
                            "    gemm<NC, NST, 2, 0, STG>(P, S, s_list, smem, bars, true, blockIdx.x, gridDim.x);\n") if g in k2seg)
     src = _region(src, K2_HEAD, "\n}\n", (
-        ("  pdl_launch();\n", "  pdl_launch();\n" + t1m + ENTRY % (1, 1)),
+        ("  pdl_launch();\n", "  pdl_launch();\n" + t1m + (ENTRY_RAW % (1, 1, 1, 1) if raw else ENTRY % (1, 1))),
         (K2G, "    if (T1M && threadIdx.x == 0) t1m(P, 1, 3, t1m_gt());\n" + K2G
          + "    if (T1M && threadIdx.x == 0) t1m(P, 1, 6, t1m_gt());\n"),
     ), "k2")
+    if raw:
+        src = _region(src, GEMM_HEAD, "\n}\n", (FIRST_LAND,), "gemm first stage landed")
     src = _region(src, GEMM_HEAD, "\n}\n", (
         ("  constexpr bool HOTCAP = (HM == 1);\n", "  constexpr bool HOTCAP = (HM == 1);\n  constexpr bool T1M = (NC == 1 && HM == 0);\n"),
         ("          if (hint) bulk_g2s_ef(dst, src, SW, fb, pol);\n",
