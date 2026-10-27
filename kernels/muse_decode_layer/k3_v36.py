@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-v36-1 (k3_v35_fa_pt1 [k3_v34 + x_4 levers + KW1 + PR206 + PT1] + TIE1 tie-tolerant top-8 self-tests + K3P: K3B every bucket, K3 grid 4T at T>=128)
+# nonce k3-v36-1 (k3_v35_fa_pt1 [k3_v34 + x_4 levers + KW1 + PR206 + PT1] + TIE1 tie-tolerant top-8 self-tests + TL1 tail routing warp + K3P: K3B every bucket, K3 grid 4T at T>=128)
 
 from typing import TypedDict
 
@@ -3903,6 +3903,128 @@ __global__ void __launch_bounds__(NT) tail_kernel(
   }
 }
 
+// TL1 (tools/tl1_patches.py, study-b R-study-b-4): tail_kernel with the routing on a 17th warp, concurrent with the 16-warp
+// norm (named barrier 1), and each top-8 pick by one redux.sync (orderable-float key, lowest lane = lowest expert id on ties,
+// as the shuffle reduction): the same outputs as tail_kernel.
+template <bool Y32, int NSMAX>
+__global__ void __launch_bounds__(NT + 32) tail_kernel2(
+    const void* __restrict__ y, long y_ld, const float* __restrict__ la, const float* __restrict__ lb, long l_ld,
+    int ns, long sstride, const __nv_bfloat16* __restrict__ nw, const float* __restrict__ bias, const int* __restrict__ lstart,
+    __nv_bfloat16* __restrict__ xn, float* __restrict__ tw, int* __restrict__ tid, int* __restrict__ lid,
+    float eps, float mult, float rscale, float deps) {
+  const int t = blockIdx.x, tx = threadIdx.x, lane = tx & 31, warp = tx >> 5;
+  __shared__ float red[NT / 32];
+  if (warp == NT / 32) {
+    // routing warp: lane l holds experts 8l .. 8l+7
+    const float4* pbias = reinterpret_cast<const float4*>(bias) + lane * 2;
+    const float4 c0 = pbias[0], c1 = pbias[1];
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");   // v4.7: K2A's K1 may launch now
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    float4 qa[NSMAX][2];
+    float4 qb0 = make_float4(0.f, 0.f, 0.f, 0.f), qb1 = qb0;
+#pragma unroll
+    for (int q = 0; q < NSMAX; ++q) {
+      if (q < ns) {
+        const float4* pq = reinterpret_cast<const float4*>(la + q * sstride + (long)t * l_ld) + lane * 2;
+        qa[q][0] = pq[0];
+        qa[q][1] = pq[1];
+      } else {
+        qa[q][0] = make_float4(0.f, 0.f, 0.f, 0.f);
+        qa[q][1] = qa[q][0];
+      }
+    }
+    if (lb != nullptr) {
+      const float4* pb = reinterpret_cast<const float4*>(lb + (long)t * l_ld) + lane * 2;
+      qb0 = pb[0];
+      qb1 = pb[1];
+    }
+    float s[8], b[8];
+    float4 a0 = qa[0][0], a1 = qa[0][1];
+#pragma unroll
+    for (int q = 1; q < NSMAX; ++q) {   // FP32 split-K partials summed in a fixed order (zeros past ns)
+      a0.x += qa[q][0].x; a0.y += qa[q][0].y; a0.z += qa[q][0].z; a0.w += qa[q][0].w;
+      a1.x += qa[q][1].x; a1.y += qa[q][1].y; a1.z += qa[q][1].z; a1.w += qa[q][1].w;
+    }
+    a0.x += qb0.x; a0.y += qb0.y; a0.z += qb0.z; a0.w += qb0.w; a1.x += qb1.x; a1.y += qb1.y; a1.z += qb1.z; a1.w += qb1.w;
+    const float lg[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    const float bs[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      s[j] = 1.f / (1.f + expf(-lg[j] * mult));
+      b[j] = s[j] + bs[j];
+    }
+    int sel_id[TK];
+    float sel_s[TK];
+#pragma unroll
+    for (int k = 0; k < TK; ++k) {
+      float bv = b[0], sv = s[0];
+      int bj = 0;
+#pragma unroll
+      for (int j = 1; j < 8; ++j)
+        if (b[j] > bv) { bv = b[j]; sv = s[j]; bj = j; }
+      const unsigned u = __float_as_uint(bv + 0.f);   // -0 -> +0: equal floats get equal keys
+      const unsigned key = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+      const unsigned mx = __reduce_max_sync(0xffffffffu, key);
+      const int owner = __ffs(__ballot_sync(0xffffffffu, key == mx)) - 1;
+      sel_id[k] = __shfl_sync(0xffffffffu, lane * 8 + bj, owner);
+      sel_s[k] = __shfl_sync(0xffffffffu, sv, owner);
+      if (lane == owner) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          if (j == bj) b[j] = -INFINITY;
+      }
+    }
+    if (lane == 0) {
+      float sum = 0.f;
+#pragma unroll
+      for (int i = 0; i < TK; ++i) sum += sel_s[i];
+      const float inv = rscale / (sum + deps);
+      const int ls = lstart[0];
+#pragma unroll
+      for (int k = 0; k < TK; ++k) {
+        tw[t * TK + k] = sel_s[k] * inv;
+        tid[t * TK + k] = sel_id[k];
+        const int rel = ((sel_id[k] - ls) % NE + NE) % NE;
+        lid[t * TK + k] = rel < 32 ? rel : -1;
+      }
+    }
+    return;
+  }
+  // norm warps 0..15 (8 elements of the row each)
+  const uint4 wq = *(reinterpret_cast<const uint4*>(nw) + tx);
+  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  float v[8];
+  if (Y32) {
+    const float4* p = reinterpret_cast<const float4*>(reinterpret_cast<const float*>(y) + (long)t * y_ld) + tx * 2;
+    const float4 a = p[0], c = p[1];
+    v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = c.x; v[5] = c.y; v[6] = c.z; v[7] = c.w;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = __bfloat162float(__float2bfloat16(v[i]));
+  } else {
+    const uint4 q = *(reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(y) + (long)t * y_ld) + tx);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&q);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = __bfloat162float(h[i]);
+  }
+  float ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) ss += v[i] * v[i];
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if (lane == 0) red[warp] = ss;
+  asm volatile("bar.sync 1, %0;\n" ::"r"(NT) : "memory");   // the 16 norm warps only
+  float tot = 0.f;
+#pragma unroll
+  for (int i = 0; i < NT / 32; ++i) tot += red[i];
+  const float rstd = rsqrtf(tot / (float)D + eps);
+  const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wq);
+  __align__(16) __nv_bfloat16 o8[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o8[i] = __float2bfloat16((v[i] * rstd) * __bfloat162float(w[i]));
+  *(reinterpret_cast<uint4*>(xn + (long)t * D) + tx) = *reinterpret_cast<const uint4*>(o8);
+}
+
 // T <= 8 router, exactly SGLang's precision regime: FP32 activations (the boundary's FP32 router input) x FP32
 // weight, FP32 accumulation. x [m <= 8, 8192], w [256, 8192] -> part [8 (K slices), m, 256]; the tail sums the
 // 8 slices in order (deterministic, no atomics, no counters). grid (32, 8) x 256 threads: warp = one router row,
@@ -3990,29 +4112,29 @@ void v8_tail(torch::Tensor y, torch::Tensor lg, int64_t la_off, int64_t lb_off, 
   const auto* wp = reinterpret_cast<const __nv_bfloat16*>(nw.data_ptr());
   cudaLaunchAttribute at[1];
   at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  at[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+  at[0].val.programmaticStreamSerializationAllowed = (pdl & 1) ? 1 : 0;
   cudaLaunchConfig_t lc = {};
   lc.gridDim = dim3(T);
-  lc.blockDim = dim3(v8::NT);
+  lc.blockDim = dim3((pdl & 2) ? v8::NT + 32 : v8::NT);   // TL1
   lc.dynamicSmemBytes = 0;
   lc.stream = st;
   lc.attrs = at;
   lc.numAttrs = 1;
   if (y.scalar_type() == at::kFloat)
-    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, v8::tail_kernel<true, 8>, y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
+    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 8> : v8::tail_kernel<true, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps));
-      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, v8::tail_kernel<true, 1>, y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 1> : v8::tail_kernel<true, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps)); }
   else
-    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, v8::tail_kernel<false, 8>, y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
+    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 8> : v8::tail_kernel<false, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps));
-      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, v8::tail_kernel<false, 1>, y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 1> : v8::tail_kernel<false, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps)); }
@@ -4045,7 +4167,7 @@ def _v8_tail(y, logits, state, data):
     else:
         lg, la, lb, l_ld = logits, 0, -1, logits.stride(0)
     v8["mod"].v8_tail(y, lg, la, lb, l_ld, ns, sstride, v8["nw"], v8["bias"], data["local_start"], xn, tw, tid, lid,
-                      RMS_EPS, 0.1767766952966369, 1.0, 1e-15, 1 if V9_TAIL_PDL else 0)
+                      RMS_EPS, 0.1767766952966369, 1.0, 1e-15, (1 if V9_TAIL_PDL else 0) | (2 if TL1_TAIL2 else 0))
     return xn, tw, tid, lid
 
 
@@ -4151,6 +4273,31 @@ def _v8_tail_prepare(weights, state):
     except Exception as ex:
         print(f"[v8] tail self-test FAILED -> k3_v07 path: {ex!r}", flush=True)
         return None
+    global TL1_TAIL2
+    if TL1_TAIL2:
+        try:
+            gen2 = torch.Generator(device=dev).manual_seed(4343)
+            same = True
+            for T, ls in ((1, 0), (8, 64), (16, 224), (33, 32), (128, 96), (256, 160)):
+                x = (torch.randn((T, HIDDEN), generator=gen2, device=dev) * 0.5).to(torch.bfloat16)
+                d = {"local_start": torch.tensor([ls], dtype=torch.int32, device=dev)}
+                y = torch.mm(x, v8["wcat"].t(), out_dtype=torch.float32)
+                lg2 = (y[:, D_EXPERT:D_EXPERT + N_EXPERTS] + y[:, D_EXPERT + N_EXPERTS:]).contiguous()
+                part2 = (lg2.unsqueeze(0).repeat(8, 1, 1) * 0.125).contiguous()
+                pool2 = y[:, :D_EXPERT].to(torch.bfloat16).contiguous()
+                for yy, ll in ((y, None), (y, part2), (pool2, lg2), (pool2, part2)):
+                    outs = []
+                    for flag in (True, False):
+                        TL1_TAIL2 = flag
+                        outs.append([a.clone() for a in _v8_tail(yy, ll, {"v8": v8}, d)])
+                    torch.cuda.synchronize()
+                    same = same and all(bool(torch.equal(a, b)) for a, b in zip(outs[0], outs[1]))
+            TL1_TAIL2 = same
+            print(f"[tl1] tail_kernel2 == tail_kernel bitwise on 6 shapes x 4 variants: {same} -> "
+                  f"{'tail_kernel2' if same else 'tail_kernel'}", flush=True)
+        except Exception as ex:
+            TL1_TAIL2 = False
+            print(f"[tl1] tail_kernel2 check raised -> tail_kernel: {ex!r}", flush=True)
     print(f"[v8] tail ready in {time.time() - t0:.1f}s; route {V8_TAIL_ROUTE}", flush=True)
     return v8
 
@@ -18631,6 +18778,10 @@ def _k3_disable(state, key, value, piece, ex):
     if piece not in _K3_WARNED:
         _K3_WARNED.add(piece)
         print(f"[k3] {piece} raised at call time, r1 path from now on: {ex!r}", flush=True)
+
+
+
+TL1_TAIL2 = True
 
 
 

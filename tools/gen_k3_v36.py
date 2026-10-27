@@ -1,10 +1,13 @@
-"""gen_k3_v36.py: kernels/muse_decode_layer/k3_v36.py = k3_v35_fa_pt1 + TIE1 + K3P (K3B every bucket, K3 grid 4T at T >= 128).
+"""gen_k3_v36.py: kernels/muse_decode_layer/k3_v36.py = k3_v35_fa_pt1 + TIE1 + TL1 + K3P (K3B every bucket, K3 grid 4T at
+T >= 128).
 
 Composition (each step asserts its anchors hit exactly once in their scope; the steps touch different code paths):
   1. k3_v35_fa_pt1's chain, unstripped (tools/gen_k3_v35.py): k3_v34 -> su1 + su1b + x_4 config -> KW1 -> PR206 (fa206_patches
      minus its nonce) -> PT1.
   2. tools/tie1_patches.py: tie-tolerant top-8 checks in the v8 tail / router32 self-tests (cd12f343 root cause).
-  3. tools/k3p_patches.py: study-b's K3B in every bucket + K3 grid 4T at buckets 128 / 256 (R-study-b-3).
+  3. tools/tl1_patches.py: study-b's tail_kernel2 (routing warp concurrent with the norm, redux picks; R-study-b-4), default
+     on, checked bitwise against tail_kernel in prepare after the (TIE1) tail self-tests, which now run through it.
+  4. tools/k3p_patches.py: study-b's K3B in every bucket + K3 grid 4T at buckets 128 / 256 (R-study-b-3).
   (WF, R-explorer-5: killed, not included.)
 Then the nonce, tools/strip_layer.py (comments + docstrings only; AST-equivalent; license lines and lines 1-2 kept; kernel
 strings untouched) and gen_k3_v35's checks: compiles, ASCII, line 1, nonce, no duplicate names, judge-checker scan <= base,
@@ -30,11 +33,12 @@ import kw1_patches  # noqa: E402
 import pt1_patches  # noqa: E402
 import strip_layer  # noqa: E402
 import tie1_patches  # noqa: E402
+import tl1_patches  # noqa: E402
 
 OUT = ROOT / "kernels/muse_decode_layer/k3_v36.py"
 LAB = ROOT / "kernels/lab/k3_v36_ab.py"
 NONCE = ("# nonce k3-v36-1 (k3_v35_fa_pt1 [k3_v34 + x_4 levers + KW1 + PR206 + PT1] + TIE1 tie-tolerant top-8 self-tests + "
-         "K3P: K3B every bucket, K3 grid 4T at T>=128)")
+         "TL1 tail routing warp + K3P: K3B every bucket, K3 grid 4T at T>=128)")
 
 
 def check(cond, msg):
@@ -53,6 +57,10 @@ def generate():
     rep.append("v35_fa_pt1 chain: su1 + su1b + x_4 config + KW1 + PR206 (minus its nonce) + PT1")
     text = tie1_patches.apply(text)
     rep.append(f"TIE1 applied ({len(tie1_patches.PATCHES)} patches hit once)")
+    text = tl1_patches.apply(text)
+    check(text.count("tail_kernel2(") == 1 and text.count("(2 if TL1_TAIL2 else 0)") == 1 and text.count("[tl1] tail_kernel2 ==") == 1,
+          "TL1 anchors")
+    rep.append("TL1 applied (tail_kernel2 + 6 host edits + _v8_tail pdl bit + prepare bitwise check + TL1_TAIL2)")
     text = k3p_patches.apply(text)
     check(text.count("k3_kernel_b(const Params P)") == 1 and text.count("| _k3p_bits(m))") == 3, "K3P anchors")
     rep.append("K3P applied (K3B kernel + 3 launches + 3 call sites + module globals)")
