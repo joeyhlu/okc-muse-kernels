@@ -12,6 +12,7 @@ Three kernels in one stream, standard PDL, today's attention kernel kept (emulat
              BEFORE griddepcontrol.wait (under KS1's chain); after the wait: o, ONE moments release + spin, s1 / h, ONE
              release + spin, router red.add.v4 (one batch), pooler split-K 4 with per-granule red.add (no fence), ONE
              release + spin, the routing-tail read (logits + p), exit. The last CTA resets counters.
+Attempt 2 (2026-10-27): max SMEM carveout on all three kernels; the stand-in spins on %globaltimer (wall ns).
 MODE 0: null consumers, no waits / epilogues (the pure two-kernel stream). MODE 1: + every dependency, null consumers.
 MODE 2: MODE 1 + P1's 12-bit decode + mma.sync instruction stream on the staged slots (router slots: T FMAs per float).
 Bounded waits (err flags, no trap). Marks (%globaltimer) per CTA when marks != nullptr.
@@ -215,8 +216,9 @@ __global__ void __launch_bounds__(256, 2) ks1e_probe(const __grid_constant__ PE 
 #pragma unroll
   for (int k = 0; k < 16; ++k) acc ^= kv[k].x ^ kv[k].y ^ kv[k].z ^ kv[k].w;
   acc ^= sm[(tid * 7) & 255];
-  const long long t0 = clock64();
-  while (clock64() - t0 < p.spin) {}
+  const long long c0 = clock64(), g0 = gt();
+  while (gt() - g0 < p.spin) {}
+  if (tid == 0 && mk) { mk[3] = clock64() - c0; mk[4] = gt() - g0; }
   if (cta == 0) {
     for (int k = tid; k < p.T * 1024; k += 256)
       p.oin[k] = __float2bfloat16_rn(__bfloat162float(p.qkvb[(size_t)(k / 1024) * 2304 + 1280 + (k % 1024)]) + (acc == 0x12345678u ? 1.f : 0.f));
@@ -376,6 +378,7 @@ __global__ void __launch_bounds__(NT, 2) f2b_probe(const __grid_constant__ PB p)
 
 template <typename K> static void set_smem(K k, int bytes) {
   C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+  C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared));
 }
 template <int NSLOT, int AB> constexpr int smem_c() { return NSLOT * SLOT + AB + NCW * 512 + (2 * NSLOT + 2) * 8; }
 template <typename K, typename P> static void launch(K k, dim3 grid, int threads, int smem, const P& prm, bool pdl, cudaStream_t st) {
@@ -385,6 +388,8 @@ template <typename K, typename P> static void launch(K k, dim3 grid, int threads
   at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   at[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
+  static bool once = false;
+  if (!once) { set_smem(k, smem); once = true; }
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k, prm));
 }
 template <typename K> static void attrs_of(K k, int threads, int smem, std::vector<int64_t>& v) {
