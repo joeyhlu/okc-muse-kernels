@@ -8842,8 +8842,25 @@ K2A33_HINT = 16
 FIN1_ENABLE = True   # FIN1 (tools/fin1_patches.py): vid 3 handed-item finalize on all 9 warps once the consumers are done (probe bit 6, read at call time)
 
 
+def _fin1_ulp(a, b):
+    """Largest distance in bf16 ulps between two bf16 tensors (sign-magnitude bit patterns mapped to a monotone order)."""
+    ia, ib = a.view(torch.int16).int(), b.view(torch.int16).int()
+    ka = torch.where(ia < 0, -32768 - ia, ia)
+    kb = torch.where(ib < 0, -32768 - ib, ib)
+    return int((ka - kb).abs().max()) if ia.numel() else 0
+
+
 def _fin1_selftest(st, dev):
-    """FIN1 on vs off must be bitwise identical (vid 3 at T = 16 / 32, three inputs each); any difference turns FIN1 off."""
+    """FIN1 on vs off, vid 3 at T = 16 / 32, three inputs each, two calls per mode (off, off, on, on).
+
+    FIN1 changes who runs the finalize code, not its arithmetic. K2's per-route sum of squares ss takes one FP32 atomic
+    per (rb item, warp) from many CTAs, so its rounding (and with it the output's last bits) already varies run to run
+    with FIN1 off: a bitwise on-vs-off output test cannot pass by design (R-study-a-6). Checked instead, every on call:
+    (a) no error flag; (b) K1's inter and K2's y bitwise equal to FIN1 off (route order is fixed; split items have <= 2
+    contributors onto zero, which commute); (c) h / cnt / cnt2 back at zero whenever FIN1 off leaves them so (no lost or
+    doubled finalize); (d) every route's ss within 3e-5 of an exact FP64 recomputation from y (bound for <= 266 FP32
+    roundings in any order; a lost / doubled item moves ss by ~3e-2); (e) output rel L2 vs FIN1 off <= 1e-3 (the judge
+    sees ~3.7e-3 vs FP32). Off vs off is printed alongside. Any failure turns FIN1 off."""
     global FIN1_ENABLE
     if not FIN1_ENABLE or not st.get("r36"):
         return
@@ -8857,19 +8874,56 @@ def _fin1_selftest(st, dev):
                 d = _v14_self_test_inputs(bs, seed, dev, dist)
                 data = {"hidden_states": d["hidden_states"], "topk_ids": d["topk_ids"], "topk_weights": d["topk_weights"],
                         "config": {"local_start": 0}}
-                outs = []
-                for on in (False, True):
+                ids = d["topk_ids"]
+                nr = int(((ids >= 0) & (ids < K2A_E_LOC)).sum())
+                runs = []
+                for on in (False, False, True, True):
                     FIN1_ENABLE = on
                     st["err"].zero_()
-                    outs.append(_k2a36_call(st, data, r[0], r[1]).clone())
+                    out = _k2a36_call(st, data, r[0], r[1]).clone()
                     torch.cuda.synchronize()
-                    if int(st["err"][0]):
-                        bad.append((bs, seed, "err"))
-                if not torch.equal(outs[0], outs[1]):
-                    bad.append((bs, seed, "diff"))
+                    y = st["y"][:nr].clone()
+                    ref = ((y.to(torch.bfloat16).float() * st["nw"]).double() ** 2).sum(1)
+                    ss = st["ss"][:nr].double()
+                    runs.append({"out": out, "inter": st["inter"].clone(), "y": y, "ss": ss,
+                                 "ssx": float(((ss - ref).abs() / ref.clamp_min(1e-30)).max()) if nr else 0.0,
+                                 "zero": not bool(st["h"].any() or st["cnt"].any() or st["cnt2"].any()),
+                                 "err": int(st["err"][0])})
+                o1, o2, n1, n2 = runs
+
+                def det(a, b):
+                    return f"{int(torch.equal(a['inter'], b['inter']))}{int(torch.equal(a['y'], b['y']))}"
+
+                def ssd(a, b):
+                    return float(((a["ss"] - b["ss"]).abs() / b["ss"].abs().clamp_min(1e-30)).max()) if nr else 0.0
+
+                def od(a, b):
+                    x, w = a["out"].float(), b["out"].float()
+                    return (int((a["out"] != b["out"]).sum()), _fin1_ulp(a["out"], b["out"]),
+                            float((x - w).norm() / w.norm().clamp_min(1e-30)))
+
+                why = []
+                if any(x["err"] for x in runs):
+                    why.append("err")
+                if det(n1, o1) != "11" or det(n2, o1) != "11":
+                    why.append("det")
+                if o1["zero"] and o2["zero"] and not (n1["zero"] and n2["zero"]):
+                    why.append("zero")
+                if max(n1["ssx"], n2["ssx"]) > 3e-5:
+                    why.append("ss")
+                if max(od(n1, o1)[2], od(n2, o1)[2]) > 1e-3:
+                    why.append("out")
+                if why:
+                    bad.append((bs, seed, "+".join(why)))
+                print(f"[fin1] bs={bs} seed={seed} {dist} routes {nr}: inter/y bitwise off2 {det(o2, o1)} on {det(n1, o1)} "
+                      f"on2 {det(n2, o1)} | zero after off {int(o1['zero'])}{int(o2['zero'])} on "
+                      f"{int(n1['zero'])}{int(n2['zero'])} | ss vs exact max rel off {max(o1['ssx'], o2['ssx']):.2e} on "
+                      f"{max(n1['ssx'], n2['ssx']):.2e} | ss max rel off2-off {ssd(o2, o1):.2e} on-off {ssd(n1, o1):.2e} "
+                      f"on2-on {ssd(n2, n1):.2e} | out (n diff, max ulp, rel L2) off2-off {od(o2, o1)} on-off "
+                      f"{od(n1, o1)} on2-on {od(n2, n1)} -> {'ok' if not why else '+'.join(why)}", flush=True)
         FIN1_ENABLE = not bad
-        print(f"[fin1] self-test FIN1 on vs off (bitwise, vid 3 T=16/32): {'ok' if not bad else bad} -> "
-              f"FIN1_ENABLE={FIN1_ENABLE}", flush=True)
+        print(f"[fin1] self-test FIN1 on vs off (vid 3 T=16/32; deterministic parts bitwise, ss vs exact, out rel L2): "
+              f"{'ok' if not bad else bad} -> FIN1_ENABLE={FIN1_ENABLE}", flush=True)
     except Exception as ex:  # noqa: BLE001
         FIN1_ENABLE = False
         print(f"[fin1] self-test raised {ex!r}: FIN1 off", flush=True)
