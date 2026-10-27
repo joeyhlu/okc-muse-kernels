@@ -63,7 +63,7 @@ def _vd_build():
     from torch.utils.cpp_extension import load_inline
     tag = hashlib.sha1((VD_CPP_SRC + VD_CUDA_SRC).encode()).hexdigest()[:10]
     t1 = time.time()
-    _VD["mod"] = load_inline(name=f"vd_{tag}", cpp_sources=VD_CPP_SRC, cuda_sources=VD_CUDA_SRC, functions=["vd_run", "vd_info"],
+    _VD["mod"] = load_inline(name=f"vd_{tag}", cpp_sources=VD_CPP_SRC, cuda_sources=VD_CUDA_SRC, functions=["vd_run"],
                              extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
     _VD["build_s"] = time.time() - t1
     return _VD["mod"]
@@ -191,7 +191,7 @@ def _lab():
                 and node.targets[0].id in ("VD_CPP_SRC", "VD_CUDA_SRC"):
             ns[node.targets[0].id] = ast.literal_eval(node.value)
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in ("vd_wg_specs", "vd_cuda_src"):
+        if isinstance(node, ast.FunctionDef) and node.name in ("vd_wg_specs", "vd_cuda_src", "vd_slim"):
             if node.name == "vd_cuda_src":
                 node.args.defaults = []
             exec(compile(ast.Module(body=[node], type_ignores=[]), "vd_lab", "exec"), ns)
@@ -202,11 +202,17 @@ def layer_code(routes):
     L = _lab()
     insts = sorted(set(routes.values()))
     route = {k: insts.index(v) for k, v in sorted(routes.items())}
-    cuda = L.vd_cuda_src(insts)
+    keep_dyn = ARGS.get('dyn', '0') == '1'
+    cuda = L.vd_slim(L.vd_cuda_src(insts), keep_dyn=keep_dyn)
+    cpp = chr(10).join(ln for ln in L.VD_CPP_SRC.split(chr(10)) if 'vd_info' not in ln)
+    if 'budget' in ARGS:   # shorter bounded waits for diagnostics (a stall then costs ms, not ~1 s per wait)
+        old = 'constexpr long long WAIT_BUDGET = 2000000000LL;'
+        assert cuda.count(old) == 1
+        cuda = cuda.replace(old, 'constexpr long long WAIT_BUDGET = ' + str(int(ARGS['budget'])) + 'LL;')
     for bad in ("'''", '"""'):
         assert bad not in cuda and bad not in L.VD_CPP_SRC
     code = (PY_TMPL.replace("@INSTS@", repr(insts)).replace("@ROUTE@", repr(route))
-            .replace("@CPP@", 'r"""' + L.VD_CPP_SRC + '"""').replace("@CUDA@", 'r"""' + cuda + '"""'))
+            .replace("@CPP@", 'r"""' + cpp + '"""').replace("@CUDA@", 'r"""' + cuda + '"""'))
     return code, insts, route
 
 

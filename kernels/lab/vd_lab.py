@@ -115,11 +115,13 @@ struct Cfg {
 };
 
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+// @lab{
 __device__ __forceinline__ unsigned long long gtime() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
 }
+// @lab}
 __device__ __forceinline__ void mbar_init(uint32_t b, int n) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(b), "r"(n) : "memory");
 }
@@ -147,11 +149,13 @@ __device__ __forceinline__ uint64_t pol_first() {
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
   return p;
 }
+// @lab{
 __device__ __forceinline__ uint64_t pol_last() {
   uint64_t p;
   asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
   return p;
 }
+// @lab}
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
                :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
@@ -164,10 +168,12 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* tm, int c
   asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];\n"
                :: "r"(dst), "l"(reinterpret_cast<uint64_t>(tm)), "r"(bar), "r"(c0), "r"(c1) : "memory");
 }
+// @lab{
 __device__ __forceinline__ void tma2d_h(uint32_t dst, const CUtensorMap* tm, int c0, int c1, uint32_t bar, uint64_t pol) {
   asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%3, %4}], [%2], %5;\n"
                :: "r"(dst), "l"(reinterpret_cast<uint64_t>(tm)), "r"(bar), "r"(c0), "r"(c1), "l"(pol) : "memory");
 }
+// @lab}
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
 __device__ __forceinline__ void named_sync(int id, int n) { asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(n) : "memory"); }
@@ -224,7 +230,9 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
   const uint32_t full0 = sbase + C::BAR_OFF, empty0 = full0 + 8 * NST, rbar = full0 + 16 * NST;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int flags = P.flags;
+  // @lab{
   if (flags & F_EXIT) return;
+  // @lab}
   uint32_t crank = 0;
   if constexpr (CL > 1) asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(crank));
   const int rb = blockIdx.x / CL;
@@ -232,9 +240,11 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
   const int nk = s1 - s0;
   const int jlo = CL > 1 ? ((int)crank * C::NB) / CL : 0;          // token blocks this rank finishes
   const int jhi = CL > 1 ? (((int)crank + 1) * C::NB) / CL : C::NB;
+  // @lab{
   const bool stamp = (flags & F_STAMP) != 0;
   unsigned long long t_entry = 0;
   if (stamp && tid == 0) t_entry = gtime();
+  // @lab}
   bool dead = false;
 
   if (tid == 0) {
@@ -259,27 +269,36 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
     // ------------------------------------------------------------------ producer (one lane)
     bool pw0 = false;   // lane 0 already did its phase-0 cluster wait (dynamic split)
     if (lane == 0) {
-      const bool nox = (flags & F_NOX) != 0, wmap = (flags & F_WMAP) != 0;
-      const bool efw = (flags & F_EFW) != 0, elx = (flags & F_ELX) != 0;
-      const uint64_t pw = efw ? pol_first() : 0ull, px = elx ? pol_last() : 0ull;
-      const uint32_t txb = (uint32_t)C::WB + (nox ? 0u : (uint32_t)C::XB);
+      const bool efw = (flags & F_EFW) != 0;
+      const uint64_t pw = efw ? pol_first() : 0ull;
+      uint32_t txb = (uint32_t)(C::WB + C::XB);
+      // @lab{
+      const bool nox = (flags & F_NOX) != 0, wmap = (flags & F_WMAP) != 0, elx = (flags & F_ELX) != 0;
+      const uint64_t px = elx ? pol_last() : 0ull;
+      if (nox) txb = (uint32_t)C::WB;
+      if (wmap) asm volatile("prefetch.tensormap [%0];\n" :: "l"(reinterpret_cast<uint64_t>(&tmw)) : "memory");
+      // @lab}
       const uint8_t* wbase = P.w + (long long)rb * P.w_rb;
       asm volatile("prefetch.tensormap [%0];\n" :: "l"(reinterpret_cast<uint64_t>(&tmx)) : "memory");
-      if (wmap) asm volatile("prefetch.tensormap [%0];\n" :: "l"(reinterpret_cast<uint64_t>(&tmw)) : "memory");
       // K rotation: row block rb walks its K range starting at stage (rb * rot) mod nk, so CTAs that run in lockstep
       // read different x tiles (128 SMs hitting the same L2 lines at once is a hotspot); 0 = no rotation
       const int off = P.rot > 0 ? (int)(((long long)rb * P.rot) % nk) : 0;
       auto kst = [&](int i) { int j = i + off; if (j >= nk) j -= nk; return s0 + j; };
       auto issue_w = [&](int i, uint32_t dst, uint32_t bar) {
         const int s = kst(i);
-        if (wmap) { if (efw) tma2d_h(dst, &tmw, s * 64, rb * C::BM, bar, pw); else tma2d(dst, &tmw, s * 64, rb * C::BM, bar); }
-        else { const void* src = wbase + (long long)s * P.w_s;
-               if (efw) bulk_g2s_h(dst, src, C::WB, bar, pw); else bulk_g2s(dst, src, C::WB, bar); }
+        // @lab{
+        if (wmap) { if (efw) tma2d_h(dst, &tmw, s * 64, rb * C::BM, bar, pw); else tma2d(dst, &tmw, s * 64, rb * C::BM, bar); return; }
+        // @lab}
+        const void* src = wbase + (long long)s * P.w_s;
+        if (efw) bulk_g2s_h(dst, src, C::WB, bar, pw); else bulk_g2s(dst, src, C::WB, bar);
       };
       auto issue_x = [&](int i, uint32_t dst, uint32_t bar) {
-        if (nox) return;
         const int s = kst(i);
-        if (elx) tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); else tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
+        // @lab{
+        if (nox) return;
+        if (elx) { tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); return; }
+        // @lab}
+        tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
       };
       if (!dyn) {
       const int npro = nk < NST ? nk : NST;
@@ -307,6 +326,7 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
         issue_x(i, dst, bar);
         issue_w(i, dst, bar);
       }
+      // @dyn{
       } else if constexpr (CL > 1) {
         // dynamic split inside the cluster: rank r first takes stages r, r + CL, .. (NST of them, static), then claims the
         // rest from a counter in rank 0's smem (DSMEM atomic, one claim ahead), so the ranks finish together; an end
@@ -315,13 +335,18 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
         const int offd = P.rot > 0 ? (int)(((long long)rb * P.rot) % nkt) : 0;
         auto ks = [&](int c) { int j = c + offd; if (j >= nkt) j -= nkt; return j; };
         auto put_w = [&](int s, uint32_t dst, uint32_t bar) {
-          if (wmap) { if (efw) tma2d_h(dst, &tmw, s * 64, rb * C::BM, bar, pw); else tma2d(dst, &tmw, s * 64, rb * C::BM, bar); }
-          else { const void* src = wbase + (long long)s * P.w_s;
-                 if (efw) bulk_g2s_h(dst, src, C::WB, bar, pw); else bulk_g2s(dst, src, C::WB, bar); }
+          // @lab{
+          if (wmap) { if (efw) tma2d_h(dst, &tmw, s * 64, rb * C::BM, bar, pw); else tma2d(dst, &tmw, s * 64, rb * C::BM, bar); return; }
+          // @lab}
+          const void* src = wbase + (long long)s * P.w_s;
+          if (efw) bulk_g2s_h(dst, src, C::WB, bar, pw); else bulk_g2s(dst, src, C::WB, bar);
         };
         auto put_x = [&](int s, uint32_t dst, uint32_t bar) {
+          // @lab{
           if (nox) return;
-          if (elx) tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); else tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
+          if (elx) { tma2d_h(dst + C::WB, &tmx, s * 64, 0, bar, px); return; }
+          // @lab}
+          tma2d(dst + C::WB, &tmx, s * 64, 0, bar);
         };
         int npre = 0;
         while (npre < NST && (int)crank + CL * npre < nkt) ++npre;
@@ -358,6 +383,7 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
         }
         *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) = iend;
         mbar_arrive(full0 + 8 * (iend % NST));                // release: the consumers read the marker after their wait
+      // @dyn}
       }
     }
     __syncwarp();
@@ -376,15 +402,20 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
   float acc[C::NACC];
 #pragma unroll
   for (int q = 0; q < C::NACC; ++q) acc[q] = 0.f;
-  const bool nomma = (flags & F_NOMMA) != 0;
+  bool nomma = false;
   const bool w0 = (flags & F_WAIT0) != 0;
+  // @lab{
+  nomma = (flags & F_NOMMA) != 0;
   unsigned long long t_first = 0;
+  // @lab}
 #pragma unroll 1
   for (int i = 0; dyn || i < nk; ++i) {
     const int slot = i % NST;
     mbar_wait(full0 + 8 * slot, (uint32_t)((i / NST) & 1), P.err, dead);
     if (dyn && (i == *reinterpret_cast<volatile int*>(gbase + C::ENDF_OFF) || dead)) break;   // this rank's end marker
+    // @lab{
     if (stamp && i == 0 && tid == 0) t_first = gtime();
+    // @lab}
     if (!nomma) {
       const uint32_t st = sbase + slot * C::SB;
       const uint64_t da = desc_sw128(st + wg * 8192), db = desc_sw128(st + C::WB);
@@ -404,8 +435,10 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
   wg_wait<0>();
 #pragma unroll
   for (int q = 0; q < C::NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
+  // @lab{
   unsigned long long t_loop = 0;
   if (stamp && tid == 0) t_loop = gtime();
+  // @lab}
   if (flags & F_TRIG) pdl_trigger();
 
   // -------------------------------------------------------------------- epilogue
@@ -480,13 +513,17 @@ vd_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUten
       *reinterpret_cast<uint4*>(yb + ((size_t)(tlo + tt) * P.ldy) * C::OB + c * 16) = v;
     }
   }
+  // @lab{
   if (stamp && tid == 0) {
     unsigned long long* sp = P.stamps + 4 * (size_t)blockIdx.x;
     sp[0] = t_entry; sp[1] = t_first; sp[2] = t_loop; sp[3] = gtime();
   }
+  // @lab}
 }
 
+// @lab{
 __global__ void null_kernel(int* e) { if (threadIdx.x == 1023) e[3] = 0; }
+// @lab}
 
 }  // namespace vd
 
@@ -541,16 +578,17 @@ static int64_t vd_launch_t(const torch::Tensor& x, const torch::Tensor& wpk, con
   TORCH_CHECK(y.is_cuda() && y.dim() == 2 && y.stride(1) == 1 && y.size(0) >= T && y.size(1) >= nrb * C::BM, "vd: y");
   TORCH_CHECK(y.scalar_type() == (F32 ? at::kFloat : at::kBFloat16), "vd: y dtype");
   TORCH_CHECK((y.stride(0) * C::OB) % 16 == 0 && ((uintptr_t)y.data_ptr() % 16) == 0, "vd: y alignment");
-  const bool wmap = (flags & vd::F_WMAP) != 0;
   CUtensorMap tmx, tmw;
   memset(&tmw, 0, sizeof(tmw));
   vd_map(&tmx, x.data_ptr(), T, K, BN);
-  if (wmap) {
+  TORCH_CHECK(wpk.is_cuda() && ((uintptr_t)wpk.data_ptr() % 16) == 0, "vd: wpk");
+  // @lab{
+  if ((flags & vd::F_WMAP) != 0) {
     TORCH_CHECK(wraw.dim() == 2 && wraw.size(1) == K && wraw.size(0) >= nrb * C::BM && wraw.is_contiguous(), "vd: wraw");
     vd_map(&tmw, wraw.data_ptr(), wraw.size(0), K, C::BM);
-  } else {
-    TORCH_CHECK(wpk.is_cuda() && ((uintptr_t)wpk.data_ptr() % 16) == 0, "vd: wpk");
   }
+  if (flags & vd::F_STAMP) TORCH_CHECK(stamps.numel() >= 4 * nrb * CL, "vd: stamps");
+  // @lab}
   vd::Params P;
   P.w = reinterpret_cast<const uint8_t*>(wpk.data_ptr());
   P.y = y.data_ptr();
@@ -558,7 +596,6 @@ static int64_t vd_launch_t(const torch::Tensor& x, const torch::Tensor& wpk, con
   P.stamps = reinterpret_cast<unsigned long long*>(stamps.data_ptr<int64_t>());
   P.w_rb = w_rb; P.w_s = w_s;
   P.nks = (int)(K / 64); P.T = (int)T; P.ldy = (int)y.stride(0); P.flags = (int)flags; P.pf = (int)(pf & 255); P.rot = (int)(pf >> 8);
-  if (flags & vd::F_STAMP) TORCH_CHECK(stamps.numel() >= 4 * nrb * CL, "vd: stamps");
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((unsigned)(nrb * CL), 1, 1);
   cfg.blockDim = dim3(C::THREADS, 1, 1);
@@ -582,6 +619,7 @@ static int64_t vd_launch_t(const torch::Tensor& x, const torch::Tensor& wpk, con
   return 0;
 }
 
+// @lab{
 template <int NWG, int BN, int NST, int CL, int F32, int RBD>
 static std::vector<int64_t> vd_info_t() {
   using C = vd::Cfg<NWG, BN, NST, CL, F32, RBD>;
@@ -604,13 +642,16 @@ static std::vector<int64_t> vd_info_t() {
   return {(int64_t)C::SMEM, (int64_t)fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)ncl, (int64_t)C::BM, (int64_t)BN,
           (int64_t)NST, (int64_t)CL, (int64_t)F32};
 }
+// @lab}
 
 int64_t vd_run(int64_t kid, torch::Tensor x, torch::Tensor wpk, torch::Tensor wraw, torch::Tensor y, torch::Tensor err,
                torch::Tensor stamps, int64_t nrb, int64_t w_rb, int64_t w_s, int64_t flags, int64_t pdl, int64_t pf) {
+  // @lab{
   if (kid < 0) {
     vd::null_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream().stream()>>>(err.data_ptr<int>());
     return 0;
   }
+  // @lab}
   switch (kid) {
 @RUNCASES@
   }
@@ -618,6 +659,7 @@ int64_t vd_run(int64_t kid, torch::Tensor x, torch::Tensor wpk, torch::Tensor wr
   return -2;
 }
 
+// @lab{
 std::vector<int64_t> vd_info(int64_t kid) {
   switch (kid) {
 @INFOCASES@
@@ -625,6 +667,7 @@ std::vector<int64_t> vd_info(int64_t kid) {
   TORCH_CHECK(false, "vd: unknown kid ", kid);
   return {};
 }
+// @lab}
 """
 
 
@@ -650,6 +693,26 @@ def vd_cuda_src(insts=VD_INSTS):
     info = "\n".join(f"    case {i}: return vd_info_t<{a}, {b}, {c}, {d}, {e}, {f}>();" for i, (a, b, c, d, e, f) in enumerate(insts))
     ns = sorted({ins[1] for ins in insts})
     return VD_CUDA_SRC.replace("@RUNCASES@", run).replace("@INFOCASES@", info).replace("@WGSPECS@", vd_wg_specs(ns))
+
+
+def vd_slim(src, keep_dyn=False):
+    """layer copy of the CUDA source: drop the lab-only regions (diagnostics, stamps, row-major W map, vd_info) and, unless
+    keep_dyn, the dynamic-split producer; markers are whole lines `// @lab{` / `// @lab}` (`// @dyn{` / `// @dyn}`)."""
+    out, skip = [], []
+    for line in src.split(chr(10)):
+        tag = line.strip()
+        if tag in ('// @lab{', '// @dyn{'):
+            skip.append(tag == '// @lab{' or not keep_dyn)
+            continue
+        if tag in ('// @lab}', '// @dyn}'):
+            skip.pop()
+            continue
+        if not any(skip):
+            out.append(line)
+    assert not skip, 'unbalanced slim markers'
+    src = chr(10).join(out)
+    assert '@lab' not in src and '@dyn' not in src, 'unbalanced slim markers'
+    return src
 
 
 def vd_build(insts=VD_INSTS, name="vdlab", verbose=False):
