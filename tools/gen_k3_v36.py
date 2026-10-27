@@ -68,8 +68,8 @@ def generate():
     rep.append("K3P applied (K3B kernel + 3 launches + 3 call sites + module globals)")
     if RS1:
         text = rs1_patches.apply(text)
-        check(text.count("(64 if RS1_ENABLE else 0)") == 2, "RS1 call sites")
-        rep.append("RS1 applied (tail_first / tail_first2 ballot, ranges36 lane-parallel, segs36 on warp 0; probe bit 6)")
+        check(text.count("((1 << 7) if RS1_ENABLE else 0)") == 2, "RS1 call sites")
+        rep.append("RS1 applied (tail_first / tail_first2 ballot, ranges36 lane-parallel, segs36 on warp 0; probe bit 7)")
     check(text.count(G.NONCE_OLD) == 1, "base nonce line")
     text = text.replace(G.NONCE_OLD, NONCE)
     before = len(text.encode())

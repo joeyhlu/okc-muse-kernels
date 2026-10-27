@@ -1,7 +1,7 @@
 """rs1_patches.py: RS1 = R-setup rider: the K2A K1 / K2 prologue before the first weight copy, made warp-parallel (R8:
 setup 2.4-2.6 us above the one-launch stream on every small-T shape; entry -> gemm start 1.5-2.6 us, gemm start -> first copy
 0.9-1.8 us). Scoped text patches inside K2A33_KERNEL_SRC plus the Python call sites; identical results by construction;
-switched per call by probe bit 6 (RS1_ENABLE, read at call time; bit 6 is unused by K2A33_KERNEL_SRC):
+switched per call by probe bit 7 (RS1_ENABLE, read at call time; bit 5 = EPI1 lab, bit 6 = study-a FIN1):
   * tail_first (v3.3 gemm: vid 0 / 1 / 2; its three callers are full warps: producer, epilogue, consumers) and tail_first2
     (v3.6 segs36): the serial scan `while (sb[e + 1] <= end - 1) ++e;` (up to 32 dependent shared loads) -> one ballot:
     e = popc(ballot(sb[lane + 1] <= end - 1)). sb is non-decreasing and end <= sb[32], so the lanes that vote form the prefix
@@ -10,7 +10,7 @@ switched per call by probe bit 6 (RS1_ENABLE, read at call time; bit 6 is unused
     weights (order-independent, exact), as v3.7's segs37; segs36 then runs on warp 0 (was thread 0) and lane 0 writes.
 vid 5 (v3.7) already uses the warp versions; vid 2's WSK range search is untouched.
 
-    python -I tools/rs1_patches.py in.py out.py      (after tools/k3p_patches.py: the call-site anchors carry its bits)
+    python -I tools/rs1_patches.py in.py out.py      (after tools/k3p_patches.py and, if present, study-a fin1_patches.py: both edit these call sites)
 """
 import pathlib
 import py_compile
@@ -33,7 +33,7 @@ CUDA = [
      "  if (rs1) e = __popc(__ballot_sync(0xffffffffu, S.sb[(threadIdx.x & 31) + 1] <= end - 1));   // RS1: = the scan\n"
      "  else while (S.sb[e + 1] <= end - 1) ++e;\n", 1),
     ("tail_first callers", "const int mid = tail_first(S, beg, end);",
-     "const int mid = tail_first(S, beg, end, (P.probe >> 6) & 1);", 3),
+     "const int mid = tail_first(S, beg, end, (P.probe >> 7) & 1);", 3),
     ("tail_first2: rs1 ballot",
      "__device__ __forceinline__ int tail_first2(const int* sb, int beg, int end) {\n"
      "  if (end <= beg) return beg;\n" + SERIAL_TF2,
@@ -47,7 +47,7 @@ CUDA = [
      "    for (int x = 0; x < 32; ++x) {\n"
      "      const int n = S.cnt[x];\n",
      "    long long Wh = 0, Wc = 0;\n"
-     "    if ((P.probe >> 6) & 1) {   // RS1: warp 0, lane = expert, exact integer butterfly sum (v3.7 segs37's scheme)\n"
+     "    if ((P.probe >> 7) & 1) {   // RS1: warp 0, lane = expert, exact integer butterfly sum (v3.7 segs37's scheme)\n"
      "      const int n = S.cnt[threadIdx.x & 31];\n"
      "      if (n > 0) {\n"
      "        if (n > P.hot_t) {\n"
@@ -66,22 +66,21 @@ CUDA = [
      "    const int mid = tail_first2(k[part] ? S.sbh : S.sbc, b[part], e[part]);\n"
      "    sg[6 * part + 0] = mid;     sg[6 * part + 1] = e[part]; sg[6 * part + 2] = k[part];\n"
      "    sg[6 * part + 3] = b[part]; sg[6 * part + 4] = mid;     sg[6 * part + 5] = k[part];\n",
-     "    const int mid = tail_first2(k[part] ? S.sbh : S.sbc, b[part], e[part], (P.probe >> 6) & 1);\n"
+     "    const int mid = tail_first2(k[part] ? S.sbh : S.sbc, b[part], e[part], (P.probe >> 7) & 1);\n"
      "    if ((threadIdx.x & 31) == 0) {   // RS1: segs36 may run on warp 0\n"
      "      sg[6 * part + 0] = mid;     sg[6 * part + 1] = e[part]; sg[6 * part + 2] = k[part];\n"
      "      sg[6 * part + 3] = b[part]; sg[6 * part + 4] = mid;     sg[6 * part + 5] = k[part];\n"
      "    }\n", 1),
     ("segs36 on warp 0 when rs1 (K1 and K2)",
      "  if (threadIdx.x == 0) segs36<NCH>(P, S, s_pr);\n",
-     "  if (threadIdx.x < (((P.probe >> 6) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0\n", 2),
+     "  if (threadIdx.x < (((P.probe >> 7) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0\n", 2),
 ]
 
-CALL36 = ('_k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | '
-          '((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m))\n')
+CALL36 = '((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m)'   # the _k2a33 / _k2a36 launches, with or without FIN1
 PY_ANCHOR = "\ndef kernel_fn(data, state):\n"
 PY = '''
 
-# RS1 (tools/rs1_patches.py): warp-parallel K2A setup (tail_first / segs36), probe bit 6; read at call time
+# RS1 (tools/rs1_patches.py): warp-parallel K2A setup (tail_first / segs36), probe bit 7; read at call time
 RS1_ENABLE = True
 
 '''
@@ -98,8 +97,8 @@ def apply(text):
             raise RuntimeError(f"rs1 patch {name!r}: `old` occurs {n} times in K2A33_KERNEL_SRC (want {count})")
         text = text[:a] + text[a:b].replace(old, new) + text[b:]
     if text.count(CALL36) != 2:
-        raise RuntimeError(f"rs1 patch: _k2a33 / _k2a36 call sites x{text.count(CALL36)} (want 2; apply after k3p_patches)")
-    text = text.replace(CALL36, CALL36[:-2] + " | (64 if RS1_ENABLE else 0))\n")
+        raise RuntimeError(f"rs1 patch: _k2a33 / _k2a36 call sites x{text.count(CALL36)} (want 2; apply after k3p / fin1)")
+    text = text.replace(CALL36, CALL36 + " | ((1 << 7) if RS1_ENABLE else 0)")
     if text.count(PY_ANCHOR) != 1:
         raise RuntimeError("rs1 patch: kernel_fn anchor")
     return text.replace(PY_ANCHOR, PY + PY_ANCHOR)

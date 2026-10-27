@@ -6970,7 +6970,7 @@ __device__ void gemm(const Params& P, Route& S, const int16_t* s_list, uint8_t* 
     uint32_t dDst[NST], dBar[NST];
     const __nv_bfloat16* dSrc[NST];
     uint32_t dB[NST];
-    const int mid = tail_first(S, beg, end, (P.probe >> 6) & 1);
+    const int mid = tail_first(S, beg, end, (P.probe >> 7) & 1);
     for (int seg = 0; seg < 2; ++seg) {
     const int xb = seg ? beg : mid, xe = seg ? mid : end;
     e = 0;
@@ -7061,7 +7061,7 @@ __device__ void gemm(const Params& P, Route& S, const int16_t* s_list, uint8_t* 
     {
       if ((P.probe & 15) != 0) return;   // probes: consumers never hand over
       int npart = 0, e = 0;
-      const int mid = tail_first(S, beg, end, (P.probe >> 6) & 1);
+      const int mid = tail_first(S, beg, end, (P.probe >> 7) & 1);
       for (int seg = 0; seg < 2; ++seg) {
         const int xb = seg ? beg : mid, xe = seg ? mid : end;
         e = 0;
@@ -7164,7 +7164,7 @@ __device__ void gemm(const Params& P, Route& S, const int16_t* s_list, uint8_t* 
   int it = 0, e = 0;
   uint32_t sink = 0u;
   int npart = 0;
-  const int mid = tail_first(S, beg, end, (P.probe >> 6) & 1);
+  const int mid = tail_first(S, beg, end, (P.probe >> 7) & 1);
   for (int seg = 0; seg < 2; ++seg) {
   const int xb = seg ? beg : mid, xe = seg ? mid : end;
   e = 0;
@@ -7841,7 +7841,7 @@ __device__ __forceinline__ void ranges36(const Params& P, const Route& S, int& b
   int Gh = 0;
   if (Sh > 0) {
     long long Wh = 0, Wc = 0;
-    if ((P.probe >> 6) & 1) {   // RS1: warp 0, lane = expert, exact integer butterfly sum (v3.7 segs37's scheme)
+    if ((P.probe >> 7) & 1) {   // RS1: warp 0, lane = expert, exact integer butterfly sum (v3.7 segs37's scheme)
       const int n = S.cnt[threadIdx.x & 31];
       if (n > 0) {
         if (n > P.hot_t) {
@@ -7882,7 +7882,7 @@ __device__ __forceinline__ void segs36(const Params& P, const Route& S, int* sg)
   ranges36<NCH>(P, S, b[0], e[0], k[0], b[1], e[1], k[1]);
 #pragma unroll
   for (int part = 0; part < 2; ++part) {
-    const int mid = tail_first2(k[part] ? S.sbh : S.sbc, b[part], e[part], (P.probe >> 6) & 1);
+    const int mid = tail_first2(k[part] ? S.sbh : S.sbc, b[part], e[part], (P.probe >> 7) & 1);
     if ((threadIdx.x & 31) == 0) {   // RS1: segs36 may run on warp 0
       sg[6 * part + 0] = mid;     sg[6 * part + 1] = e[part]; sg[6 * part + 2] = k[part];
       sg[6 * part + 3] = b[part]; sg[6 * part + 4] = mid;     sg[6 * part + 5] = k[part];
@@ -7903,7 +7903,7 @@ __global__ void __launch_bounds__(320, 2) k1_kernel36(const Params P) {
   pdl_wait();   // v4.7: K1 is a PDL secondary of the routing tail (vid 3)
   route<1, 8 * NCH, true>(P, S, nullptr, s_list, 64, blockIdx.x == 0 && (P.probe & 15) == 0);
   __shared__ int s_pr[12];
-  if (threadIdx.x < (((P.probe >> 6) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0
+  if (threadIdx.x < (((P.probe >> 7) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0
   __syncthreads();
   gemm36<NCH, NST, 1>(P, S, s_list, smem, bars, false, s_pr);
 }
@@ -7919,7 +7919,7 @@ __global__ void __launch_bounds__(320, 2) k2_kernel36(const Params P) {
   setup_bars<1, NST>(bars);
   route<1, 8 * NCH, true>(P, S, nullptr, s_list, 32, false);
   __shared__ int s_pr[12];
-  if (threadIdx.x < (((P.probe >> 6) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0
+  if (threadIdx.x < (((P.probe >> 7) & 1) ? 32 : 1)) segs36<NCH>(P, S, s_pr);   // RS1: warp 0
   __syncthreads();
   gemm36<NCH, NST, 2>(P, S, s_list, smem, bars, true, s_pr);
 }
@@ -8825,7 +8825,7 @@ def _k2a33_call(st, data, vid, probe=K2A33_HINT, mask=7, hot_t=None, hot_w4=None
     st["mod"].run3(vid, mask, x, ids, wts, st["ws13"], st["ws2"], st["gsc13"], st["gsc2"], st["nw"], st["h"],
                    st["inter"], st["y"], st["meta"], st["cnt"], st["err"], out, st["sink"], st["ss"], st["cnt2"],
                    st["xw"], st["xw2"], hot_t, m,
-                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | (64 if RS1_ENABLE else 0))
+                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 7) if RS1_ENABLE else 0))
     return out
 
 def _k2a33_reset(st):
@@ -8996,7 +8996,7 @@ def _k2a36_call(st, data, vid, hot=None, probe=K2A33_HINT, mask=7):
     st["mod"].run3(vid, mask, x, ids, wts, st["ws13"], st["ws2"], st["gsc13"], st["gsc2"], st["nw"], st["h"],
                    st["inter"], st["y"], st["meta"], st["cnt"], st["err"], out, st["sink"], st["ss"], st["cnt2"],
                    st["xw"], st["xw2"], _k2a36_hot_code(st["variants"][vid], hot), m,
-                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | (64 if RS1_ENABLE else 0))
+                   data["config"]["local_start"], st["grid"][vid], _k3p_g3(st, m, _su1_g3(st, m)), probe | ((1 << 24) if K2A47_K1_PDL else 0) | ((1 << 25) if _SU1_FLAG["k3trig"] else 0) | _k3p_bits(m) | ((1 << 7) if RS1_ENABLE else 0))
     return out
 
 
