@@ -6,7 +6,7 @@ Composition: tools/gen_k3_v37.py --v39 regenerates k3_v39 (asserted byte-identic
 asserted), then gen_k3_v37's checks with this nonce: compiles, ASCII, line 1, nonce, no duplicate top-level names,
 judge-checker scan <= base, < 1 MB.
 
-    python -I tools/gen_k3_gd.py [--n=1|2] [--check]      (n >= 2: + the T = 1 prt port)
+    python -I tools/gen_k3_gd.py [--n=1|2|3] [--check]      (2: + the T = 1 prt port; 3: GD v2 = cat + Lt)
 """
 import ast
 import hashlib
@@ -18,7 +18,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 CHECK = "--check" in sys.argv
 N = next((int(a[4:]) for a in sys.argv if a.startswith("--n=")), 1)
-PRT = N >= 2   # k3_gd_2+: + the T = 1 pooler in a G2-style fused prt kernel on gv1's stream (gd_patches prt=True)
+FEAT = {1: {}, 2: {"prt": True}, 3: {"v2": True}}[N]   # 2: + T = 1 prt (killed, R-gd-2); 3: GD v2 = cat + Lt (no prt)
 _argv, sys.argv = sys.argv, [sys.argv[0], "--v39"]   # gen_k3_v37 reads its flags at import
 import gen_k3_v37 as G37  # noqa: E402
 sys.argv = _argv
@@ -30,7 +30,9 @@ OUT = ROOT / f"kernels/muse_decode_layer/k3_gd_{N}.py"
 LAB = ROOT / f"kernels/lab/k3_gd_{N}_ab.py"
 TAG = f"k3-gd-{N}"
 NONCE = (f"# nonce {TAG} (k3_v39 + GD: gv1 P12 weight-streaming GEMVs for qkv / o / unpooler at T <= 32 and the pooler at"
-         " T = 2-8, PDL producer loads before griddepcontrol.wait)" if not PRT else
+         " T = 2-8, PDL producer loads before griddepcontrol.wait)" if not FEAT else
+         f"# nonce {TAG} (k3_gd_1 + GD v2: the T = 9-32 cat as gv1 pooler + gv1 router launches into the v8 tail, the T = 128"
+         " cat on a pinned cuBLASLt algorithm searched in prepare)" if FEAT.get("v2") else
          f"# nonce {TAG} (k3_v39 + GD: gv1 P12 weight-streaming GEMVs for qkv / o / unpooler at T <= 32, the pooler at T = 2-8"
          " and the T = 1 pooler inside a G2-style fused pooler + FP32 router + tail kernel on gv1's stream)")
 
@@ -44,7 +46,7 @@ def main():
     v39, base, rep = G37.generate()
     check(G37.V39 and v39 == V39.read_text(encoding="utf-8"), "gen_k3_v37 --v39 does not reproduce k3_v39.py on disk")
     rep.append(f"k3_v39 reproduced ({len(v39.encode())} B, sha1 {hashlib.sha1(v39.encode()).hexdigest()[:12]})")
-    text = gd_patches.apply(v39, prt=PRT)
+    text = gd_patches.apply(v39, **FEAT)
     check(text.count(G37.NONCE) == 1, "k3_v39 nonce line")
     text = text.replace(G37.NONCE, NONCE)
     stripped = strip_layer.strip(text)

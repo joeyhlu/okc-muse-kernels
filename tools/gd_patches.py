@@ -1187,6 +1187,351 @@ PRT_EDITS = [
      '        g2out = _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n'),
 ]
 
+# ---- V2 (k3_gd_3, apply(v2=True)): the dense builder's GD v2 hand-offs (dense_independent.md section 10, R-dense-3) -------
+# (a) the T = 9-32 cat as two gv1 launches: the pooler (BF16) and the router (OUT 2: virtual hi / lo P12 tiles with per-half
+#     window bases, FP32 logits = hi + lo in the epilogue, cluster 8), then _v8_tail(pool, logits); (b) the T = 128 cat GEMM on
+#     a pinned cuBLASLt algorithm searched in prepare (the layer's verify16 pooler is the FP32-out cat [4608, 8192]).
+V2_CUDA = [
+    ("OUT 2 output count", "  constexpr int NO = WR * MT * 128;     // CTA output values\n",
+     "  constexpr int NO = WR * MT * (OUT == 2 ? 64 : 128);     // CTA output values (OUT 2: hi + lo rows -> 8 per tile)\n"),
+    ("OUT 2 epilogue",
+     "  auto cta_value = [&](int i) -> float {\n"
+     "    const int l = i & 31;\n"
+     "    const int c = (i >> 5) & 3, r = i >> 7, mt = r % MT, w2 = r / MT;\n"
+     "    float v = 0.f;\n"
+     "#pragma unroll\n"
+     "    for (int k2 = 0; k2 < WK; ++k2) v += red[w2 * WK + k2][mt * 4 + c][l];\n"
+     "    return v;\n"
+     "  };\n"
+     "  auto store = [&](int i, float v) {\n"
+     "    const int l = i & 31, gg = l >> 2, tt = l & 3;\n"
+     "    const int c = (i >> 5) & 3, r = i >> 7, mt = r % MT, w2 = r / MT;\n",
+     "  auto cta_value = [&](int i) -> float {\n"
+     "    const int l = i & 31;\n"
+     "    if constexpr (OUT == 2) {   // router: tile rows 0-7 = hi rows, 8-15 = lo rows of the same 8 router rows\n"
+     "      const int c = (i >> 5) & 1, r = i >> 6, mt = r % MT, w2 = r / MT;\n"
+     "      float v = 0.f;\n"
+     "#pragma unroll\n"
+     "      for (int k2 = 0; k2 < WK; ++k2) v += red[w2 * WK + k2][mt * 4 + c][l] + red[w2 * WK + k2][mt * 4 + c + 2][l];\n"
+     "      return v;\n"
+     "    }\n"
+     "    const int c = (i >> 5) & 3, r = i >> 7, mt = r % MT, w2 = r / MT;\n"
+     "    float v = 0.f;\n"
+     "#pragma unroll\n"
+     "    for (int k2 = 0; k2 < WK; ++k2) v += red[w2 * WK + k2][mt * 4 + c][l];\n"
+     "    return v;\n"
+     "  };\n"
+     "  auto store = [&](int i, float v) {\n"
+     "    const int l = i & 31, gg = l >> 2, tt = l & 3;\n"
+     "    if constexpr (OUT == 2) {\n"
+     "      const int c = (i >> 5) & 1, r = i >> 6, mt = r % MT, w2 = r / MT;\n"
+     "      const int tok = tok0 + mt * 8 + 2 * tt + c;\n"
+     "      if (tok < A.M) reinterpret_cast<float*>(A.out)[(size_t)tok * A.ldo + ((int)blockIdx.x * WR + w2) * 8 + gg] = v;\n"
+     "      return;\n"
+     "    }\n"
+     "    const int c = (i >> 5) & 3, r = i >> 7, mt = r % MT, w2 = r / MT;\n"),
+]
+
+V2_PY_REPL = [
+    ("key: OUT", "def _gd_key(n, k, rt):\n", "def _gd_key(n, k, rt, out=0):\n"),
+    ("key: OUT value", "    return (0, mt, wr, wk, ku, st_, s, max(1, min(2048 // nt, -(-ctas // GD_SMS))), xp)\n",
+     "    return (out, mt, wr, wk, ku, st_, s, max(1, min(2048 // nt, -(-ctas // GD_SMS))), xp)\n"),
+    ("keys: OUT", "        key = _gd_key(*_gd_nk(proj, b), rt) if rt else None\n",
+     "        key = _gd_key(*_gd_nk(proj, b), rt, GD_OUT.get(proj, 0)) if rt else None\n"),
+    ("prepare: OUT", "        key = _gd_key(n, k, rt)\n", "        key = _gd_key(n, k, rt, GD_OUT.get(proj, 0))\n"),
+    ("pack: two bases", "def _gd_pack(wv, wr, wk, ku, s, base):\n", "def _gd_pack(wv, wr, wk, ku, s, base, bb=None):\n"),
+    ("pack: per-half base", "    d = h7 - base\n",
+     "    bj = base if bb is None else torch.where(((torch.arange(8, device=dev) >> 1) & 1) == 0, base, bb).to(torch.int32)\n"
+     "    d = h7 - bj\n"),
+    ("pack: escape xor", "        x7 = (h7[rt, u, ln, qq, jv] ^ base).to(torch.int64)\n",
+     "        x7 = (h7[rt, u, ln, qq, jv] ^ (base if bb is None else bj[jv])).to(torch.int64)\n"),
+    ("pack: tb", '    return {"w": v, "esc": esc, "tb": base * 0x01010101, "G": G, "nbx": nbx, "nesc": nesc}\n',
+     '    return {"w": v, "esc": esc, "tb": base * 0x0101 + (base if bb is None else bb) * 0x01010000, "G": G, "nbx": nbx,\n'
+     '            "nesc": nesc}\n'),
+    ("prepare: weight", "        w = dense[GD_WEIGHT[proj]]\n", "        w = _gd_weight(state, proj)\n"),
+    ("prepare: bases",
+     "                        bases[(proj, n)] = _gd_window_base(wv)\n"
+     "                    pk = _gd_pack(wv, rt[1], rt[2], rt[3], rt[5], bases[(proj, n)])\n",
+     "                        bases[(proj, n)] = _gd_bases(proj, wv)\n"
+     "                    pk = _gd_pack(wv, rt[1], rt[2], rt[3], rt[5], *bases[(proj, n)])\n"),
+    ("prepare: router self-test", "                ok, msg = _gd_selftest(r, wv, b)\n",
+     '                ok, msg = _gd_selftest_router(r, state, b) if proj == "router" else _gd_selftest(r, wv, b)\n'),
+]
+
+V2_LT_CPP = r'''
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublasLt.h>
+#include <vector>
+struct LtPlan {
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+  std::vector<cublasLtMatmulHeuristicResult_t> res;
+};
+static cublasLtHandle_t g_h = nullptr;
+static std::vector<LtPlan> g_plans;
+// column-major view: C^T [n x m] = op_T(W) [n x k] * X^T [k x m]  (W row-major [n, k], x row-major [m, k]); shapes only
+int64_t lt_plan(int64_t m, int64_t n, int64_t k, int64_t out_f32, int64_t ws_bytes, int64_t max_algos) {
+  if (!g_h) TORCH_CHECK(cublasLtCreate(&g_h) == CUBLAS_STATUS_SUCCESS, "lt: create");
+  LtPlan p;
+  TORCH_CHECK(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS, "lt: desc");
+  cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+  cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+  cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_16BF, k, n, k) == CUBLAS_STATUS_SUCCESS, "lt: la");
+  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_16BF, k, m, k) == CUBLAS_STATUS_SUCCESS, "lt: lb");
+  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.lc, out_f32 ? CUDA_R_32F : CUDA_R_16BF, n, m, n) == CUBLAS_STATUS_SUCCESS,
+              "lt: lc");
+  cublasLtMatmulPreference_t pref;
+  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS, "lt: pref");
+  uint64_t ws = (uint64_t)ws_bytes;
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+  p.res.resize((size_t)max_algos);
+  int got = 0;
+  cublasStatus_t s = cublasLtMatmulAlgoGetHeuristic(g_h, p.op, p.la, p.lb, p.lc, p.lc, pref, (int)max_algos,
+                                                    p.res.data(), &got);
+  cublasLtMatmulPreferenceDestroy(pref);
+  TORCH_CHECK(s == CUBLAS_STATUS_SUCCESS, "lt: heuristic status ", (int)s);
+  p.res.resize((size_t)got);
+  g_plans.push_back(p);
+  return ((int64_t)(g_plans.size() - 1) << 8) | (int64_t)got;
+}
+void lt_run(int64_t pid, int64_t ai, torch::Tensor w, torch::Tensor x, torch::Tensor out, double beta, torch::Tensor ws) {
+  LtPlan& p = g_plans[(size_t)pid];
+  const float alpha = 1.f, b = (float)beta;
+  cublasStatus_t s = cublasLtMatmul(g_h, p.op, &alpha, w.data_ptr(), p.la, x.data_ptr(), p.lb, &b, out.data_ptr(), p.lc,
+                                    out.data_ptr(), p.lc, &p.res[(size_t)ai].algo, ws.data_ptr(), (size_t)ws.numel(),
+                                    at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(s == CUBLAS_STATUS_SUCCESS, "lt_run: status ", (int)s);
+}
+'''
+
+V2_PY = '''
+
+# GD v2 (tools/gd_patches.py v2=True; dense_independent.md section 10): the T = 9-32 cat as gv1 pooler + gv1 router launches
+# into _v8_tail (GD_CAT), and the T = 128 cat GEMM on a pinned cuBLASLt algorithm searched in prepare (GD_LT). Call time.
+GD_CAT = {16: True, 32: True}
+GD_CAT_PDL = 3           # PDL + early trigger on both launches (= P1M / DG1's cat)
+GD_LT = True
+GD_LT_M = (128,)
+GD_LT_MAX_ALGOS = 24
+GD_LT_WS = 32 << 20
+GD_LT_MARGIN = 0.97      # a pinned algorithm must be <= 0.97 x torch.mm's time in prepare
+GD_LT_REPS = 15
+GD_OUT = {"router": 2}
+GD_DIMS["router"] = (2 * N_EXPERTS, HIDDEN)   # virtual [512, 8192]: per 16-row tile 8 hi + 8 lo rows
+GD_ROUTE.update({("pooler", 16): (2, 1, 8, 16, 2, 1, 0), ("pooler", 32): (4, 1, 8, 16, 1, 1, 0),
+                 ("router", 16): (2, 1, 8, 2, 2, 8, 0), ("router", 32): (4, 1, 4, 4, 1, 8, 0)})
+GD_LT_CPP = @LTCPP@
+_GD_LT = {"mod": None, "err": None}
+
+
+def _gd_weight(state, proj):
+    if proj != "router":
+        return state["dense"][GD_WEIGHT[proj]]
+    w32 = state["router"]
+    hi = w32.to(torch.bfloat16)
+    lo = (w32 - hi.float()).to(torch.bfloat16)
+    n, k = hi.shape
+    return torch.stack([hi.view(n // 8, 8, k), lo.view(n // 8, 8, k)], dim=1).reshape(2 * n, k).contiguous()
+
+
+def _gd_bases(proj, wv):
+    if proj != "router":
+        return (_gd_window_base(wv),)
+    t = wv.view(-1, 16, wv.shape[1])
+    return (_gd_window_base(t[:, :8]), _gd_window_base(t[:, 8:]))
+
+
+def _gd_selftest_router(r, state, b):
+    w32 = state["router"]
+    k, dev = w32.shape[1], w32.device
+    parts = []
+    for T in GD_SELF_TEST_T[b]:
+        for outl in (False, True):
+            x, probes = _gd_test_input(T, k, 1977 + 31 * T + int(outl), dev, outl)
+            outs = []
+            for pdl in GD_SELF_TEST_PDL:
+                o = torch.full((T, N_EXPERTS), float("nan"), dtype=torch.float32, device=dev)
+                r["mod"].gd_run(r["inst"], r["w"], r["esc"], x, o, T, k, N_EXPERTS, r["tb"], r["nbx"], 1, pdl)
+                outs.append(o)
+            ref = (x.double() @ w32.double().T).float().double()
+            torch.cuda.synchronize()
+            got = outs[0].double()
+            if not bool(torch.isfinite(got).all()):
+                return False, f"T={T} outl={outl}: non-finite"
+            dd = got - ref
+            rn = ref.norm(dim=-1)
+            tot = float(dd.norm() / ref.norm().clamp(min=1e-30))
+            row = float((dd.norm(dim=-1) / torch.maximum(rn, 0.1 * rn.mean()).clamp(min=1e-30)).max())
+            pr = float((dd[probes].norm(dim=-1) / rn[probes].clamp(min=1e-30)).max()) if bool(probes.any()) else 0.0
+            rep = all(bool(torch.equal(outs[0], o)) for o in outs[1:])
+            if not (tot <= 2e-5 and row <= 1e-4 and pr <= 2e-4 and rep):
+                return False, f"T={T} outl={outl}: rel {tot:.1e} row {row:.1e} probe {pr:.1e} repeat {rep}"
+            parts.append(f"T={T}{'o' if outl else ''} {tot:.1e}")
+    return True, " ".join(parts)
+
+
+def _gd_cat(ffn_input, state, data, tokens):
+    b = _gd_bucket(tokens)
+    if not (GD_ENABLE and b is not None and GD_CAT.get(b)) or state.get("v8") is None:
+        return None
+    rp, rr = _gd_live(state, "pooler", tokens), _gd_live(state, "router", tokens)
+    x = ffn_input
+    if rp is None or rr is None or not (x.dtype == torch.bfloat16 and x.dim() == 2 and x.shape[1] == HIDDEN
+                                        and x.is_contiguous() and x.data_ptr() % 16 == 0):
+        return None
+    try:
+        pool = torch.empty((tokens, D_EXPERT), dtype=torch.bfloat16, device=x.device)
+        lg = torch.empty((tokens, N_EXPERTS), dtype=torch.float32, device=x.device)
+        rp["mod"].gd_run(rp["inst"], rp["w"], rp["esc"], x, pool, tokens, HIDDEN, D_EXPERT, rp["tb"], rp["nbx"], 1, GD_CAT_PDL)
+        rr["mod"].gd_run(rr["inst"], rr["w"], rr["esc"], x, lg, tokens, HIDDEN, N_EXPERTS, rr["tb"], rr["nbx"], 1, GD_CAT_PDL)
+        out = _v8_tail(pool, lg, state, data)
+        if ("cat", tokens) not in _GD_SEEN:
+            _GD_SEEN.add(("cat", tokens))
+            print(f"[gd] first call cat T={tokens}: pooler {rp['desc']} + router {rr['desc']} -> v8 tail", flush=True)
+        return out
+    except Exception as ex:
+        _k3_disable(state, "gd", None, "GD cat", ex)
+        return None
+
+
+def _gd_lt_build():
+    _pt1_wait("gdlt")
+    if _GD_LT["mod"] is not None or _GD_LT["err"] is not None:
+        return _GD_LT["mod"]
+    import glob
+    import os
+    from torch.utils.cpp_extension import load_inline, CUDA_HOME
+    dirs = []
+    if CUDA_HOME:
+        dirs += [os.path.join(CUDA_HOME, d) for d in ("lib64", "lib", os.path.join("targets", "x86_64-linux", "lib"))]
+    tdir = os.path.dirname(torch.__file__)
+    dirs += glob.glob(os.path.join(os.path.dirname(tdir), "nvidia", "*", "lib")) + [os.path.join(tdir, "lib")]
+    flags = []
+    for d in dirs:
+        libs = sorted(glob.glob(os.path.join(d, "libcublasLt.so*")))
+        if libs:
+            plain = [lb for lb in libs if lb.endswith("libcublasLt.so")]
+            flags = (["-L" + d, "-lcublasLt"] if plain else ["-L" + d, "-l:" + os.path.basename(libs[-1])]) + ["-Wl,-rpath," + d]
+            break
+    flags = flags or ["-lcublasLt"]
+    tag = hashlib.sha1((GD_LT_CPP + " ".join(flags)).encode()).hexdigest()[:10]
+    try:
+        _GD_LT["mod"] = load_inline(name=f"gdlt_{tag}", cpp_sources=GD_LT_CPP, functions=["lt_plan", "lt_run"],
+                                    extra_ldflags=flags, with_cuda=True, verbose=False)
+    except Exception as ex:
+        _GD_LT["err"] = f"{str(ex)[-1500:]} (flags {flags})"
+    return _GD_LT["mod"]
+
+
+def _gd_lt_prepare(state, t0):
+    state["gdlt"] = None
+    if not (GD_BUILD and GD_LT_M):
+        return None
+    if time.time() - t0 > GD_PREPARE_BY_S:
+        print(f"[gd] LT skipped: prepare already took {time.time() - t0:.1f}s: torch's cat", flush=True)
+        return None
+    mod = _gd_lt_build()
+    v8 = state.get("v8")
+    if mod is None or v8 is None:
+        print(f"[gd] LT FALLBACK: {'no v8 state' if v8 is None else 'build failed: ' + str(_GD_LT['err'])} -> torch's cat", flush=True)
+        return None
+    wcat = v8["wcat"]
+    n, k = wcat.shape
+    dev = wcat.device
+    ws = torch.empty((GD_LT_WS,), dtype=torch.uint8, device=dev)
+    flush = torch.empty((64 << 20,), dtype=torch.float32, device=dev).fill_(1.0)
+    plans, notes = {}, []
+    for m in GD_LT_M:
+        try:
+            code = int(mod.lt_plan(m, n, k, 1, GD_LT_WS, GD_LT_MAX_ALGOS))
+            pid, cnt = code >> 8, code & 255
+            x, probes = _gd_test_input(m, k, 31337 + m, dev)
+            ref = (x.double() @ wcat.double().T).float().double()
+            rn = ref.norm(dim=-1)
+            cands = []
+            for ai in range(cnt):
+                o = torch.full((m, n), float("nan"), dtype=torch.float32, device=dev)
+                try:
+                    mod.lt_run(pid, ai, wcat, x, o, 0.0, ws)
+                    torch.cuda.synchronize()
+                except Exception:
+                    continue
+                dd = o.double() - ref
+                tot = float(dd.norm() / ref.norm())
+                row = float((dd.norm(dim=-1) / torch.maximum(rn, 0.1 * rn.mean())).max())
+                pr = float((dd[probes].norm(dim=-1) / rn[probes]).max()) if bool(probes.any()) else 0.0
+                if bool(torch.isfinite(o).all()) and tot <= 2e-5 and row <= 1e-4 and pr <= 1e-6:
+                    cands.append(ai)
+            fns = [lambda: torch.mm(x, wcat.t(), out_dtype=torch.float32)]
+            for ai in cands:
+                o = torch.empty((m, n), dtype=torch.float32, device=dev)
+                fns.append(lambda ai=ai, o=o: mod.lt_run(pid, ai, wcat, x, o, 0.0, ws))
+            ev = [[] for _ in fns]
+            for rep in range(GD_LT_REPS):
+                for i in (range(len(fns)) if rep % 2 == 0 else reversed(range(len(fns)))):
+                    flush.sum()
+                    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    fns[i]()
+                    e1.record()
+                    ev[i].append((e0, e1))
+            torch.cuda.synchronize()
+            med = [sorted(a.elapsed_time(b2) * 1000.0 for a, b2 in e)[len(e) // 2] for e in ev]
+            best = min(range(1, len(fns)), key=lambda i: med[i]) if len(fns) > 1 else None
+            if best is not None and med[best] <= GD_LT_MARGIN * med[0]:
+                plans[m] = (pid, cands[best - 1])
+                notes.append(f"m{m}: lt{cands[best - 1]} {med[best]:.2f} vs torch {med[0]:.2f} us (x{med[0] / med[best]:.3f}, "
+                             f"{len(cands)}/{cnt} algos pass)")
+            else:
+                notes.append(f"m{m}: torch kept ({med[0]:.2f} us; best lt "
+                             f"{'-' if best is None else f'{med[best]:.2f}'}; {len(cands)}/{cnt} algos pass)")
+        except Exception as ex:
+            notes.append(f"m{m}: FALLBACK {ex!r}")
+    del flush
+    state["gdlt"] = {"mod": mod, "plans": plans, "ws": ws} if plans else None
+    print(f"[gd] LT cat [{n}x{k}] FP32 out: " + "; ".join(notes), flush=True)
+    return None
+
+
+def _gd_lt_cat(ffn_input, state):
+    st = state.get("gdlt")
+    if not (GD_ENABLE and GD_LT and st is not None):
+        return None
+    x = ffn_input
+    p = st["plans"].get(x.shape[0])
+    if p is None or not (x.dtype == torch.bfloat16 and x.dim() == 2 and x.shape[1] == HIDDEN and x.is_contiguous()
+                         and x.data_ptr() % 16 == 0):
+        return None
+    try:
+        wcat = state["v8"]["wcat"]
+        out = torch.empty((x.shape[0], wcat.shape[0]), dtype=torch.float32, device=x.device)
+        st["mod"].lt_run(p[0], p[1], wcat, x, out, 0.0, st["ws"])
+        if ("lt", x.shape[0]) not in _GD_SEEN:
+            _GD_SEEN.add(("lt", x.shape[0]))
+            print(f"[gd] first call LT cat T={x.shape[0]}: algorithm {p[1]}", flush=True)
+        return out
+    except Exception as ex:
+        state["gdlt"] = None
+        print(f"[gd] LT raised at call time, torch's cat from now on: {ex!r}", flush=True)
+        return None
+
+'''
+
+V2_EDITS = [
+    ("v2 Lt build job", '    if GD_BUILD:\n        jobs.append(("gd", _gd_build))\n',
+     '    if GD_BUILD:\n        jobs.append(("gd", _gd_build))\n    if GD_BUILD and GD_LT_M:\n        jobs.append(("gdlt", _gd_lt_build))\n'),
+    ("v2 Lt prepare", "    _gd_prepare(state, t0)\n    _p206_prepare(state, t0)\n",
+     "    _gd_prepare(state, t0)\n    _gd_lt_prepare(state, t0)\n    _p206_prepare(state, t0)\n"),
+    ("v2 cat route T = 9-32", '    g2out = _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n',
+     '    g2out = _g2_prt(ffn_input, router_input, state, data, tokens, mode, tail)\n'
+     '    if g2out is None and tail == "cat":\n        g2out = _gd_cat(ffn_input, state, data, tokens)\n'),
+    ("v2 Lt cat T = 128", '            y32 = torch.mm(ffn_input, state["v8"]["wcat"].t(), out_dtype=torch.float32)\n',
+     '            y32 = _gd_lt_cat(ffn_input, state)\n        if y32 is None:\n'
+     '            y32 = torch.mm(ffn_input, state["v8"]["wcat"].t(), out_dtype=torch.float32)\n'),
+]
+
 PY_ANCHOR = "\ndef kernel_fn(data, state):\n"
 
 EDITS = [
@@ -1219,21 +1564,34 @@ EDITS = [
 ]
 
 
-def block(prt=False):
-    """The GD Python block with the two kernel sources inlined as raw string literals (+ the T = 1 prt kernel if prt)."""
+def _repl(src, edits, what):
+    for name, old, new in edits:
+        if src.count(old) != 1:
+            raise RuntimeError(f"gd patch {what} {name!r}: anchor found {src.count(old)}x (want 1)")
+        src = src.replace(old, new)
+    return src
+
+
+def block(prt=False, v2=False):
+    """The GD Python block with the kernel sources inlined as raw string literals (+ prt: the T = 1 prt kernel; + v2: the
+    OUT 2 router epilogue, two-base packs, the two-launch cat and the pinned-Lt T = 128 cat)."""
     cpp, cuda, py = GD_CPP_SRC, GD_CUDA_SRC, PY
     if prt:
         ns_end = "}  // namespace gd\n"
         if cuda.count(ns_end) != 1:
             raise RuntimeError("gd patch: namespace end anchor")
         cpp, cuda, py = cpp + PRT_CPP, cuda.replace(ns_end, PRT_DEV + "\n" + ns_end) + PRT_HOST, py + PRT_PY
-    for src in (cpp, cuda):
+    if v2:
+        cuda = _repl(cuda, V2_CUDA, "v2 cuda")
+        py = _repl(py, V2_PY_REPL, "v2 py") + V2_PY
+    for src in (cpp, cuda, V2_LT_CPP):
         if "'''" in src or src.endswith("\\"):
             raise RuntimeError("gd patch: a kernel source holds ''' or ends in a backslash")
-    return py.replace("@CPP@", "r'''" + cpp + "'''").replace("@CUDA@", "r'''" + cuda + "'''")
+    py = py.replace("@CPP@", "r'''" + cpp + "'''").replace("@CUDA@", "r'''" + cuda + "'''")
+    return py.replace("@LTCPP@", "r'''" + V2_LT_CPP + "'''") if v2 else py
 
 
-def apply(text, prt=False):
+def apply(text, prt=False, v2=False):
     for name in ("GD_ENABLE", "GD_CUDA_SRC", "def _gd(", "def _gd_prepare(", "_gd_build"):
         if name in text:
             raise RuntimeError(f"gd patch: {name!r} already in the base")
@@ -1243,12 +1601,11 @@ def apply(text, prt=False):
         text = text.replace(old, new)
     if text.count(PY_ANCHOR) != 1:
         raise RuntimeError("gd patch: kernel_fn anchor")
-    text = text.replace(PY_ANCHOR, block(prt) + PY_ANCHOR)
+    text = text.replace(PY_ANCHOR, block(prt, v2) + PY_ANCHOR)
     if prt:
-        for name, old, new in PRT_EDITS:
-            if text.count(old) != 1:
-                raise RuntimeError(f"gd patch {name!r}: anchor found {text.count(old)}x (want 1)")
-            text = text.replace(old, new)
+        text = _repl(text, PRT_EDITS, "prt")
+    if v2:
+        text = _repl(text, V2_EDITS, "v2")
     return text
 
 
