@@ -50,6 +50,8 @@ CUDA_SRC = r'''
 #ifndef VMS_FL
 #define VMS_FL 0
 #endif
+#define VMS_DW ((VMS_FL & 64) != 0)
+#define VMS_STAG ((VMS_FL & 16) ? 1 : (VMS_FL & 32) ? 2 : VMS_NS)
 
 namespace vms {
 constexpr int HD = 4096, ID = 4096, NE = 32, MAXP = 128, MAXJ = 64;
@@ -112,7 +114,7 @@ __device__ __forceinline__ const unsigned char* unit_src(const Params& p, const 
 }
 
 // sm_90: thread 0 only (bulk copy + expect_tx); sm_86: every compute thread (cp.async + arrive.noinc, count NT)
-__device__ __forceinline__ void issue(const unsigned char* src, unsigned char* dst, uint64_t* bar, int tid) {
+__device__ __forceinline__ void issue(const unsigned char* src, unsigned char* dst, uint64_t* bar, int tid, int nthr = NT) {
 #if __CUDA_ARCH__ >= 900
   uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
@@ -120,7 +122,7 @@ __device__ __forceinline__ void issue(const unsigned char* src, unsigned char* d
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n"
                :: "r"(su32(dst)), "l"(src), "r"(UB), "r"(su32(bar)), "l"(pol) : "memory");
 #else
-  for (int i = tid; i < UB / 16; i += NT)
+  for (int i = tid; i < UB / 16; i += nthr)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(su32(dst + i * 16)), "l"(src + i * 16) : "memory");
   asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" :: "r"(su32(bar)) : "memory");
 #endif
@@ -151,9 +153,9 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
 #if __CUDA_ARCH__ >= 900
     for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], 1);
 #else
-    for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], NT);
+    for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], VMS_DW ? 32 : NT);
 #endif
-    for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], 1); mbar_init(&S.pempty[i], 1); }
+    for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], VMS_DW ? NW : 1); mbar_init(&S.pempty[i], 1); }
 #if __CUDA_ARCH__ >= 900
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 #endif
@@ -213,12 +215,14 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
   if (mk && tid == 0) { mrow[1] = gt(); mrow[10] = N; }
   if (warp < NW) {
     // ================= compute warps
-    for (int q = 0; q < NS && q < N; ++q) {
+#if !(VMS_DW && __CUDA_ARCH__ < 900)
+    for (int q = 0; q < VMS_STAG && q < N; ++q) {
 #if __CUDA_ARCH__ >= 900
       if (tid == 0)
 #endif
       issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], tid);
     }
+#endif
     const uint32_t k16 = 16u + (uint32_t)(p.m >> 30);   // opaque 16: the scale build's multiply stays an IMAD
     const int g = lane >> 2, t = lane & 3;
     uint4 xr[2 * NCH];
@@ -279,6 +283,16 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       }
       mbar_wait(&S.full[sl], par);
       if (mk && tid == 0 && q == 0) mrow[2] = gt();
+#if VMS_STAG < VMS_NS && !(VMS_DW && __CUDA_ARCH__ < 900)
+      if (q == 0) {
+        for (int q2 = VMS_STAG; q2 < NS && q2 < N; ++q2) {
+#if __CUDA_ARCH__ >= 900
+          if (tid == 0)
+#endif
+          issue(unit_src(p, S, q2, nA, a0, b0), ring + q2 * UB, &S.full[q2], tid);
+        }
+      }
+#endif
       const unsigned char* slot = ring + sl * UB;
 #if VMS_NW == 16
       const uint2 sc2 = *reinterpret_cast<const uint2*>(slot + UC + (warp >> 1) * 512 + lane * 16 + (warp & 1) * 8);
@@ -319,6 +333,10 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       const int bq = q & (NRB - 1);
       mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));
       S.red[bq][warp][lane] = o;
+#if VMS_DW
+      __syncwarp();
+      if (lane == 0) mbar_arrive(&S.pfull[bq]);   // the helper refills the slot once all NW warps are in
+#else
       cta_sync_compute();
       if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
@@ -327,6 +345,7 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
         issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
       }
       if (tid == 0) mbar_arrive(&S.pfull[bq]);
+#endif
       if (++sl == NS) { sl = 0; par ^= 1u; }
     }
     if (mk && tid == 0) mrow[5] = gt();
@@ -334,9 +353,22 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
     // ================= helper warp: per-unit K reduction + epilogue
     const int g = lane >> 2, t = lane & 3;
     float* ssc = p.ss + (S.gen & 1) * MAXP;
+#if VMS_DW && __CUDA_ARCH__ < 900
+    for (int q = 0; q < NS && q < N; ++q) issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], lane, 32);
+#endif
+    int hsl = 0;
     for (int q = 0; q < N; ++q) {
       const int bq = q & (NRB - 1);
       mbar_wait(&S.pfull[bq], (uint32_t)((q / NRB) & 1));
+#if VMS_DW
+      if (q + NS < N) {
+#if __CUDA_ARCH__ >= 900
+        if (lane == 0)
+#endif
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + hsl * UB, &S.full[hsl], lane, 32);
+      }
+#endif
+      if (++hsl == NS) hsl = 0;
       float4 sm = S.red[bq][0][lane];
 #pragma unroll
       for (int w = 1; w < NW; ++w) { const float4 u = S.red[bq][w][lane]; sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w; }

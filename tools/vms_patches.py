@@ -44,7 +44,7 @@ _VMS = {"mod": None, "G": None}
 def _vms_build():
     from torch.utils.cpp_extension import load_inline
     G = torch.cuda.get_device_properties(0).multi_processor_count
-    flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=3", "-Xptxas=-warn-spills", "-gencode=arch=compute_90a,code=sm_90a"]
+    flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=3", f"-DVMS_FL={VMS_FL}", "-Xptxas=-warn-spills", "-gencode=arch=compute_90a,code=sm_90a"]
     tag = hashlib.sha1((VMS_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
     t1 = time.time()
     mod = load_inline(name=f"k3_vms_{tag}", cpp_sources=VMS_CPP_SRC, cuda_sources=VMS_CUDA_SRC, functions=["run", "attrs"],
@@ -211,6 +211,7 @@ def apply_vms(text, maxt=16, fl=0, lab=None):
     if lab == LAB_V1:   # the frozen v1 run() has no fl argument
         text = _once(text, ', K2A_POST_NORM_EPS, 1, 0, VMS_FL)', ', K2A_POST_NORM_EPS, 1, 0)', "v1 call")
         text = _once(text, "VMS_MAXT = %d\nVMS_FL = %d\n" % (maxt, fl), "VMS_MAXT = %d\n" % maxt, "v1 VMS_FL")
+        text = _once(text, ' f"-DVMS_FL={VMS_FL}",', '', "v1 build define")
     return text
 
 
