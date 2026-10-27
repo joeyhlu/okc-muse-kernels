@@ -1,5 +1,5 @@
 # okc: problem=muse_attention_decode
-# nonce va-5 (va_k3_va_7_ab attention path for muse_attention_decode (VA1 + VA2 routes), tools/va_patches.py --attn; VA2_VAR=344 VA2_KX=True VA2_LAZY=True)
+# nonce va-5 (va_k3_va_8_ab attention path for muse_attention_decode (VA1 + VA2 routes), tools/va_patches.py --attn; VA2_VAR=345)
 
 from typing import TypedDict
 
@@ -1307,7 +1307,7 @@ __device__ __forceinline__ bool va2_softmax_lazy(float (&S)[32], const float (&m
   return !__any_sync(FULL, ov != 0u);
 }
 
-template <int ST, int PW, int NVT>
+template <int ST, int PW, int NVT, int KV = 0>
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #if K1_ARCH_OK
   constexpr int L = 8;
@@ -1371,7 +1371,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     const int q = tid - 256, c = q & 7, x0 = q >> 3, psh = p.page_shift, pm = (1 << psh) - 1;
     const uint8_t* kc = p.k_cache + (size_t)hp * 128 + 16 * c;
     const uint8_t* vc = p.v_cache + (size_t)hp * 128 + 16 * c;
-    const bool kx = PW == 4 && (p.W & 4) != 0;
+    const bool kx = PW == 4 && (KV || (p.W & 4) != 0);
     const int ck = (q >> 3) & 7, xk0 = (q & 7) + 8 * (q >> 6);
     const uint8_t* kck = p.k_cache + (size_t)hp * 128 + 16 * ck;
     for (int b = bf; b < B && sV[b] < v1; ++b) {
@@ -1382,13 +1382,23 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       int pg[MPT], pgk[MPT];
 #pragma unroll
       for (int m = 0; m < MPT; ++m) {
-        pg[m] = (k0 + x0 + XS * m < cend) ? __ldg(pt + ((k0 + x0 + XS * m) >> psh)) : -1;
+        pg[m] = (!KV && k0 + x0 + XS * m < cend) ? __ldg(pt + ((k0 + x0 + XS * m) >> psh)) : -1;
         pgk[m] = (kx && k0 + xk0 + 16 * m < cend) ? __ldg(pt + ((k0 + xk0 + 16 * m) >> psh)) : -1;
       }
       for (int t = 0; t < nt; ++t, ++n) {
         const int st = n % ST;
         if (n >= ST) va_wait(empt + st, ((n / ST) - 1) & 1);
         uint8_t* stg = smem + st * STAGE_BYTES;
+        if constexpr (KV) {
+#pragma unroll
+          for (int m = 0; m < MPT; ++m) {
+            const int xk = xk0 + 16 * m, posk = k0 + t * TILE + xk;
+            const size_t gk = pgk[m] >= 0 ? (size_t)((pgk[m] << psh) | (posk & pm)) * rowB : (size_t)0;
+            cp_async16(stg + (ck >> 2) * 4096 + (xk >> 3) * 512 + (ck & 3) * 128 + (xk & 7) * 16, kck + gk, pgk[m] >= 0 ? 16 : 0);
+            cp_async16(stg + 8192 + xk * 128 + ((ck ^ (xk & 7)) << 4), kck + (p.v_cache - p.k_cache) + gk, pgk[m] >= 0 ? 16 : 0);
+            pgk[m] = (posk + TILE < cend) ? __ldg(pt + ((posk + TILE) >> psh)) : -1;
+          }
+        } else {
 #pragma unroll
         for (int m = 0; m < MPT; ++m) {
           const int x = x0 + XS * m, pos = k0 + t * TILE + x;
@@ -1405,6 +1415,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
           cp_async16(stg + 8192 + (x & 1) * 4096 + vt * 16, vc + go, pg[m] >= 0 ? 16 : 0);
           const int nx = pos + TILE;
           pg[m] = (nx < cend) ? __ldg(pt + (nx >> psh)) : -1;
+        }
         }
         asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" ::"r"(va_sa(full + st)) : "memory");
       }
@@ -1426,8 +1437,10 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
   const uint64_t dq = desc_il(qs + h * 4096, 128, 512);
   auto transpose_v = [&](int nn) {
     const uint8_t* stg = smem + (nn % ST) * STAGE_BYTES + 8192;
-    const uint4 va = *reinterpret_cast<const uint4*>(stg + vtid * 16);
-    const uint4 vb = *reinterpret_cast<const uint4*>(stg + 4096 + vtid * 16);
+    const int lk0 = 16 * (vtid >> 6) + 8 * ((vtid >> 5) & 1) + 2 * ((vtid >> 3) & 3), lc = vtid & 7;
+    const uint4 va = *reinterpret_cast<const uint4*>(KV ? stg + lk0 * 128 + ((lc ^ (lk0 & 7)) << 4) : stg + vtid * 16);
+    const uint4 vb = *reinterpret_cast<const uint4*>(KV ? stg + (lk0 + 1) * 128 + ((lc ^ ((lk0 + 1) & 7)) << 4)
+                                                        : stg + 4096 + vtid * 16);
     uint8_t* dst = vtb + (nn % NVT) * VT_BYTES + vt_own;
     const uint32_t wa[4] = {va.x, va.y, va.z, va.w}, wb[4] = {vb.x, vb.y, vb.z, vb.w};
 #pragma unroll
@@ -2057,7 +2070,7 @@ static int occ_of() {
   return nb;
 }
 
-static bool stages_ok(int64_t L, int64_t ST) { return (L == 1) ? (ST == 4 || ST == 6 || ST == 203 || ST == 204 || ST == 213 || ST == 214) : (ST == 3 || ST == 4 || ST == 303 || ST == 313 || ST == 323 || ST == 333 || ST == 344 || ST == 354); }
+static bool stages_ok(int64_t L, int64_t ST) { return (L == 1) ? (ST == 4 || ST == 6 || ST == 203 || ST == 204 || ST == 213 || ST == 214) : (ST == 3 || ST == 4 || ST == 303 || ST == 313 || ST == 323 || ST == 333 || ST == 344 || ST == 354 || ST == 345 || ST == 355); }
 
 template <int ST>
 static int va_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl = false) {   // VA1 (tools/va_patches.py): launch, or occupancy
@@ -2080,11 +2093,11 @@ static int va_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl = fals
 }
 
 
-template <int ST, int PW, int NVT>
+template <int ST, int PW, int NVT, int KV = 0>
 static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
   static bool attr = false;
   if (!attr) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT>()));
     attr = true;
   }
   int nb = 0;
@@ -2095,14 +2108,14 @@ static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT>(); cfg.stream = s;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT>, *p));
-  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT>, 256 + 32 * PW, k1::va2_smem<ST, NVT>()));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV>, *p));
+  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV>, 256 + 32 * PW, k1::va2_smem<ST, NVT>()));
   return nb;
 }
 
 int64_t k1_occupancy(int64_t L, int64_t ST) {
   TORCH_CHECK(stages_ok(L, ST), "k1: (L, stages) not instantiated");
-  if (ST > 300) return (int64_t)(ST >= 344 ? va2_go<4, 4, 2>(nullptr, dim3(1), 0, false) : ST >= 320 ? va2_go<3, 4, 3>(nullptr, dim3(1), 0, false) : va2_go<3, 1, 3>(nullptr, dim3(1), 0, false));
+  if (ST > 300) return (int64_t)(ST % 10 == 5 ? va2_go<4, 4, 2, 1>(nullptr, dim3(1), 0, false) : ST >= 344 ? va2_go<4, 4, 2>(nullptr, dim3(1), 0, false) : ST >= 320 ? va2_go<3, 4, 3>(nullptr, dim3(1), 0, false) : va2_go<3, 1, 3>(nullptr, dim3(1), 0, false));
   if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>(nullptr, dim3(1), 0) : va_go<4>(nullptr, dim3(1), 0));
   if (L == 1) return (int64_t)(ST == 4 ? occ_of<1, 4>() : occ_of<1, 6>());
   return (int64_t)(ST == 3 ? occ_of<8, 3>() : occ_of<8, 4>());
@@ -2171,7 +2184,8 @@ void k1_forward(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_l
   const dim3 grid((unsigned)Gx, (unsigned)(Hkv / 2));
   if (stages > 300) {
     TORCH_CHECK(L == 8 && fold == 1 && B <= 128, "va2: L 8, fold, B <= 128");
-    if (stages >= 344) va2_go<4, 4, 2>(&p, grid, st, stages > 350);
+    if (stages % 10 == 5) va2_go<4, 4, 2, 1>(&p, grid, st, stages > 350);
+    else if (stages >= 344) va2_go<4, 4, 2>(&p, grid, st, stages > 350);
     else if (stages >= 320) va2_go<3, 4, 3>(&p, grid, st, stages > 330);
     else va2_go<3, 1, 3>(&p, grid, st, stages > 310);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2386,9 +2400,9 @@ VA2_ENABLE = True
 VA2_MIN_B = 2
 VA2_SEGK = 600
 VA2_PDL = False
-VA2_LAZY = True
-VA2_KX = True
-VA2_VAR = 344
+VA2_LAZY = False
+VA2_KX = False
+VA2_VAR = 345
 VA2_CASES = ((2, 3000, 1, 1.0, 401), (3, 1500, 64, 1.0, 402), (16, 700, 1, 1.0 / 64, 403), (5, 9000, 1, 1.0, 404),
              (33, 300, 1, 1.0, 405), (32, 2500, 1, 1.0, 406), (2, 20, 64, 1.0, 407))
 
@@ -2439,7 +2453,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 323, 344):
+        for code in (303, 323, 344, 345):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -2452,7 +2466,7 @@ def _va2_prepare(state):
                         and kt < 3e-2 and vt < 3e-2):
                     raise RuntimeError(f"self-test mismatch B={B} ctx={ctx}")
         state["va2_ok"] = True
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 323, 344)]} (variant {VA2_VAR}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 323, 344, 345)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
