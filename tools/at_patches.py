@@ -169,6 +169,14 @@ def builtin():
     variant("attn_slide", "fa4", (16, 32), {"KS3_ROUTE": "{k: False for k in KS3_ROUTE}", "KS2_ROUTE": "{k: False for k in KS2_ROUTE}"},
             kinds=("sliding",), when='KS3_ENABLE and S.get("ks3") and S.get("fa4v6")', ship=False,
             note="decode 16 / 32 sliding: KS3 vs FA4 v6")
+    for b in (128, 256):   # research rows for the VML builder (dropped on bases without VML_FLAGS / VML_COST)
+        vml = 'VML_ENABLE and VML_BUCKETS.get(%d) and _VML["ok"].get(%d)' % (b, b)
+        variant("moe", "vml-nob6", (b,), {"VML_FLAGS": "{**VML_FLAGS, %d: VML_FLAGS.get(%d, 1) & ~64}" % (b, b)},
+                when=vml + " and VML_FLAGS.get(%d, 0) & 64" % b, ship=False, note="VML flags bit 6 off (self-fill / gather)")
+        variant("moe", "vml-cost0", (b,), {"VML_COST": "{k: v for k, v in VML_COST.items() if k != %d}" % b},
+                when=vml + " and %d in VML_COST" % b, ship=False, note="VML default cost table instead of the refit")
+    variant("attn_slide", "vsl-off", (1, 8, 16), {"VSL_ENABLE": "False"}, kinds=("sliding",),
+            when="VSL_ENABLE", ship=False, note="VSL red.add merge variants off (KS1 / KS3 base geometries)")
     for proj, bs in (("qkv", (1, 8, 16, 32)), ("o", (1, 8, 16, 32)), ("pooler", (8,)), ("unpooler", (1, 8, 16, 32))):
         for b in bs:
             variant(proj, f"{proj}-nogd", (b,), {"GD_ROUTE": "_at_gdrop(%r, %d)" % (proj, b)},

@@ -19966,7 +19966,7 @@ def _at_gdok(S, proj, b):
 
 
 def _at_swap(ov):
-    global GD_ROUTE, KS1_ROUTE, KS2_ROUTE, KS3_ROUTE, M32_PX, P206_ENABLE, VA1_ENABLE, VA1_PDL, VA1_SEGK, VA1_STAGES, VML_BUCKETS, VMS_ENABLE
+    global GD_ROUTE, KS1_ROUTE, KS2_ROUTE, KS3_ROUTE, M32_PX, P206_ENABLE, VA1_ENABLE, VA1_PDL, VA1_SEGK, VA1_STAGES, VML_BUCKETS, VML_COST, VML_FLAGS, VMS_ENABLE, VSL_ENABLE
     old = {}
     if not ov:
         return old
@@ -19992,13 +19992,19 @@ def _at_swap(ov):
         old["VA1_STAGES"], VA1_STAGES = VA1_STAGES, ov["VA1_STAGES"]
     if "VML_BUCKETS" in ov:
         old["VML_BUCKETS"], VML_BUCKETS = VML_BUCKETS, ov["VML_BUCKETS"]
+    if "VML_COST" in ov:
+        old["VML_COST"], VML_COST = VML_COST, ov["VML_COST"]
+    if "VML_FLAGS" in ov:
+        old["VML_FLAGS"], VML_FLAGS = VML_FLAGS, ov["VML_FLAGS"]
     if "VMS_ENABLE" in ov:
         old["VMS_ENABLE"], VMS_ENABLE = VMS_ENABLE, ov["VMS_ENABLE"]
+    if "VSL_ENABLE" in ov:
+        old["VSL_ENABLE"], VSL_ENABLE = VSL_ENABLE, ov["VSL_ENABLE"]
     return old
 
 
 def _at_cur():
-    return {"GD_ROUTE": GD_ROUTE, "KS1_ROUTE": KS1_ROUTE, "KS2_ROUTE": KS2_ROUTE, "KS3_ROUTE": KS3_ROUTE, "M32_PX": M32_PX, "P206_ENABLE": P206_ENABLE, "VA1_ENABLE": VA1_ENABLE, "VA1_PDL": VA1_PDL, "VA1_SEGK": VA1_SEGK, "VA1_STAGES": VA1_STAGES, "VML_BUCKETS": VML_BUCKETS, "VMS_ENABLE": VMS_ENABLE}
+    return {"GD_ROUTE": GD_ROUTE, "KS1_ROUTE": KS1_ROUTE, "KS2_ROUTE": KS2_ROUTE, "KS3_ROUTE": KS3_ROUTE, "M32_PX": M32_PX, "P206_ENABLE": P206_ENABLE, "VA1_ENABLE": VA1_ENABLE, "VA1_PDL": VA1_PDL, "VA1_SEGK": VA1_SEGK, "VA1_STAGES": VA1_STAGES, "VML_BUCKETS": VML_BUCKETS, "VML_COST": VML_COST, "VML_FLAGS": VML_FLAGS, "VMS_ENABLE": VMS_ENABLE, "VSL_ENABLE": VSL_ENABLE}
 
 
 def _at_prepare_set():
@@ -20038,6 +20044,11 @@ def _at_variants(S):
     add('attn_slide', 'fa4', (1, 8), ('sliding',), False, lambda: ({"KS1_ROUTE": {k: False for k in KS1_ROUTE}}, KS1_ENABLE and S.get("ks1") and S.get("fa4v6")), 0.15)
     add('attn_slide', 'ks2', (16,), ('sliding',), False, lambda: ({"KS3_ROUTE": {k: False for k in KS3_ROUTE}}, KS3_ENABLE and S.get("ks3") and KS2_ROUTE.get((16, 1)) and S.get("ks2")), 0.15)
     add('attn_slide', 'fa4', (16, 32), ('sliding',), False, lambda: ({"KS3_ROUTE": {k: False for k in KS3_ROUTE}, "KS2_ROUTE": {k: False for k in KS2_ROUTE}}, KS3_ENABLE and S.get("ks3") and S.get("fa4v6")), 0.15)
+    add('moe', 'vml-nob6', (128,), None, False, lambda: ({"VML_FLAGS": {**VML_FLAGS, 128: VML_FLAGS.get(128, 1) & ~64}}, VML_ENABLE and VML_BUCKETS.get(128) and _VML["ok"].get(128) and VML_FLAGS.get(128, 0) & 64))
+    add('moe', 'vml-cost0', (128,), None, False, lambda: ({"VML_COST": {k: v for k, v in VML_COST.items() if k != 128}}, VML_ENABLE and VML_BUCKETS.get(128) and _VML["ok"].get(128) and 128 in VML_COST))
+    add('moe', 'vml-nob6', (256,), None, False, lambda: ({"VML_FLAGS": {**VML_FLAGS, 256: VML_FLAGS.get(256, 1) & ~64}}, VML_ENABLE and VML_BUCKETS.get(256) and _VML["ok"].get(256) and VML_FLAGS.get(256, 0) & 64))
+    add('moe', 'vml-cost0', (256,), None, False, lambda: ({"VML_COST": {k: v for k, v in VML_COST.items() if k != 256}}, VML_ENABLE and VML_BUCKETS.get(256) and _VML["ok"].get(256) and 256 in VML_COST))
+    add('attn_slide', 'vsl-off', (1, 8, 16), ('sliding',), False, lambda: ({"VSL_ENABLE": False}, VSL_ENABLE), 0.15)
     add('qkv', 'qkv-nogd', (1,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 1)}, _at_gdok(S, 'qkv', 1)))
     add('qkv', 'qkv-nogd', (8,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 8)}, _at_gdok(S, 'qkv', 8)))
     add('qkv', 'qkv-nogd', (16,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 16)}, _at_gdok(S, 'qkv', 16)))
