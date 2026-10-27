@@ -51,6 +51,7 @@ CUDA_SRC = r'''
 #define VMS_FL 0
 #endif
 #define VMS_DW ((VMS_FL & 64) != 0)
+#define VMS_SKT ((VMS_FL & 128) ? 16 : 8)
 #define VMS_STAG ((VMS_FL & 16) ? 1 : (VMS_FL & 32) ? 2 : VMS_NS)
 
 namespace vms {
@@ -77,6 +78,9 @@ struct __align__(16) Smem {
   int jE[MAXJ], jS[MAXJ], jC[MAXJ];
   int ent[MAXP], pos[MAXP];
   float4 red[NRB][NW][32];
+#if VMS_SKT == 16
+  float4 red2[NRB][NW][32];
+#endif
 };
 constexpr int RING_OFF = (int)((sizeof(Smem) + 127) / 128 * 128);
 constexpr int SMEM_BYTES = RING_OFF + NS * UB;
@@ -141,6 +145,40 @@ __device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+
+// one unit for one warp: dequant each word once, 1 or 2 n-tiles (TWO: tokens 8..15 from x2)
+template <bool TWO>
+__device__ __forceinline__ void consume(const unsigned char* slot, const uint4 sc, const uint4 (&xr)[2 * NCH],
+                                        const uint4 (&x2)[2 * NCH], float (&acc)[4][4], float (&acc2)[4][4],
+                                        uint32_t k16, int warp, int lane) {
+#pragma unroll
+  for (int cc = 0; cc < NCH; ++cc) {
+    const uint4 w = *reinterpret_cast<const uint4*>(slot + (warp * NCH + cc) * 512 + lane * 16);
+    const uint32_t sw = cc < 4 ? (cc < 2 ? sc.x : sc.y) : (cc < 6 ? sc.z : sc.w);
+    const uint32_t sel = (cc & 1) ? 0x4242u : 0x4040u;
+    const uint32_t sg = scd(sw, sel, k16), sg8 = scd(sw, sel + 0x0101u, k16);
+    const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+    const uint32_t bb[8] = {xr[2 * cc].x, xr[2 * cc].y, xr[2 * cc].z, xr[2 * cc].w,
+                            xr[2 * cc + 1].x, xr[2 * cc + 1].y, xr[2 * cc + 1].z, xr[2 * cc + 1].w};
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint32_t qw = ww[s];
+      const uint32_t M = 0x81C081C0u;
+      const uint32_t r0 = qw & M;
+      const uint32_t r1 = (qw * 16u) & M;
+      const uint32_t r2 = __funnelshift_l(qw, qw, 10) & M;
+      const uint32_t r3 = ((qw * 64u) & 0x80C080C0u) | (__funnelshift_l(qw, qw, 14) & 0x01000100u);
+      const uint32_t A0 = bmul(r0, sg), A1 = bmul(r1, sg8), A2 = bmul(r2, sg), A3 = bmul(r3, sg8);
+      mma(acc[TWO ? (s & 1) : s], A0, A1, A2, A3, bb[2 * s], bb[2 * s + 1]);   // TWO: 2 chains per tile (register budget)
+      if (TWO) {
+        const uint32_t b0 = s < 2 ? (s == 0 ? x2[2 * cc].x : x2[2 * cc].z) : (s == 2 ? x2[2 * cc + 1].x : x2[2 * cc + 1].z);
+        const uint32_t b1 = s < 2 ? (s == 0 ? x2[2 * cc].y : x2[2 * cc].w) : (s == 2 ? x2[2 * cc + 1].y : x2[2 * cc + 1].w);
+        mma(acc2[s & 1], A0, A1, A2, A3, b0, b1);
+      }
+    }
+  }
+}
+
 __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
   extern __shared__ __align__(128) unsigned char smem[];
   Smem& S = *reinterpret_cast<Smem*>(smem);
@@ -182,14 +220,14 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
     int cr[4], tot = 0;
 #pragma unroll
     for (int r = 0; r < 4; ++r) { cr[r] = S.base[r][lane]; tot += cr[r]; }
-    int inc = tot, nj = (tot + 7) >> 3, jinc = nj;
+    int inc = tot, nj = (tot + VMS_SKT - 1) / VMS_SKT, jinc = nj;
 #pragma unroll
     for (int d = 1; d < 32; d <<= 1) {
       const int a = __shfl_up_sync(0xffffffffu, inc, d), b = __shfl_up_sync(0xffffffffu, jinc, d);
       if (lane >= d) { inc += a; jinc += b; }
     }
     const int off = inc - tot, joff = jinc - nj;
-    for (int k = 0; k < nj; ++k) { S.jE[joff + k] = lane; S.jS[joff + k] = off + 8 * k; S.jC[joff + k] = min(8, tot - 8 * k); }
+    for (int k = 0; k < nj; ++k) { S.jE[joff + k] = lane; S.jS[joff + k] = off + VMS_SKT * k; S.jC[joff + k] = min(VMS_SKT, tot - VMS_SKT * k); }
     int run = off;
 #pragma unroll
     for (int r = 0; r < 4; ++r) { S.base[r][lane] = run; run += cr[r]; }
@@ -226,6 +264,10 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
     const uint32_t k16 = 16u + (uint32_t)(p.m >> 30);   // opaque 16: the scale build's multiply stays an IMAD
     const int g = lane >> 2, t = lane & 3;
     uint4 xr[2 * NCH];
+#if VMS_SKT == 16
+    uint4 x2[2 * NCH];
+    bool two = false;
+#endif
     int curj = -1;
     int sl = 0; uint32_t par = 0;
     for (int q = 0; q < N; ++q) {
@@ -262,6 +304,24 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
 #pragma unroll
           for (int cc = 0; cc < 2 * NCH; ++cc) xr[cc] = make_uint4(0u, 0u, 0u, 0u);
         }
+#if VMS_SKT == 16
+        two = cnt > 8;
+        if (two) {
+          if (g + 8 < cnt) {
+            const uint4* src = PB ? reinterpret_cast<const uint4*>(p.inter + (size_t)(st + 8 + g) * ID)
+                                  : reinterpret_cast<const uint4*>(p.x + (size_t)(S.ent[st + 8 + g] >> 3) * HD);
+            src += warp * (8 * NCH) + 2 * t;
+#pragma unroll
+            for (int cc = 0; cc < NCH; ++cc) {
+              x2[2 * cc] = PB ? __ldcg(src + cc * 8) : __ldg(src + cc * 8);
+              x2[2 * cc + 1] = PB ? __ldcg(src + cc * 8 + 1) : __ldg(src + cc * 8 + 1);
+            }
+          } else {
+#pragma unroll
+            for (int cc = 0; cc < 2 * NCH; ++cc) x2[cc] = make_uint4(0u, 0u, 0u, 0u);
+          }
+        }
+#endif
       }
       if ((VMS_FL & 12) && q + 1 < N) {   // the next unit starts a new job: pull its x / inter fragments into L1 now
         const bool PB1 = q + 1 >= nA;
@@ -303,7 +363,13 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       float acc[4][4];
 #pragma unroll
       for (int s = 0; s < 4; ++s) { acc[s][0] = 0.f; acc[s][1] = 0.f; acc[s][2] = 0.f; acc[s][3] = 0.f; }
-#if !(VMS_FL & 2)
+#if VMS_SKT == 16
+      float acc2[4][4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) { acc2[s][0] = 0.f; acc2[s][1] = 0.f; acc2[s][2] = 0.f; acc2[s][3] = 0.f; }
+      if (two) consume<true>(slot, sc, xr, x2, acc, acc2, k16, warp, lane);
+      else consume<false>(slot, sc, xr, x2, acc, acc2, k16, warp, lane);
+#elif !(VMS_FL & 2)
 #pragma unroll
       for (int cc = 0; cc < NCH; ++cc) {
         const uint4 w = *reinterpret_cast<const uint4*>(slot + (warp * NCH + cc) * 512 + lane * 16);
@@ -333,6 +399,16 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       const int bq = q & (NRB - 1);
       mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));
       S.red[bq][warp][lane] = o;
+#if VMS_SKT == 16
+      if (two) {
+        float4 o2;
+        o2.x = acc2[0][0] + acc2[1][0] + acc2[2][0] + acc2[3][0];
+        o2.y = acc2[0][1] + acc2[1][1] + acc2[2][1] + acc2[3][1];
+        o2.z = acc2[0][2] + acc2[1][2] + acc2[2][2] + acc2[3][2];
+        o2.w = acc2[0][3] + acc2[1][3] + acc2[2][3] + acc2[3][3];
+        S.red2[bq][warp][lane] = o2;
+      }
+#endif
 #if VMS_DW
       __syncwarp();
       if (lane == 0) mbar_arrive(&S.pfull[bq]);   // the helper refills the slot once all NW warps are in
@@ -372,17 +448,31 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
       float4 sm = S.red[bq][0][lane];
 #pragma unroll
       for (int w = 1; w < NW; ++w) { const float4 u = S.red[bq][w][lane]; sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w; }
+#if VMS_SKT == 16
+      const int jq = q < nA ? ((a0 + q) >> 9) : ((b0 + (q - nA)) >> 8);
+      const int ntile = S.jC[jq] > 8 ? 2 : 1;
+      float4 sm2 = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (ntile == 2) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) { const float4 u = S.red2[bq][w][lane]; sm2.x += u.x; sm2.y += u.y; sm2.z += u.z; sm2.w += u.w; }
+      }
+#else
+      const int ntile = 1;
+      const float4 sm2 = sm;
+#endif
       __syncwarp();
       if (lane == 0) mbar_arrive(&S.pempty[bq]);
       if (q < nA) {
         const int v = a0 + q, j = v >> 9, rb = v & 511;
         const int cnt = S.jC[j], st = S.jS[j];
         const float gs = __ldg(p.gsA + S.jE[j]);
+        for (int tile = 0; tile < ntile; ++tile)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const int tk = 2 * t + h;
+          const int tk = 8 * tile + 2 * t + h;
+          const float4 ms = tile ? sm2 : sm;
           if (tk < cnt) {
-            const float ga = (h ? sm.y : sm.x) * gs, up = (h ? sm.w : sm.z) * gs;
+            const float ga = (h ? ms.y : ms.x) * gs, up = (h ? ms.w : ms.z) * gs;
             const float sv = __fdividef(ga, 1.f + __expf(-ga)) * up;
             p.inter[(size_t)(st + tk) * ID + rb * 8 + g] = __float2bfloat16(sv);
           }
@@ -399,10 +489,12 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
         const float gs = __ldg(p.gsB + S.jE[j]);
         const int n0 = rb * 16 + g;
         const float w0 = __ldg(p.nw + n0) * gs, w1 = __ldg(p.nw + n0 + 8) * gs;
+        for (int tile = 0; tile < ntile; ++tile)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const int tk = 2 * t + h;
-          const float y0 = (h ? sm.y : sm.x) * w0, y1 = (h ? sm.w : sm.z) * w1;
+          const int tk = 8 * tile + 2 * t + h;
+          const float4 ms = tile ? sm2 : sm;
+          const float y0 = (h ? ms.y : ms.x) * w0, y1 = (h ? ms.w : ms.z) * w1;
           float sq = y0 * y0 + y1 * y1;
           if (tk < cnt) {
             p.ybuf[(size_t)(st + tk) * HD + n0] = y0;
