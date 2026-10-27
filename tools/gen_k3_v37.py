@@ -20,6 +20,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 FIN1 = "--fin1" in sys.argv
+SS3 = "--ss3" in sys.argv   # lab: + tools/ss3_patches.py (ss in K3, 4-CTA clusters; R12 A/B file)
 CHECK = "--check" in sys.argv
 _argv, sys.argv = sys.argv, [sys.argv[0]]   # gen_k3_v35 reads its flags at import; library use only
 import gen_k3_v35 as G  # noqa: E402
@@ -29,13 +30,15 @@ import k3p_patches  # noqa: E402
 import kw1_patches  # noqa: E402
 import pt1_patches  # noqa: E402
 import rs1_patches  # noqa: E402
+import ss3_patches  # noqa: E402
 import sbb1_patches  # noqa: E402
 import strip_layer  # noqa: E402
 import tie1_patches  # noqa: E402
 import tl1_patches  # noqa: E402
 
-OUT = ROOT / "kernels/muse_decode_layer/k3_v37.py"
-LAB = ROOT / "kernels/lab/k3_v37_ab.py"
+_LABNAME = "k3_v37" + ("_ss3" if SS3 else "") + ("_fin1" if FIN1 else "")
+OUT = ROOT / ("kernels/muse_decode_layer/k3_v37.py" if not (SS3 or FIN1) else f"kernels/lab/{_LABNAME}_ab.py")
+LAB = ROOT / f"kernels/lab/{_LABNAME}_ab.py"
 NONCE = ("# nonce k3-v37-1 (k3_v36 [v35_fa_pt1 + TIE1 + TL1 + K3P] + RS1 warp-parallel K2A setup + SBB1 attention boundary"
          + (" + FIN1 vid-3 9-warp finalize" if FIN1 else "") + ")")
 
@@ -61,6 +64,10 @@ def generate():
     text = rs1_patches.apply(text)
     check(text.count("((1 << 7) if RS1_ENABLE else 0)") == 2, "RS1 call sites")
     rep.append("RS1 applied (probe bit 7)")
+    if SS3:
+        text = ss3_patches.apply(text)
+        check(text.count("| _ss3_bits(m)") == 2 and text.count("k3_kernel_ss(const Params P)") == 1, "SS3 anchors")
+        rep.append("SS3 applied (probe bit 23 + FIN1_K1_ONLY bit 5; K3 4-CTA cluster ss; K2 no ss work; prepare envelope self-test)")
     text = sbb1_patches.apply(text)
     check(text.count("SBB1_ENABLE = True") == 1 and 'jobs.append(("sbb1", _sbb1_build))' in text, "SBB1 + PT1 job")
     rep.append("SBB1 applied (attention boundary, PT1 job)")
