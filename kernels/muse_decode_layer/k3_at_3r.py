@@ -19970,36 +19970,21 @@ def _at_swap(ov):
     old = {}
     if not ov:
         return old
-    if "GD_ROUTE" in ov:
-        old["GD_ROUTE"], GD_ROUTE = GD_ROUTE, ov["GD_ROUTE"]
-    if "KS1_ROUTE" in ov:
-        old["KS1_ROUTE"], KS1_ROUTE = KS1_ROUTE, ov["KS1_ROUTE"]
-    if "KS2_ROUTE" in ov:
-        old["KS2_ROUTE"], KS2_ROUTE = KS2_ROUTE, ov["KS2_ROUTE"]
-    if "KS3_ROUTE" in ov:
-        old["KS3_ROUTE"], KS3_ROUTE = KS3_ROUTE, ov["KS3_ROUTE"]
-    if "M32_PX" in ov:
-        old["M32_PX"], M32_PX = M32_PX, ov["M32_PX"]
-    if "P206_ENABLE" in ov:
-        old["P206_ENABLE"], P206_ENABLE = P206_ENABLE, ov["P206_ENABLE"]
-    if "VA1_ENABLE" in ov:
-        old["VA1_ENABLE"], VA1_ENABLE = VA1_ENABLE, ov["VA1_ENABLE"]
-    if "VA1_PDL" in ov:
-        old["VA1_PDL"], VA1_PDL = VA1_PDL, ov["VA1_PDL"]
-    if "VA1_SEGK" in ov:
-        old["VA1_SEGK"], VA1_SEGK = VA1_SEGK, ov["VA1_SEGK"]
-    if "VA1_STAGES" in ov:
-        old["VA1_STAGES"], VA1_STAGES = VA1_STAGES, ov["VA1_STAGES"]
-    if "VML_BUCKETS" in ov:
-        old["VML_BUCKETS"], VML_BUCKETS = VML_BUCKETS, ov["VML_BUCKETS"]
-    if "VML_COST" in ov:
-        old["VML_COST"], VML_COST = VML_COST, ov["VML_COST"]
-    if "VML_FLAGS" in ov:
-        old["VML_FLAGS"], VML_FLAGS = VML_FLAGS, ov["VML_FLAGS"]
-    if "VMS_ENABLE" in ov:
-        old["VMS_ENABLE"], VMS_ENABLE = VMS_ENABLE, ov["VMS_ENABLE"]
-    if "VSL_ENABLE" in ov:
-        old["VSL_ENABLE"], VSL_ENABLE = VSL_ENABLE, ov["VSL_ENABLE"]
+    if "GD_ROUTE" in ov: old["GD_ROUTE"], GD_ROUTE = GD_ROUTE, ov["GD_ROUTE"]
+    if "KS1_ROUTE" in ov: old["KS1_ROUTE"], KS1_ROUTE = KS1_ROUTE, ov["KS1_ROUTE"]
+    if "KS2_ROUTE" in ov: old["KS2_ROUTE"], KS2_ROUTE = KS2_ROUTE, ov["KS2_ROUTE"]
+    if "KS3_ROUTE" in ov: old["KS3_ROUTE"], KS3_ROUTE = KS3_ROUTE, ov["KS3_ROUTE"]
+    if "M32_PX" in ov: old["M32_PX"], M32_PX = M32_PX, ov["M32_PX"]
+    if "P206_ENABLE" in ov: old["P206_ENABLE"], P206_ENABLE = P206_ENABLE, ov["P206_ENABLE"]
+    if "VA1_ENABLE" in ov: old["VA1_ENABLE"], VA1_ENABLE = VA1_ENABLE, ov["VA1_ENABLE"]
+    if "VA1_PDL" in ov: old["VA1_PDL"], VA1_PDL = VA1_PDL, ov["VA1_PDL"]
+    if "VA1_SEGK" in ov: old["VA1_SEGK"], VA1_SEGK = VA1_SEGK, ov["VA1_SEGK"]
+    if "VA1_STAGES" in ov: old["VA1_STAGES"], VA1_STAGES = VA1_STAGES, ov["VA1_STAGES"]
+    if "VML_BUCKETS" in ov: old["VML_BUCKETS"], VML_BUCKETS = VML_BUCKETS, ov["VML_BUCKETS"]
+    if "VML_COST" in ov: old["VML_COST"], VML_COST = VML_COST, ov["VML_COST"]
+    if "VML_FLAGS" in ov: old["VML_FLAGS"], VML_FLAGS = VML_FLAGS, ov["VML_FLAGS"]
+    if "VMS_ENABLE" in ov: old["VMS_ENABLE"], VMS_ENABLE = VMS_ENABLE, ov["VMS_ENABLE"]
+    if "VSL_ENABLE" in ov: old["VSL_ENABLE"], VSL_ENABLE = VSL_ENABLE, ov["VSL_ENABLE"]
     return old
 
 
@@ -20049,19 +20034,8 @@ def _at_variants(S):
     add('moe', 'vml-nob6', (256,), None, False, lambda: ({"VML_FLAGS": {**VML_FLAGS, 256: VML_FLAGS.get(256, 1) & ~64}}, VML_ENABLE and VML_BUCKETS.get(256) and _VML["ok"].get(256) and VML_FLAGS.get(256, 0) & 64))
     add('moe', 'vml-cost0', (256,), None, False, lambda: ({"VML_COST": {k: v for k, v in VML_COST.items() if k != 256}}, VML_ENABLE and VML_BUCKETS.get(256) and _VML["ok"].get(256) and 256 in VML_COST))
     add('attn_slide', 'vsl-off', (1, 8, 16), ('sliding',), False, lambda: ({"VSL_ENABLE": False}, VSL_ENABLE), 0.15)
-    add('qkv', 'qkv-nogd', (1,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 1)}, _at_gdok(S, 'qkv', 1)))
-    add('qkv', 'qkv-nogd', (8,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 8)}, _at_gdok(S, 'qkv', 8)))
-    add('qkv', 'qkv-nogd', (16,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 16)}, _at_gdok(S, 'qkv', 16)))
-    add('qkv', 'qkv-nogd', (32,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('qkv', 32)}, _at_gdok(S, 'qkv', 32)))
-    add('o', 'o-nogd', (1,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('o', 1)}, _at_gdok(S, 'o', 1)))
-    add('o', 'o-nogd', (8,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('o', 8)}, _at_gdok(S, 'o', 8)))
-    add('o', 'o-nogd', (16,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('o', 16)}, _at_gdok(S, 'o', 16)))
-    add('o', 'o-nogd', (32,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('o', 32)}, _at_gdok(S, 'o', 32)))
-    add('pooler', 'pooler-nogd', (8,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('pooler', 8)}, _at_gdok(S, 'pooler', 8)))
-    add('unpooler', 'unpooler-nogd', (1,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('unpooler', 1)}, _at_gdok(S, 'unpooler', 1)))
-    add('unpooler', 'unpooler-nogd', (8,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('unpooler', 8)}, _at_gdok(S, 'unpooler', 8)))
-    add('unpooler', 'unpooler-nogd', (16,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('unpooler', 16)}, _at_gdok(S, 'unpooler', 16)))
-    add('unpooler', 'unpooler-nogd', (32,), None, True, lambda: ({"GD_ROUTE": _at_gdrop('unpooler', 32)}, _at_gdok(S, 'unpooler', 32)))
+    for P, B in (('qkv', 1), ('qkv', 8), ('qkv', 16), ('qkv', 32), ('o', 1), ('o', 8), ('o', 16), ('o', 32), ('pooler', 8), ('unpooler', 1), ('unpooler', 8), ('unpooler', 16), ('unpooler', 32)):
+        add(P, P + '-nogd', (B,), None, True, lambda P=P, B=B: ({"GD_ROUTE": _at_gdrop(P, B)}, _at_gdok(S, P, B)))
     return out
 
 

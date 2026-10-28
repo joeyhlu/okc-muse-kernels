@@ -82,6 +82,23 @@ def variant(op, name, buckets, overrides, when="True", kinds=None, ship=True, no
                          note=note, tol=None if tol is None else float(tol)))
 
 
+FAMILIES = []      # dicts: vars, rows, op, name, buckets, set, when, kinds, ship, tol (emitted as one loop)
+
+
+def family(names, rows, op, name, buckets, overrides, when, kinds=None, ship=True, tol=None, note=""):
+    """Many variants of one shape, emitted as ONE loop in the layer (bytes): `names` = loop variable names, `rows` = their
+    literal values; `op`, `name`, `buckets` are python expressions over the loop variables (evaluated here, so each member
+    is validated like a `variant`), `overrides` values and `when` are expressions emitted inside the loop."""
+    fid = len(FAMILIES)
+    FAMILIES.append(dict(vars=tuple(names), rows=[tuple(r) for r in rows], op=op, name=name, buckets=buckets,
+                         set=dict(overrides), when=when, kinds=kinds, ship=bool(ship), tol=tol))
+    for row in rows:
+        env = dict(zip(names, row))
+        variant(eval(op, {}, env), eval(name, {}, env), eval(buckets, {}, env), dict(overrides), when=when, kinds=kinds,
+                ship=ship, note=note, tol=tol)
+        REGISTRY[-1]["fam"] = fid
+
+
 def set_overlap(a, b):
     return bool(frozenset(a) & frozenset(b))
 
@@ -177,10 +194,10 @@ def builtin():
                 when=vml + " and %d in VML_COST" % b, ship=False, note="VML default cost table instead of the refit")
     variant("attn_slide", "vsl-off", (1, 8, 16), {"VSL_ENABLE": "False"}, kinds=("sliding",),
             when="VSL_ENABLE", ship=False, note="VSL red.add merge variants off (KS1 / KS3 base geometries)")
-    for proj, bs in (("qkv", (1, 8, 16, 32)), ("o", (1, 8, 16, 32)), ("pooler", (8,)), ("unpooler", (1, 8, 16, 32))):
-        for b in bs:
-            variant(proj, f"{proj}-nogd", (b,), {"GD_ROUTE": "_at_gdrop(%r, %d)" % (proj, b)},
-                    when="_at_gdok(S, %r, %d)" % (proj, b), note="GD GEMV vs the next route (P1M / P1 / DG1 / cuBLAS)")
+    rows = [(p, b) for p, bs in (("qkv", (1, 8, 16, 32)), ("o", (1, 8, 16, 32)), ("pooler", (8,)), ("unpooler", (1, 8, 16, 32)))
+            for b in bs]
+    family(("P", "B"), rows, "P", "P + '-nogd'", "(B,)", {"GD_ROUTE": "_at_gdrop(P, B)"}, "_at_gdok(S, P, B)",
+           note="GD GEMV vs the next route (P1M / P1 / DG1 / cuBLAS)")
     timeline("vms", (1, 8, 16), "_at_tl_vms", TL_VMS)
     timeline("vml", (32, 128, 256), "_at_tl_vml", TL_VML)
 
@@ -675,7 +692,7 @@ def _emit(names, diag, vmlfc="", lean=False):
     gl = ", ".join(names)
     swap = ["def _at_swap(ov):", f"    global {gl}", "    old = {}", "    if not ov:", "        return old"]
     for n in names:
-        swap += [f'    if "{n}" in ov:', f'        old["{n}"], {n} = {n}, ov["{n}"]']
+        swap.append(f'    if "{n}" in ov: old["{n}"], {n} = {n}, ov["{n}"]')
     swap.append("    return old")
     cur = ["def _at_cur():", "    return {" + ", ".join(f'"{n}": {n}' for n in names) + "}"]
     ps = ["def _at_prepare_set():", "    ov = {}"]
@@ -696,12 +713,25 @@ def _emit(names, diag, vmlfc="", lean=False):
           "        except Exception:",
           "            ov, ok = {}, False",
           "        out.append((op, name, buckets, kinds or ('sliding', 'full'), ov, ok, ship, tol))", ""]
+    done = set()
     for v in REGISTRY:
         if lean and not v["ship"]:
             continue
         ov = "{" + ", ".join(f'"{k}": {e}' for k, e in v["set"].items()) + "}"
         kd = None if v["kinds"] == KINDS else v["kinds"]
         tl = "" if v["tol"] is None else f", {v['tol']!r}"
+        if "fam" in v:   # one loop per family, at its first surviving member
+            if v["fam"] in done:
+                continue
+            done.add(v["fam"])
+            f = FAMILIES[v["fam"]]
+            rows = tuple(r for r in f["rows"] if any(m.get("fam") == v["fam"] and m["op"] == eval(f["op"], {}, dict(zip(f["vars"], r)))
+                                                     and m["name"] == eval(f["name"], {}, dict(zip(f["vars"], r))) for m in REGISTRY))
+            lv = ", ".join(f["vars"])
+            dv = ", ".join(f"{x}={x}" for x in f["vars"])
+            va.append(f"    for {lv} in {rows!r}:")
+            va.append(f"        add({f['op']}, {f['name']}, {f['buckets']}, {kd!r}, {v['ship']!r}, lambda {dv}: ({ov}, {v['when']}){tl})")
+            continue
         va.append(f"    add({v['op']!r}, {v['name']!r}, {v['buckets']!r}, {kd!r}, {v['ship']!r}, "
                   f"lambda: ({ov}, {v['when']}){tl})")
     va.append("    return out")
@@ -826,10 +856,20 @@ def main():
     pa, pr = a[:ia].split(chr(10)), r[:ir].split(chr(10))
     diff = [i for i, (x, y) in enumerate(zip(pa, pr)) if x != y]
     GM.check(len(pa) == len(pr) and diff == [1], f"ship / research copies differ before the AT section on lines {diff[:6]}")
-    ship_adds = lambda t: sorted(ln for ln in t.split(chr(10)) if ln.startswith("    add(") and ", True, lambda: (" in ln)
+    def ship_adds(t):   # the variant list without research lines (a research family's loop header goes with it)
+        i = t.index("def _at_variants(S):")
+        body = t[i:t.index(chr(10) + "    return out" + chr(10), i)].split(chr(10))
+        keep = []
+        for k, ln in enumerate(body):
+            nxt = body[k + 1] if k + 1 < len(body) else ""
+            if ", False, lambda" in ln or (ln.startswith("    for ") and ", False, lambda" in nxt):
+                continue
+            keep.append(ln)
+        return keep
     GM.check(ship_adds(a) == ship_adds(r), "ship variants differ between the ship and the research copy")
-    GM.check(", False, lambda: (" not in a and "_at_timelines" not in a, "ship copy carries research variants / timelines")
-    print(f"[at_patches] OK  ship copy (lean, {len(ship_adds(a))} ship variants) and research copy share the layer and the ship "
+    GM.check(", False, lambda" not in a and "_at_timelines" not in a, "ship copy carries research variants / timelines")
+    nship = sum(1 for v in REGISTRY if v["ship"])
+    print(f"[at_patches] OK  ship copy (lean, {nship} ship variants) and research copy share the layer and the ship "
           f"variants; AT costs {len(a.encode()) - len(b.encode())} B in the ship copy, {len(r.encode()) - len(b.encode())} B in "
           f"the research copy")
     return 0
