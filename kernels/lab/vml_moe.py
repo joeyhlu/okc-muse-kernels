@@ -16,6 +16,7 @@ vm_main: grid = SMs, 576 threads (16 consumer warps = 4 WGs, weight producer war
      red.release doneA[job][unit / 2]. Phase B epilogue: y rows (f32, x gs2).
 vm_fin: grid = M, 256 threads: K2A K3 numerics (bf16r(y) * nw, ss, rsqrt(ss / 4096 + 1e-8) * wt, slot order), and block 0
   resets xready / doneA / fixup counters for the next call. Bounded waits only (error flag, no trap).
+Lab v9: marks cols 24..28 from the x producer (B doneA wait ns / count, A xready wait ns, first / last B acquire); only with marks.
 """
 import hashlib
 import time
@@ -438,6 +439,8 @@ __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars
 __device__ void prod_x(const Args& A, const Tab& T, uint32_t xring, uint32_t bars) {
   const int c = blockIdx.x, nf = nfill_of(A, T);
   int it = 0;
+  long long wA = 0, wB = 0, tB0 = 0, tB1 = 0;   // marks only (v9): readiness waits of this CTA's x producer
+  int nB = 0;
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
     int lastj = -1;
@@ -449,10 +452,26 @@ __device__ void prod_x(const Args& A, const Tab& T, uint32_t xring, uint32_t bar
       const int npad = (T.jC[j] + 7) & ~7;
       if (!pb && i < nf) continue;
       if (!pb) {
-        if (j != lastj) { wait_flag(A.xready + j, npad, A.err); fence_proxy_async(); lastj = j; }
+        if (j != lastj) {
+          if (A.marks && ld_acquire(A.xready + j) < npad) {
+            const long long t = gtime();
+            wait_flag(A.xready + j, npad, A.err);
+            wA += gtime() - t;
+          } else {
+            wait_flag(A.xready + j, npad, A.err);
+          }
+          fence_proxy_async(); lastj = j;
+        }
       } else {
-        wait_flag(A.doneA + j * 16 + s, 8, A.err);
+        if (A.marks && ld_acquire(A.doneA + j * 16 + s) < 8) {
+          const long long t = gtime();
+          wait_flag(A.doneA + j * 16 + s, 8, A.err);
+          wB += gtime() - t; ++nB;
+        } else {
+          wait_flag(A.doneA + j * 16 + s, 8, A.err);
+        }
         fence_proxy_async();
+        if (A.marks) { tB1 = gtime(); if (tB0 == 0) tB0 = tB1; }
       }
       const uint32_t bytes = (uint32_t)npad * 512u;
       const __nv_bfloat16* src = (pb ? A.xB : A.xA) + (size_t)T.jrow[j] * KDIM + (size_t)s * npad * 256;
@@ -462,6 +481,10 @@ __device__ void prod_x(const Args& A, const Tab& T, uint32_t xring, uint32_t bar
       mbar_expect_tx(fb, bytes);
       bulk_g2s(xring + sl * XS, src, bytes, fb);
     }
+  }
+  if (A.marks) {   // cols 24..28: B doneA wait ns, B stages that waited, A xready wait ns, first / last B x acquire (gtime)
+    long long* m = A.marks + (size_t)c * 32;
+    m[24] = wB; m[25] = nB; m[26] = wA; m[27] = tB0; m[28] = tB1;
   }
 }
 
