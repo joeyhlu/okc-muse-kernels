@@ -20606,7 +20606,6 @@ def _at_tune(state, weights, t0, base):
                     if AT_DIAG and AT_TIMELINES and kind == "sliding":
                         _at_timelines(d, state, tm, b)
             del data
-            torch.cuda.empty_cache()
         units, choice, rows = {}, {}, []
         for v in act:
             for b in (v[2] if v[6] else ()):
@@ -20669,6 +20668,5 @@ def _at_tune(state, weights, t0, base):
     finally:
         try:
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
         except Exception as ex:
             print(f"[at] cleanup raised {ex!r}"[:300], flush=True)

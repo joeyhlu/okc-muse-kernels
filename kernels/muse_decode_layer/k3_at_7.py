@@ -20519,7 +20519,6 @@ def _at_tune(state, weights, t0, base):
                     d = dict(data, config=_at_cfg(B, L, kind))
                     res[(b, kind)] = _at_measure(d, state, base, cal[T][0], [None] + want[kind], tm, 2000 + T, AT_SEEDS, dl)
             del data
-            torch.cuda.empty_cache()
         units, choice, rows = {}, {}, []
         for v in act:
             for b in (v[2] if v[6] else ()):
@@ -20576,6 +20575,5 @@ def _at_tune(state, weights, t0, base):
     finally:
         try:
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
         except Exception as ex:
             print(f"[at] cleanup raised {ex!r}"[:300], flush=True)

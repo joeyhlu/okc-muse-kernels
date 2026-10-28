@@ -604,8 +604,7 @@ def _at_tune(state, weights, t0, base):
                     if AT_DIAG and AT_TIMELINES and kind == "sliding":
                         _at_timelines(d, state, tm, b)
 #@D-
-            del data
-            torch.cuda.empty_cache()
+            del data   # no empty_cache(): freed blocks stay cached and are reused, as in the judge (R-at-7: the fault followed a fresh mapping)
         units, choice, rows = {}, {}, []
         for v in act:
             for b in (v[2] if v[6] else ()):
@@ -670,7 +669,6 @@ def _at_tune(state, weights, t0, base):
     finally:
         try:
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
         except Exception as ex:
             print(f"[at] cleanup raised {ex!r}"[:300], flush=True)
 '''
