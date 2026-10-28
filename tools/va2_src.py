@@ -17,7 +17,17 @@ VA2_CUDA = r'''// VA2 (tools/va2_src.py): verify full q_len 8; part_o / part_lse
 #endif
 template <int ST, int NVT, int NB = 0> constexpr int va2_off_new() { return ST * STAGE_BYTES + NVT * VT_BYTES; }
 template <int ST, int NVT, int NB = 0> constexpr int va2_off_bar() { return va2_off_new<ST, NVT>() + (NB ? 0 : NEW8_BYTES) + 8192; }
-template <int ST, int NVT, int NB = 0> constexpr int va2_smem() { return va2_off_bar<ST, NVT, NB>() + 16 * ST + 4 * 264 + 1024; }   // B <= 128
+template <int ST, int NVT, int NB = 0> constexpr int va2_smem() { return va2_off_bar<ST, NVT, NB>() + 16 * ST + 4 * 264 + 2048; }   // B <= 128
+__device__ __forceinline__ uint64_t desc_sw128(const void* ptr) {   // K-major, 128-B swizzle, SBO 1024 B
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(ptr);
+  return (uint64_t)((a & 0x3FFFF) >> 4) | (1ull << 16) | (64ull << 32) | (1ull << 62);
+}
+__device__ __forceinline__ void qk_issue_sw(float (&S)[32], const uint64_t dq, const uint64_t dk) {
+  wg_fence();
+  wg_ss(S, dq, dk, 0);
+  wg_ss(S, dq + 16, dk + 2, 1);
+  wg_commit();
+}
 __device__ __forceinline__ void va_red2(float* a, float x, float y) {
 #if __CUDA_ARCH__ >= 900
   asm volatile("red.global.add.v2.f32 [%0], {%1, %2};\n" ::"l"(a), "f"(x), "f"(y) : "memory");
@@ -67,7 +77,8 @@ template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, in
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #if K1_ARCH_OK
   constexpr int L = 8;
-  extern __shared__ __align__(128) uint8_t smem[];
+  extern __shared__ __align__(128) uint8_t smem_raw[];
+  uint8_t* smem = KV == 3 ? reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~(uintptr_t)1023) : smem_raw;
   uint8_t* vtb = smem + ST * STAGE_BYTES;
   uint8_t* newk = smem + va2_off_new<ST, NVT>();   // NB 1: no separate new tile (newk unused)
   uint8_t* qs = newk + (NB ? 0 : NEW8_BYTES);
@@ -174,14 +185,23 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       int pg[MPT];
 #pragma unroll
       for (int m = 0; m < MPT; ++m) {
-        const int x = KV ? xk0 + 16 * m : x0 + XS * m;
+        const int x = (KV && KV != 3 && DG != 7) ? xk0 + 16 * m : x0 + XS * m;
         pg[m] = (k0 + x < cend) ? __ldg(pt + ((k0 + x) >> psh)) : -1;
       }
       for (int t = 0; t < nt; ++t, ++n) {
         const int st = n % ST;
         if (n >= ST) va_wait(empt + st, ((n / ST) - 1) & 1);
         uint8_t* stg = smem + st * STAGE_BYTES;
-        if constexpr (KV) {
+        if constexpr (DG == 7 || KV == 3) {   // whole rows (8 lanes = one 128-B row), chunk c at ((c ^ (r & 7)) << 4)
+#pragma unroll
+          for (int m = 0; m < 4; ++m) {
+            const int r = x0 + 16 * m, pos = k0 + t * TILE + r;
+            const size_t go = pg[m] >= 0 ? (size_t)((pg[m] << psh) | (pos & pm)) * rowB : (size_t)0;
+            cp_async16(stg + r * 128 + ((c ^ (r & 7)) << 4), kc + go, pg[m] >= 0 ? 16 : 0);
+            cp_async16(stg + 8192 + r * 128 + ((c ^ (r & 7)) << 4), vc + go, pg[m] >= 0 ? 16 : 0);
+            pg[m] = (pos + TILE < cend) ? __ldg(pt + ((pos + TILE) >> psh)) : -1;
+          }
+        } else if constexpr (KV) {
 #pragma unroll
           for (int m = 0; m < MPT; ++m) {
             const int xk = xk0 + 16 * m, posk = k0 + t * TILE + xk;
@@ -290,11 +310,21 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     uint32_t pa[2][4];
     for (int i = 0; i < nt; ++i, ++n) {
       const int ts = k0 + i * TILE;
+      if constexpr (DG == 6 || DG == 7) {   // probes: the bare stage protocol
+        va_wait(full + n % ST, (n / ST) & 1);
+        __syncwarp();
+        if (lane == 0) asm volatile("{\n.reg .b64 s;\nmbarrier.arrive.shared.b64 s, [%0];\n}\n" ::"r"(va_sa(empt + n % ST)) : "memory");
+        m[0] = 0.f; m[1] = 0.f;
+        continue;
+      }
       if (PF) {
         va_wait(full + n % ST, (n / ST) & 1);
         fence_async_smem();                          // the producers' cp.async K rows -> the wgmma (async proxy)
       }
-      if (DG != 4 && DG != 5) qk_issue(S, dq, desc_il(smem + (n % ST) * STAGE_BYTES + h * 4096, 128, 512));
+      if (DG != 4 && DG != 5) {
+        if constexpr (KV == 3) qk_issue_sw(S, dq, desc_sw128(smem + (n % ST) * STAGE_BYTES + 64 * h));
+        else qk_issue(S, dq, desc_il(smem + (n % ST) * STAGE_BYTES + h * 4096, 128, 512));
+      }
       if (PF) {
         if (DG != 1 && DG != 5) transpose_v(n);
         fence_async_smem();
@@ -319,8 +349,8 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       }
       if (DG != 3 && DG != 5) pv_issue7(O, pa, vtb + (n % NVT) * VT_BYTES, h);
     }
-    uint8_t* nK = NB ? vtb + ((n + 1) % NVT) * VT_BYTES : newk;
-    uint8_t* nV = NB ? vtb + ((n + 2) % NVT) * VT_BYTES : newk + 8192;
+    uint8_t* nK = KV == 3 ? vtb : NB ? vtb + ((n + 1) % NVT) * VT_BYTES : newk;   // KV 3: buffer 0 is 1024-B aligned
+    uint8_t* nV = KV == 3 ? vtb + VT_BYTES : NB ? vtb + ((n + 2) % NVT) * VT_BYTES : newk + 8192;
     if (NB && has_new) {   // both warpgroups are past their loops before the V^T buffers take the new rows
       wg_wait<0>();
       asm volatile("bar.sync 3, 256;\n" ::: "memory");
@@ -335,7 +365,12 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         const float sc = kind ? vsc : ksc;
         const uint16_t q8 = (uint16_t)__nv_cvt_float2_to_fp8x2(make_float2(x.x / sc, x.y / sc), __NV_SATFINITE, __NV_E4M3);
         if (kind == 0) {
-          *reinterpret_cast<uint16_t*>(nK + h * 4096 + il_off(j, 2 * lane, 128, 512)) = q8;
+          if constexpr (KV == 3) {
+            const int bb = 64 * h + 2 * lane;
+            *reinterpret_cast<uint16_t*>(nK + j * 128 + (((bb >> 4) ^ (j & 7)) << 4) + (bb & 15)) = q8;
+          } else {
+            *reinterpret_cast<uint16_t*>(nK + h * 4096 + il_off(j, 2 * lane, 128, 512)) = q8;
+          }
         } else {
           int s8, kl;
           key_to_sk(j, s8, kl);
@@ -347,7 +382,8 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       asm volatile("bar.sync %0, 128;\n" ::"r"(1 + h) : "memory");
     }
     if (has_new) {
-      qk_issue(S, dq, desc_il(nK + h * 4096, 128, 512));
+      if constexpr (KV == 3) qk_issue_sw(S, dq, desc_sw128(nK + 64 * h));
+      else qk_issue(S, dq, desc_il(nK + h * 4096, 128, 512));
       wg_wait<0>();
       softmax_pack7(S, O, m, pa, t, cl2, true, seq, seq + L, seq, 0, j0);
       pv_issue7(O, pa, nV, h);
@@ -460,14 +496,14 @@ def _va2_run(qkv, data, cfg, segk=None, pdl=None):
 def _va2_probes(qkv, data, cfg):
     B, hq, hkv = cfg["batch"], cfg["num_q_heads"], cfg["num_kv_heads"]
     dev = qkv.device
-    G = max(B + 1, _k1_sms(dev) * max(1, min(2, _K1_OCC.get((8, 351, str(dev)), 1))) // (hkv // 2))
+    G = max(B + 1, _k1_sms(dev) * max(1, min(2, _K1_OCC.get((8, 353, str(dev)), 1))) // (hkv // 2))
     ws = _VA1_WS[str(dev)]
     for dg in VA2_PROBES:
         scratch = torch.empty((B, 8, hq * 64), dtype=torch.bfloat16, device=dev)
         _K1_MOD.k1_forward(qkv, data["seq_lens"], data["cache_loc"], data["page_table"], data["k_cache"].view(torch.uint8),
                            data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], ws[2], ws[0], ws[1], scratch,
                            ws[3], B, 8, hq, hkv, 1, cfg["page_size"].bit_length() - 1, G, max(1, int(VA2_SEGK)), 0,
-                           float(cfg["qk_scale_factor"] * cfg["sm_scale"]), 1, 4, 1000 * int(dg) + 351)
+                           float(cfg["qk_scale_factor"] * cfg["sm_scale"]), 1, 4, 1000 * int(dg) + 353)
 
 
 def _va2_try(qkv, data, cfg, state):
@@ -504,7 +540,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 345, 347, 348, 349, 350, 351):
+        for code in (303, 345, 347, 348, 349, 350, 351, 353):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -525,7 +561,7 @@ def _va2_prepare(state):
             print(f"[va2] probes {VA2_PROBES}: workspace {'clean' if state['va2_probes_ok'] else 'DIRTY (probes off)'}", flush=True)
             for t_ in ws:
                 t_.zero_()
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349, 350, 351)]} (variant {VA2_VAR}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349, 350, 351, 353)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
@@ -539,11 +575,13 @@ def va2_patches(text):
     K1_MAIN = "template <int L, int ST>\n__global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {"
     steps = (
         ("VA2 kernel", K1_MAIN, VA2_CUDA + K1_MAIN),
-        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 1000 && ST % 1000 == 351 && ST < 6000) || ST == 303 || ST == 313 || ST == 345 || ST == 355 || "
-         "ST == 347 || ST == 357 || ST == 348 || ST == 358 || ST == 349 || ST == 359 || ST == 350 || ST == 360 || ST == 351 || ST == 361); }"),
+        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 1000 && ST % 1000 == 353 && ST < 8000) || ST == 303 || ST == 313 || ST == 345 || ST == 355 || "
+         "ST == 347 || ST == 357 || ST == 348 || ST == 358 || ST == 349 || ST == 359 || ST == 350 || ST == 360 || ST == 351 || ST == 361 || "
+         "ST == 353 || ST == 363); }"),
         ("VA2 host", "int64_t k1_occupancy(int64_t L, int64_t ST) {", VA2_HOST + "\n\nint64_t k1_occupancy(int64_t L, int64_t ST) {"),
         ("occupancy", "  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>",
-         "  if (ST > 300) return (int64_t)(ST == 350 ? va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
+         "  if (ST > 300) return (int64_t)(ST == 353 ? va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
+         "ST == 350 ? va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
          "ST == 351 ? va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
          "ST % 10 == 9 ? va2_go<4, 4, 3, 2, 1>(nullptr, dim3(1), 0, false) : "
          "ST % 10 == 8 ? va2_go<4, 4, 3, 1, 1, VA2_DIAG, 48>(nullptr, dim3(1), 0, false) : ST % 10 == 7 ? "
@@ -552,9 +590,12 @@ def va2_patches(text):
         ("launch", "  if (stages > 200) {",
          "  if (stages > 300) {\n    TORCH_CHECK(L == 8 && fold == 1 && B <= 128, \"va2: L 8, fold, B <= 128\");\n"
          "    if (stages > 1000) {\n      const int dg = (int)(stages / 1000);\n"
-         "      if (dg == 1) va2_go<5, 4, 2, 1, 1, 1, 32, 1>(&p, grid, st, false);\n      else if (dg == 2) va2_go<5, 4, 2, 1, 1, 2, 32, 1>(&p, grid, st, false);\n"
-         "      else if (dg == 3) va2_go<5, 4, 2, 1, 1, 3, 32, 1>(&p, grid, st, false);\n"
-         "      else va2_go<5, 4, 2, 1, 1, 5, 32, 1>(&p, grid, st, false);\n    }\n"
+         "      if (dg == 1) va2_go<5, 4, 2, 3, 1, 1, 32, 1>(&p, grid, st, false);\n      else if (dg == 2) va2_go<5, 4, 2, 3, 1, 2, 32, 1>(&p, grid, st, false);\n"
+         "      else if (dg == 3) va2_go<5, 4, 2, 3, 1, 3, 32, 1>(&p, grid, st, false);\n"
+         "      else if (dg == 6) va2_go<5, 4, 2, 3, 1, 6, 32, 1>(&p, grid, st, false);\n"
+         "      else if (dg == 7) va2_go<5, 4, 2, 3, 1, 7, 32, 1>(&p, grid, st, false);\n"
+         "      else va2_go<5, 4, 2, 3, 1, 5, 32, 1>(&p, grid, st, false);\n    }\n"
+         "    else if (stages == 353 || stages == 363) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages == 350 || stages == 360) va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages == 351 || stages == 361) va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages % 10 == 9) va2_go<4, 4, 3, 2, 1>(&p, grid, st, stages > 350);\n"
