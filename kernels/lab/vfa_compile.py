@@ -24,6 +24,9 @@ def main():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     src = m.cuda_source(lab="--ship" not in sys.argv)
+    alt = next((a[6:] for a in sys.argv if a.startswith("--src=")), None)   # an edited copy of the source (experiments)
+    if alt:
+        src = pathlib.Path(alt).read_text(encoding="utf-8")
     cu = work / "vfa.cu"
     cu.write_text(src)
     inc = [f"-I{p}" for p in ce.include_paths(device_type="cuda")] + [f"-I{sysconfig.get_paths()['include']}"]
@@ -52,6 +55,9 @@ def main():
                 bad = True
         if "bytes stack frame" in ln:
             print("   " + ln.strip())
+            sp = re.search(r"(\d+) bytes spill stores, (\d+) bytes spill loads", ln)
+            if sp and (int(sp.group(1)) or int(sp.group(2))):
+                bad = True
         if "C75" in ln:
             print("   WARN " + ln.strip()[:300])
             if "C7515" in ln:

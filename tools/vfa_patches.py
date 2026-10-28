@@ -26,13 +26,21 @@ VFA_BLOCK = r'''
 VFA_ENABLE = True
 VFA_MIN_B = 2
 VFA_MAX_B = 256
+VFA_B1 = True
+VFA_L1 = True
+VFA_L1_MIN_B = 1
+VFA_L1_MAX_B = 256
+VFA_NC_SMALLB = 8
+VFA_PKV = False
 VFA_STAGES = 4
 VFA_SEGK = 300
 VFA_PDL = True
 VFA_DIAG = 0
 VFA_SELF_TEST = True
-VFA_CASES = ((2, 3000, 1, 1.0, 401), (3, 1500, 64, 1.0, 402), (16, 700, 1, 1.0 / 64, 403), (5, 9000, 1, 1.0, 404),
-             (33, 300, 1, 1.0, 405), (32, 2500, 1, 1.0, 406), (2, 20, 1, 1.0, 407), (17, 100, 1, 1.0, 408), (4, 70, 64, 1.0, 409))
+VFA_CASES = ((2, 3000, 8, 1, 1.0, 401), (3, 1500, 8, 64, 1.0, 402), (16, 700, 8, 1, 1.0 / 64, 403), (5, 9000, 8, 1, 1.0, 404),
+             (33, 300, 8, 1, 1.0, 405), (32, 2500, 8, 1, 1.0, 406), (2, 20, 8, 1, 1.0, 407), (17, 100, 8, 1, 1.0, 408), (4, 70, 8, 64, 1.0, 409),
+             (1, 9000, 8, 1, 1.0, 421), (1, 20, 8, 1, 1.0, 422), (1, 9000, 1, 1, 1.0, 431), (1, 20, 1, 1, 1.0, 432), (2, 3000, 1, 1, 1.0, 433),
+             (16, 700, 1, 1, 1.0 / 64, 434), (33, 300, 1, 1, 1.0, 435), (32, 2500, 1, 64, 1.0, 436))
 _VFA = {"mod": None, "ws": {}, "sms": {}, "occ": {}}
 
 VFA_CPP_SRC = r"""
@@ -40,7 +48,7 @@ VFA_CPP_SRC = r"""
 void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor page_table, torch::Tensor k_cache,
                  torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor ws_o, torch::Tensor ws_l,
                  torch::Tensor tickets, torch::Tensor out, int64_t B, int64_t Hq, int64_t Hkv, int64_t page_shift, int64_t G,
-                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag);
+                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv);
 int64_t vfa_occupancy(int64_t stages);
 """
 
@@ -100,6 +108,7 @@ struct Params {
   int* tickets;                 // [B*pairs] key-count tickets (zero between calls)
   __nv_bfloat16* out;           // [B*8, Hq*64]
   int B, Hq, Hkv, ld_qkv, page_shift, pt_stride, segk, pdl;
+  int nc;                       // workspace copies per (request, pair): 8 at B <= 2 spreads the same-address red contention
   float qk_sm;                  // qk_scale_factor * sm_scale
 };
 
@@ -174,9 +183,9 @@ __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;"
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 
 // ---- producer warpgroup (32 registers): thread q copies 16-B chunk (q & 7) of rows (q >> 3) + 16 k of every tile ----
-template <int ST, bool O32>
-__device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const int* seg, int nseg, uint64_t* full, uint64_t* empt,
-                                         int q, int pair) {
+template <int ST, bool O32, int L, bool PKV>
+__device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const int* seg, const int* sN, int nseg, uint64_t* full,
+                                         uint64_t* empt, int q, int pair) {
   const int ch = q & 7, r0 = q >> 3;
   const int lp = p.page_shift, pm = (1 << lp) - 1;
   const uint32_t rowb = (uint32_t)p.Hkv * 64u;
@@ -189,6 +198,8 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
     const int b = seg[4 * s], k0 = seg[4 * s + 1], k1 = seg[4 * s + 2];
     const int nt = (k1 - k0 + TILE - 1) / TILE;
     const int* pt = p.page_table + (long long)b * p.pt_stride;
+    const int seqb = sN[b] - L;   // the block's own keys (written by the prologue) start here
+    bool waited = !(PKV && p.pdl);
     int pg[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -196,6 +207,7 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
       pg[k] = pos < k1 ? __ldg(pt + (pos >> lp)) : -1;
     }
     for (int x = 0; x < nt; ++x, ++n) {
+      if (!waited && k0 + (x + 1) * TILE > seqb) { pdl_wait(); waited = true; }   // early K/V: wait only before the new rows
       int pgn[4];
 #pragma unroll
       for (int k = 0; k < 4; ++k) {   // next tile's pages: in flight while this tile's copies issue
@@ -233,13 +245,16 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
 // ---- consumer warpgroups (104 registers): warpgroup h = KV head h, warp w = tokens 2w, 2w + 1 (rows 16 w .. 16 w + 15) ----
 // DIAG (lab builds only): 1 = skeleton (wait / arrive only), 2 = no V^T + PV, 3 = no QK, 4 = exact per-tile row max,
 // 5 = valid variant: PV wait deferred to the next tile, 6 = valid variant: offset = row max - 8 with the P >= 448 threshold
-template <int ST, int DIAG>
+template <int ST, int DIAG, int L>
 __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const int* seg, const int* sN, int nseg, uint64_t* full,
                                          uint64_t* empt, int* misc, int tid, int pair, int pairs) {
   const int lane = tid & 31, warp = __shfl_sync(FULL, tid >> 5, 0);
   const int h = warp >> 2, w = warp & 3;
   const int g = lane >> 2, tig = lane & 3;
   const int hq = p.Hq;
+  constexpr int ROWS = 16 * L;                                       // output rows per (request, pair)
+  const bool live = (L == 8) || (w == 0);                            // L = 1: only warp 0's row g (head g) is real
+  const int nc = p.nc, copy = (int)(blockIdx.x % (unsigned)nc);
   constexpr bool DEFER = (DIAG == 5);   // PV(i) waited at tile i + 1 (with QK(i + 1)) instead of at the end of tile i
   constexpr float POF = (DIAG == 6) ? 8.f : POFF;              // DIAG 6 (lab): offset = max - 8 with the 448 threshold (R-vfa-2..4)
   constexpr uint32_t PBK = (DIAG == 6) ? 0x02020202u : PCHK;
@@ -268,10 +283,12 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
     const int nt = (k1 - k0 + TILE - 1) / TILE;
     const int lim = min(k1, seq + 1);                            // a tile is mask-free iff t0 + 63 < lim
     const int bp = b * pairs + pair;
-    if (DIAG != 1) {   // this head's e4m3 Q tile: row r = 8 j + hh at r * 64, 16-B chunk c at ((c ^ ((r >> 1) & 3)) << 4)
+    const long long wbase = ((long long)bp * nc + copy) * ROWS;
+    if (DIAG != 1) {   // this head's e4m3 Q tile: row r = 8 j + hh at r * 64, 16-B chunk c at ((c ^ ((r >> 1) & 3)) << 4); L = 1: rows >= 8 zero
       const int r = tl & 63, c0 = 2 * (tl >> 6);
-      const uint4* src = reinterpret_cast<const uint4*>(p.q8 + ((long long)(b * 8 + (r >> 3)) * hq + pair * 16 + 8 * h + (r & 7)) * 64 + c0 * 16);
-      const uint4 a = __ldg(src), c = __ldg(src + 1);
+      const bool rv = (L == 8) || (r < 8);
+      const uint4* src = reinterpret_cast<const uint4*>(p.q8 + ((long long)(b * L + (rv ? (r >> 3) : 0)) * hq + pair * 16 + 8 * h + (r & 7)) * 64 + c0 * 16);
+      const uint4 a = rv ? __ldg(src) : make_uint4(0u, 0u, 0u, 0u), c = rv ? __ldg(src + 1) : make_uint4(0u, 0u, 0u, 0u);
       uint8_t* qd = smem + off_q<ST>() + h * Q_BYTES + r * 64;
       *reinterpret_cast<uint4*>(qd + ((c0 ^ ((r >> 1) & 3)) << 4)) = a;
       *reinterpret_cast<uint4*>(qd + (((c0 + 1) ^ ((r >> 1) & 3)) << 4)) = c;
@@ -325,6 +342,10 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
         }
         mbar_arrive(empt + st_c);                                // K (wgmma) and V (ldmatrix) of the stage consumed
         const int t0 = k0 + i * TILE;
+        if (!live) {                                             // padding rows: P = 0, no exponentials
+#pragma unroll
+          for (int e = 0; e < 8; ++e) pa[e >> 2][e & 3] = 0u;
+        } else {
         if (t0 + TILE - 1 >= lim) {                              // edge tile: range + causal mask
           const int hi0 = min(k1 - 1, seq + 2 * w), hi1 = min(k1 - 1, seq + 2 * w + 1);
 #pragma unroll
@@ -344,7 +365,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
             m1 = fmaxf(m1, fmaxf(sc[4 * nt8 + 2], sc[4 * nt8 + 3]));
           }
           m0 = quad_max(m0) * ssc;
-          m1 = quad_max(m1) * ssc;
+          m1 = (L == 8) ? quad_max(m1) * ssc : 0.f;
           if (first) {
             cr0 = (m0 == neg_inf()) ? 0.f : m0 - POF;
             cr1 = (m1 == neg_inf()) ? 0.f : m1 - POF;
@@ -361,9 +382,14 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
           for (int kk = 0; kk < 2; ++kk) {
             const float* sv = sc + 16 * kk;
             pa[kk][0] = pk4(ex2(fmaf(sv[0], ssc, -cr0)), ex2(fmaf(sv[1], ssc, -cr0)), ex2(fmaf(sv[4], ssc, -cr0)), ex2(fmaf(sv[5], ssc, -cr0)));
-            pa[kk][1] = pk4(ex2(fmaf(sv[2], ssc, -cr1)), ex2(fmaf(sv[3], ssc, -cr1)), ex2(fmaf(sv[6], ssc, -cr1)), ex2(fmaf(sv[7], ssc, -cr1)));
             pa[kk][2] = pk4(ex2(fmaf(sv[8], ssc, -cr0)), ex2(fmaf(sv[9], ssc, -cr0)), ex2(fmaf(sv[12], ssc, -cr0)), ex2(fmaf(sv[13], ssc, -cr0)));
-            pa[kk][3] = pk4(ex2(fmaf(sv[10], ssc, -cr1)), ex2(fmaf(sv[11], ssc, -cr1)), ex2(fmaf(sv[14], ssc, -cr1)), ex2(fmaf(sv[15], ssc, -cr1)));
+            if (L == 8) {
+              pa[kk][1] = pk4(ex2(fmaf(sv[2], ssc, -cr1)), ex2(fmaf(sv[3], ssc, -cr1)), ex2(fmaf(sv[6], ssc, -cr1)), ex2(fmaf(sv[7], ssc, -cr1)));
+              pa[kk][3] = pk4(ex2(fmaf(sv[10], ssc, -cr1)), ex2(fmaf(sv[11], ssc, -cr1)), ex2(fmaf(sv[14], ssc, -cr1)), ex2(fmaf(sv[15], ssc, -cr1)));
+            } else {
+              pa[kk][1] = 0u;
+              pa[kk][3] = 0u;
+            }
           }
         };
         pack();
@@ -379,7 +405,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
               m1 = fmaxf(m1, fmaxf(sc[4 * nt8 + 2], sc[4 * nt8 + 3]));
             }
             m0 = quad_max(m0) * ssc;
-            m1 = quad_max(m1) * ssc;
+            m1 = (L == 8) ? quad_max(m1) * ssc : 0.f;
             const float n0 = fmaxf(m0 - POF, cr0), n1 = fmaxf(m1 - POF, cr1);
             const float a0 = ex2(cr0 - n0), a1 = ex2(cr1 - n1);
 #pragma unroll
@@ -389,6 +415,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
           }
         }
         first = false;
+        }   // live rows
         if (DIAG != 2) {
 #pragma unroll
           for (int e = 0; e < 36; ++e) VFA_RF(acc[e]);
@@ -423,14 +450,15 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
     }
     // ---- merge: rows (token 2w, head 8h + g) and (token 2w + 1, same head) rescaled to 2^0, fp32 red.add ----
     const float f0 = ex2(fminf(cr0, 126.f)), f1 = ex2(fminf(cr1, 126.f));
-    const int R0 = bp * 128 + (2 * w) * 16 + 8 * h + g, R1 = R0 + 16;
-    float* a0p = p.ws_o + (long long)R0 * 64;
-    float* a1p = p.ws_o + (long long)R1 * 64;
+    const long long R0 = wbase + (2 * w) * 16 + 8 * h + g, R1 = R0 + 16;
+    float* a0p = p.ws_o + R0 * 64;
+    float* a1p = p.ws_o + R1 * 64;
     const bool odd = tig & 1;
+    if (live) {
 #pragma unroll
     for (int t = 0; t < 8; t += 2) {   // lanes (tig, tig ^ 1) swap so each holds 4 consecutive dims (one 16-B red)
 #pragma unroll
-      for (int r = 0; r < 2; ++r) {
+      for (int r = 0; r < (L == 8 ? 2 : 1); ++r) {
         const float f = r ? f1 : f0;
         const float x0 = acc[4 * t + 2 * r] * f, x1 = acc[4 * t + 2 * r + 1] * f;
         const float y0 = acc[4 * (t + 1) + 2 * r] * f, y1 = acc[4 * (t + 1) + 2 * r + 1] * f;
@@ -442,8 +470,9 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
     }
     if (tig == 0) {
       red1(p.ws_l + R0, acc[32] * f0);
-      red1(p.ws_l + R1, acc[34] * f1);
+      if (L == 8) red1(p.ws_l + R1, acc[34] * f1);
     }
+    }   // live
     bar_named(3, NCONS);
     if (tid == 0) {
       __threadfence();
@@ -452,15 +481,26 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
       misc[1] = (old + mine == sN[b]) ? 1 : 0;
     }
     bar_named(3, NCONS);
-    if (misc[1]) {   // last segment of request b: normalize, rmsnorm, gate, bf16; zero what was read
+    if (misc[1]) {   // last segment of request b: sum the copies, normalize, rmsnorm, gate, bf16; zero what was read
       __threadfence();
-      const int rr = tid >> 1, hf = tid & 1;
-      const long long R = (long long)bp * 128 + rr;
-      float4* src = reinterpret_cast<float4*>(p.ws_o + R * 64 + hf * 32);
+      const int hf = tid & 1;
+      for (int rr = tid >> 1; rr < ROWS; rr += NCONS / 2) {
       float4 v[8];
+      float l = 0.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) v[e] = __ldcg(src + e);
-      const float l = __ldcg(p.ws_l + R);
+      for (int e = 0; e < 8; ++e) v[e] = make_float4(0.f, 0.f, 0.f, 0.f);
+      for (int cc = 0; cc < nc; ++cc) {
+        const long long R = ((long long)bp * nc + cc) * ROWS + rr;
+        float4* src = reinterpret_cast<float4*>(p.ws_o + R * 64 + hf * 32);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const float4 x = __ldcg(src + e);
+          v[e].x += x.x; v[e].y += x.y; v[e].z += x.z; v[e].w += x.w;
+          src[e] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        l += __ldcg(p.ws_l + R);
+        if (hf == 0) p.ws_l[R] = 0.f;
+      }
       const float inv = l > 0.f ? __fdividef(vs, l) : 0.f;
       float ss = 0.f;
 #pragma unroll
@@ -471,7 +511,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
       ss += __shfl_xor_sync(FULL, ss, 1);
       const float rn = rsqrtf(ss * (1.f / 64.f) + 1e-5f);
       const int j = rr >> 4, hh = pair * 16 + (rr & 15);
-      const long long tok = (long long)b * 8 + j;
+      const long long tok = (long long)b * L + j;
       const uint4* gp = reinterpret_cast<const uint4*>(p.qkv + tok * p.ld_qkv + (hq + 2 * p.Hkv) * 64 + hh * 64 + hf * 32);
       uint4* op = reinterpret_cast<uint4*>(p.out + tok * hq * 64 + hh * 64 + hf * 32);
 #pragma unroll
@@ -490,16 +530,14 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
         }
         op[e] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
       }
-#pragma unroll
-      for (int e = 0; e < 8; ++e) src[e] = make_float4(0.f, 0.f, 0.f, 0.f);
-      if (hf == 0) p.ws_l[R] = 0.f;
+      }   // rows
       if (tid == 0) p.tickets[bp] = 0;
     }
   }
 }
 #endif
 
-template <int ST, int DIAG, bool O32>
+template <int ST, int DIAG, bool O32, int L, bool PKV>
 __global__ void __launch_bounds__(NTHR, 2) vfa_main(const __grid_constant__ Params p) {
 #if VFA_SM90
   extern __shared__ uint8_t smem_raw[];
@@ -526,7 +564,7 @@ __global__ void __launch_bounds__(NTHR, 2) vfa_main(const __grid_constant__ Para
     int carry = 0;
     for (int b0 = 0; b0 < B; b0 += 32) {
       const int b = b0 + lane;
-      const int nb = (b < B) ? __ldg(p.seq_lens + b) + 8 : 0, wv = (b < B) ? nb + segk : 0;
+      const int nb = (b < B) ? __ldg(p.seq_lens + b) + L : 0, wv = (b < B) ? nb + segk : 0;
       int incl = wv;
 #pragma unroll
       for (int d = 1; d < 32; d <<= 1) {
@@ -558,25 +596,26 @@ __global__ void __launch_bounds__(NTHR, 2) vfa_main(const __grid_constant__ Para
   }
   __syncthreads();
   const int nseg = misc[0];
-  if (p.pdl) pdl_wait();   // q8 and the block's cache rows come from the FA4 prologue
+  if (p.pdl && (tid < NCONS || !PKV)) pdl_wait();   // q8 and the block's cache rows come from the FA4 prologue (PKV: the producers
+                                                      // stream the cached keys first and wait only before the block's own rows)
   if (tid >= NCONS) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 32;\n" ::: "memory");
-    producer<ST, O32>(p, smem, seg, nseg, full, empt, tid - NCONS, pair);
+    producer<ST, O32, L, PKV>(p, smem, seg, sN, nseg, full, empt, tid - NCONS, pair);
     if (p.pdl) pdl_trigger();
   } else {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 104;\n" ::: "memory");
-    consumer<ST, DIAG>(p, smem, seg, sN, nseg, full, empt, misc, tid, pair, pairs);
+    consumer<ST, DIAG, L>(p, smem, seg, sN, nseg, full, empt, misc, tid, pair, pairs);
     if (p.pdl) pdl_trigger();
   }
 #endif
 }
 
-template <int ST, int DIAG, bool O32>
+template <int ST, int DIAG, bool O32, int L, bool PKV>
 static void vfa_go(const Params& p, dim3 grid, cudaStream_t stream, bool pdl) {
   static bool init = false;
   if (!init) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa_main<ST, DIAG, O32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<ST>()));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa_main<ST, DIAG, O32>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa_main<ST, DIAG, O32, L, PKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<ST>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa_main<ST, DIAG, O32, L, PKV>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     init = true;
   }
   cudaLaunchConfig_t cfg = {};
@@ -589,26 +628,29 @@ static void vfa_go(const Params& p, dim3 grid, cudaStream_t stream, bool pdl) {
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vfa_main<ST, DIAG, O32>, p));
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vfa_main<ST, DIAG, O32, L, PKV>, p));
 }
 
-template <int ST, bool O32>
-static void vfa_diag(const Params& p, dim3 grid, cudaStream_t stream, bool pdl, int diag) {
+template <int ST, bool O32, int L>
+static void vfa_diag(const Params& p, dim3 grid, cudaStream_t stream, bool pdl, int diag, bool pkv) {
 #if VFA_LAB
-  if constexpr (O32) {   // lab builds only: probe variants (32-bit offsets, the box's test caches)
+  if constexpr (O32 && L == 8) {   // lab builds only: probe variants (32-bit offsets, the box's test caches)
     switch (diag) {
-      case 1: vfa_go<ST, 1, true>(p, grid, stream, pdl); return;
-      case 2: vfa_go<ST, 2, true>(p, grid, stream, pdl); return;
-      case 3: vfa_go<ST, 3, true>(p, grid, stream, pdl); return;
-      case 4: vfa_go<ST, 4, true>(p, grid, stream, pdl); return;
-      case 5: vfa_go<ST, 5, true>(p, grid, stream, pdl); return;
-      case 6: vfa_go<ST, 6, true>(p, grid, stream, pdl); return;
+      case 1: vfa_go<ST, 1, true, 8, false>(p, grid, stream, pdl); return;
+      case 2: vfa_go<ST, 2, true, 8, false>(p, grid, stream, pdl); return;
+      case 3: vfa_go<ST, 3, true, 8, false>(p, grid, stream, pdl); return;
+      case 4: vfa_go<ST, 4, true, 8, false>(p, grid, stream, pdl); return;
+      case 5: vfa_go<ST, 5, true, 8, false>(p, grid, stream, pdl); return;
+      case 6: vfa_go<ST, 6, true, 8, false>(p, grid, stream, pdl); return;
       default: break;
     }
   }
 #endif
   (void)diag;
-  vfa_go<ST, 0, O32>(p, grid, stream, pdl);
+  if constexpr (O32) {
+    if (pkv) { vfa_go<ST, 0, true, L, true>(p, grid, stream, pdl); return; }
+  }
+  vfa_go<ST, 0, O32, L, false>(p, grid, stream, pdl);
 }
 
 }  // namespace vfa
@@ -616,11 +658,11 @@ static void vfa_diag(const Params& p, dim3 grid, cudaStream_t stream, bool pdl, 
 int64_t vfa_occupancy(int64_t stages) {
   int nb = 0;
   if (stages == 5) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa::vfa_main<5, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, vfa::smem_bytes<5>()));
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, vfa::vfa_main<5, 0, true>, vfa::NTHR, vfa::smem_bytes<5>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa::vfa_main<5, 0, true, 8, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, vfa::smem_bytes<5>()));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, vfa::vfa_main<5, 0, true, 8, false>, vfa::NTHR, vfa::smem_bytes<5>()));
   } else {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa::vfa_main<4, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, vfa::smem_bytes<4>()));
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, vfa::vfa_main<4, 0, true>, vfa::NTHR, vfa::smem_bytes<4>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(vfa::vfa_main<4, 0, true, 8, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, vfa::smem_bytes<4>()));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, vfa::vfa_main<4, 0, true, 8, false>, vfa::NTHR, vfa::smem_bytes<4>()));
   }
   return nb;
 }
@@ -628,13 +670,15 @@ int64_t vfa_occupancy(int64_t stages) {
 void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor page_table, torch::Tensor k_cache,
                  torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor ws_o, torch::Tensor ws_l,
                  torch::Tensor tickets, torch::Tensor out, int64_t B, int64_t Hq, int64_t Hkv, int64_t page_shift, int64_t G,
-                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag) {
+                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv) {
   TORCH_CHECK(stages == 4 || stages == 5, "vfa: stages 4 or 5");
+  TORCH_CHECK((L == 8 || L == 1) && (L == 8 || stages == 4), "vfa: q_len 1 or 8 (q_len 1: stages 4)");
+  TORCH_CHECK(nc >= 1 && nc <= 64, "vfa: nc");
   TORCH_CHECK(Hq == 8 * Hkv && Hkv % 2 == 0 && Hkv > 0, "vfa: need Hq == 8*Hkv and even Hkv");
   TORCH_CHECK(B >= 1 && B <= vfa::MAXB, "vfa: B");
   TORCH_CHECK(G >= 1 && segk >= 0, "vfa: G / segk");
-  TORCH_CHECK(q8.is_cuda() && q8.scalar_type() == at::kByte && q8.is_contiguous() && q8.numel() == B * 8 * Hq * 64, "vfa: q8");
-  TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && qkv.dim() == 2 && qkv.stride(1) == 1 && qkv.size(0) == B * 8 &&
+  TORCH_CHECK(q8.is_cuda() && q8.scalar_type() == at::kByte && q8.is_contiguous() && q8.numel() == B * L * Hq * 64, "vfa: q8");
+  TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && qkv.dim() == 2 && qkv.stride(1) == 1 && qkv.size(0) == B * L &&
                   qkv.size(1) >= (2 * Hq + 2 * Hkv) * 64 && qkv.stride(0) % 8 == 0, "vfa: qkv");
   TORCH_CHECK(seq_lens.scalar_type() == at::kInt && seq_lens.is_contiguous() && seq_lens.numel() == B, "vfa: seq_lens");
   TORCH_CHECK(page_table.scalar_type() == at::kInt && page_table.is_contiguous() && page_table.dim() == 2 && page_table.size(0) == B,
@@ -642,10 +686,10 @@ void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, to
   TORCH_CHECK(k_cache.scalar_type() == at::kByte && k_cache.is_contiguous() && v_cache.scalar_type() == at::kByte && v_cache.is_contiguous(),
               "vfa: caches");
   TORCH_CHECK(k_scale.scalar_type() == at::kFloat && v_scale.scalar_type() == at::kFloat, "vfa: scales");
-  TORCH_CHECK(ws_o.scalar_type() == at::kFloat && ws_o.is_contiguous() && ws_o.numel() >= B * (Hkv / 2) * 128 * 64, "vfa: ws_o");
-  TORCH_CHECK(ws_l.scalar_type() == at::kFloat && ws_l.is_contiguous() && ws_l.numel() >= B * (Hkv / 2) * 128, "vfa: ws_l");
+  TORCH_CHECK(ws_o.scalar_type() == at::kFloat && ws_o.is_contiguous() && ws_o.numel() >= B * (Hkv / 2) * nc * 16 * L * 64, "vfa: ws_o");
+  TORCH_CHECK(ws_l.scalar_type() == at::kFloat && ws_l.is_contiguous() && ws_l.numel() >= B * (Hkv / 2) * nc * 16 * L, "vfa: ws_l");
   TORCH_CHECK(tickets.scalar_type() == at::kInt && tickets.is_contiguous() && tickets.numel() >= B * (Hkv / 2), "vfa: tickets");
-  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() && out.numel() == B * 8 * Hq * 64, "vfa: out");
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() && out.numel() == B * L * Hq * 64, "vfa: out");
   const c10::cuda::OptionalCUDAGuard guard(q8.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   vfa::Params p;
@@ -662,14 +706,17 @@ void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, to
   p.tickets = tickets.data_ptr<int>();
   p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   p.B = (int)B; p.Hq = (int)Hq; p.Hkv = (int)Hkv; p.ld_qkv = (int)qkv.stride(0); p.page_shift = (int)page_shift;
-  p.pt_stride = (int)page_table.size(1); p.segk = (int)segk; p.pdl = (int)pdl;
+  p.pt_stride = (int)page_table.size(1); p.segk = (int)segk; p.pdl = (int)pdl; p.nc = (int)nc;
   p.qk_sm = (float)qk_sm;
   const bool o32 = (k_cache.numel() < (1ll << 32)) && (v_cache.numel() < (1ll << 32));
   const dim3 grid((unsigned)G, (unsigned)(Hkv / 2));
-  if (stages == 5) {
-    if (o32) vfa::vfa_diag<5, true>(p, grid, stream, pdl != 0, (int)diag); else vfa::vfa_diag<5, false>(p, grid, stream, pdl != 0, (int)diag);
+  const bool pd = pdl != 0, pk = pkv != 0;
+  if (L == 1) {
+    if (o32) vfa::vfa_diag<4, true, 1>(p, grid, stream, pd, (int)diag, pk); else vfa::vfa_diag<4, false, 1>(p, grid, stream, pd, (int)diag, pk);
+  } else if (stages == 5) {
+    if (o32) vfa::vfa_diag<5, true, 8>(p, grid, stream, pd, (int)diag, pk); else vfa::vfa_diag<5, false, 8>(p, grid, stream, pd, (int)diag, pk);
   } else {
-    if (o32) vfa::vfa_diag<4, true>(p, grid, stream, pdl != 0, (int)diag); else vfa::vfa_diag<4, false>(p, grid, stream, pdl != 0, (int)diag);
+    if (o32) vfa::vfa_diag<4, true, 8>(p, grid, stream, pd, (int)diag, pk); else vfa::vfa_diag<4, false, 8>(p, grid, stream, pd, (int)diag, pk);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -691,9 +738,15 @@ def _vfa_build(lab=False):
 
 
 def _vfa_wanted(qkv, data, cfg, state):
-    B = cfg["batch"]
-    return (VFA_ENABLE and state.get("vfa_ok") and cfg["q_len"] == 8 and not cfg["window"] and cfg["rope_theta"] in (0.0, ROPE_THETA)
-            and VFA_MIN_B <= B <= VFA_MAX_B and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
+    B, L = cfg["batch"], cfg["q_len"]
+    if L == 8:
+        okb = (B == 1 and VFA_B1) or (VFA_MIN_B <= B <= VFA_MAX_B)
+    elif L == 1:
+        okb = VFA_L1 and VFA_L1_MIN_B <= B <= VFA_L1_MAX_B
+    else:
+        okb = False
+    return (VFA_ENABLE and state.get("vfa_ok") and okb and B <= 256 and not cfg["window"] and cfg["rope_theta"] in (0.0, ROPE_THETA)
+            and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
             and cfg["head_dim"] == 64 and str(qkv.device) in _VFA["ws"] and qkv.dtype == torch.bfloat16 and qkv.dim() == 2
             and qkv.stride(1) == 1 and data["k_cache"].dtype == FP8 and data["v_cache"].dtype == FP8
             and data["k_cache"].is_contiguous() and data["v_cache"].is_contiguous()
@@ -702,9 +755,11 @@ def _vfa_wanted(qkv, data, cfg, state):
             and data["cache_loc"].is_contiguous() and data["positions"].is_contiguous())
 
 
-def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None):
-    B, hq, hkv, d = cfg["batch"], cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
-    tokens = B * 8
+def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None, pkv=None, nc=None):
+    B, L, hq, hkv, d = cfg["batch"], cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    tokens = B * L
+    nc = (VFA_NC_SMALLB if B <= 2 else 1) if nc is None else int(nc)
+    pkv = VFA_PKV if pkv is None else bool(pkv)
     dev = qkv.device
     k_cache, v_cache = data["k_cache"], data["v_cache"]
     pdl = VFA_PDL if pdl is None else bool(pdl)
@@ -725,7 +780,8 @@ def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None):
     _VFA["mod"].vfa_forward(q8.view(torch.uint8), qkv, data["seq_lens"], data["page_table"], k_cache.view(torch.uint8),
                             v_cache.view(torch.uint8), data["k_scale"], data["v_scale"], ws[0], ws[1], ws[2], out, B, hq, hkv,
                             cfg["page_size"].bit_length() - 1, G, int(VFA_SEGK if segk is None else segk), 1 if pdl else 0,
-                            float(cfg["qk_scale_factor"] * cfg["sm_scale"]), st, int(VFA_DIAG if diag is None else diag))
+                            float(cfg["qk_scale_factor"] * cfg["sm_scale"]), st, int(VFA_DIAG if diag is None else diag), L, nc,
+                            1 if (pkv and pdl) else 0)
     return out
 
 
@@ -768,12 +824,13 @@ def _vfa_ref_attention(data, k_new, v_new):
 
 def _vfa_self_test(dev):
     ws = _VFA["ws"][str(dev)]
-    for (B, ctx, page, kvs, seed) in VFA_CASES:
+    for (B, ctx, L, page, kvs, seed) in VFA_CASES:
         for rep in range(2):
-            d = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
-            out = _vfa_run(d["qkv"].view(B * 8, -1), d, d["config"], pdl=bool(rep), stages=4 + rep if _VFA["occ"].get((5, str(dev)), 0) >= 2 else 4)
+            d = _k1_mk_case(dev, B, ctx, L, False, page, kvs, seed)
+            out = _vfa_run(d["qkv"].view(B * L, -1), d, d["config"], pdl=bool(rep), pkv=bool(rep),
+                           stages=4 + rep if (L == 8 and _VFA["occ"].get((5, str(dev)), 0) >= 2) else 4)
             torch.cuda.synchronize(dev)
-            pos = d["seq_lens"].long()[:, None] + torch.arange(8, device=dev)
+            pos = d["seq_lens"].long()[:, None] + torch.arange(L, device=dev)
             slots = torch.gather(d["page_table"].long(), 1, pos // page) * page + pos % page
             kn, vn = (c.view(torch.uint8).view(-1, d["config"]["num_kv_heads"], 64)[slots] for c in (d["k_cache"], d["v_cache"]))
             tot, row = _k1_rel_rows(out, _vfa_ref_attention(d, kn, vn))
@@ -781,20 +838,20 @@ def _vfa_self_test(dev):
             # unscaled and PR206 ignores the cache scales, so at other scales they disagree with each other (R-vfa-3: 0.5-0.6)
             vk = vp = -1.0
             if kvs == 1.0 and _K1_MOD is not None:
-                d2 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
-                vk = _k1_rel_rows(out, _k1_run(d2["qkv"].view(B * 8, -1), d2, d2["config"]))[0]
+                d2 = _k1_mk_case(dev, B, ctx, L, False, page, kvs, seed)
+                vk = _k1_rel_rows(out, _k1_run(d2["qkv"].view(B * L, -1), d2, d2["config"]))[0]
             pr = globals().get("p206_run")   # absent when the bundle strips PR206 (VFA routes every verify-full B >= 2)
-            if pr is not None and kvs == 1.0 and B >= 16 and page == 1:   # same prologue, different attention core
+            if pr is not None and kvs == 1.0 and B >= 16 and page == 1 and L == 8:   # same prologue, different attention core
                 try:
                     d3 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
                     vp = _k1_rel_rows(out, pr(dict(d3, qkv=d3["qkv"].view(B * 8, -1)), pdl=False))[0]
                 except Exception as ex:
                     print(f"[vfa] (P206 comparison unavailable: {ex!r}"[:200] + ")", flush=True)
             clean = not (int(ws[2].abs().sum()) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
-            print(f"[vfa] self-test B={B} ctx={ctx} page={page} kvs={kvs:g} #{rep}: rel {tot:.2e} row {row:.2e} vs K1 {vk:.2e} "
+            print(f"[vfa] self-test B={B} ctx={ctx} L={L} page={page} kvs={kvs:g} #{rep}: rel {tot:.2e} row {row:.2e} vs K1 {vk:.2e} "
                   f"vs P206 {vp:.2e} ws {'clean' if clean else 'DIRTY'}", flush=True)
             if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < 6e-2 and vp < 2e-2):
-                raise RuntimeError(f"self-test mismatch B={B} ctx={ctx} page={page}")
+                raise RuntimeError(f"self-test mismatch B={B} ctx={ctx} L={L} page={page}")
     # graph replay: identical output, and correct after new inputs are copied in
     d = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 411)
     o1 = _vfa_run(d["qkv"].view(128, -1), d, d["config"]).clone()
@@ -843,8 +900,9 @@ def _vfa_prepare(state, t0):
         if VFA_SELF_TEST:
             _vfa_self_test(dev)
         state["vfa_ok"] = True
-        print(f"[vfa] LIVE: verify full {VFA_MIN_B} <= B <= {VFA_MAX_B}, stages {VFA_STAGES} (occupancy {_VFA['occ']}), segk {VFA_SEGK}, "
-              f"pdl {VFA_PDL}, enable {VFA_ENABLE}, build {_K3_BUILD_S.get('vfa', 0):.0f}s, prepare so far {time.time() - t0:.1f}s", flush=True)
+        print(f"[vfa] LIVE: verify full {VFA_MIN_B} <= B <= {VFA_MAX_B} (B = 1: {VFA_B1}), decode full q_len 1 {VFA_L1} B {VFA_L1_MIN_B}..{VFA_L1_MAX_B}, "
+              f"stages {VFA_STAGES} (occupancy {_VFA['occ']}), segk {VFA_SEGK}, nc(B <= 2) {VFA_NC_SMALLB}, pdl {VFA_PDL}, early K/V {VFA_PKV}, "
+              f"enable {VFA_ENABLE}, build {_K3_BUILD_S.get('vfa', 0):.0f}s, prepare so far {time.time() - t0:.1f}s", flush=True)
     except Exception as ex:
         print(f"[vfa] FAILED, the FA4 / K1 verify-full routes stay: {ex!r}"[:1500], flush=True)
         state["vfa_ok"] = False
@@ -936,6 +994,21 @@ def strip_p206(text):
     textual = sorted(n for n in gone if n in words and n not in ("p206_run",))   # p206_run: globals().get() in the VFA self-test
     assert not textual, f"removed names still named in the text: {textual}"
     return text, removed, sorted(gone)
+
+
+def replace(text, sets=()):
+    """Swap the VFA block a base already carries (k3_mb_1 = k3_vfa_7 + ...) for the current one; the route / PT1 / prepare hooks are
+    already in place. The old block runs from `VFA_ENABLE = True` to the line before kernel_fn (strip_layer removed its comment)."""
+    a = text.index(NL + "VFA_ENABLE = True" + NL) + 1
+    b = text.index(KFN, a) + 1
+    assert text.count(NL + "VFA_ENABLE = True" + NL) == 1 and "def _vfa_prepare(state, t0):" in text[a:b]
+    block = VFA_BLOCK
+    for k, v in sets:
+        old = next(ln for ln in block.split(NL) if ln.startswith(f"{k} = "))
+        assert block.count(NL + old + NL) == 1, k
+        block = block.replace(NL + old + NL, NL + f"{k} = {v}" + NL)
+    assert text.count(ROUTE_NEW) == 1, "route hook"
+    return text[:a] + block.lstrip(NL) + text[b:]
 
 
 def cuda_source(lab=True):
@@ -1106,9 +1179,10 @@ def main():
     GM.check(GM.finish(b, bn, tag0, chk_base, []) == b, f"{base.name} is not a fixed point of finish()")
     rep.append(f"base {base.name} {len(b.encode())} B is a finish() fixed point")
     nonce = (f"# nonce {tag} ({base.stem} + VFA: flat warp-specialized FP8-wgmma verify-full attention, q_len 8, B >= 2, "
-             f"self-tested vs the reference / K1 with fallback{'; PR206 route removed (VFA -> FA4 v8 / K1 -> r1)' if '--slim-p206' in sys.argv else ''}"
+             f"+ q_len 1 and B = 1 routes (nc copies, early K/V option), self-tested vs the reference / K1 with fallback"
+             f"{'; PR206 route removed (VFA -> FA4 v8 / K1 -> r1)' if '--slim-p206' in sys.argv else ''}"
              f"{'; ' + ' '.join(f'{k}={v}' for k, v in sets) if sets else ''})")
-    t = apply(b.replace(bn, nonce), sets)
+    t = replace(b.replace(bn, nonce), sets) if "--replace" in sys.argv else apply(b.replace(bn, nonce), sets)
     if "--slim-p206" in sys.argv:
         t, removed, gone = strip_p206(t)
         rep.append(f"PR206 removed: {len(removed.encode())} B, {len(gone)} top-level names, none referenced afterwards")
