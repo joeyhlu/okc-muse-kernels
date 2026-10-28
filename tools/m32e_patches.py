@@ -475,8 +475,22 @@ def sub1(text, old, new, what):
     return text.replace(old, new)
 
 
+# k3_mb_1 and later bases carry MB's closed-form job split in route() (gen_k3_mb.py, -1..-1.6 us per call) instead of the
+# countdown loop; the JN / VM_DP split patch then wraps that line instead of the loop (same jobs, same code at defaults).
+_NL = chr(10)
+_MB_SPLIT = _NL.join(["const int nj = (tot + 63) >> 6;", "int base = 64;",
+                      "if (nj && base > 1) base = max(1, min(base, (tot + nj - 1) / nj));"])
+_LOOP_SPLIT = _NL.join(["const int nj = (tot + 63) >> 6;", "int base = 64;",
+                        "if (nj) { while (base > 1 && (base - 1) * nj >= tot) --base; }", ""])
+
+
 def patch_cuda(cuda):
     for i, (old, new) in enumerate(CUDA_PATCHES):
+        if old == _LOOP_SPLIT and cuda.count(old) == 0 and cuda.count(_MB_SPLIT) == 1:
+            ln = cuda[cuda.index(_MB_SPLIT):].split(_NL, 3)
+            mb = _NL.join(ln[:3]) + _NL   # the closed-form line keeps its trailing comment, if any
+            new = new.replace(_LOOP_SPLIT, mb)
+            old = mb
         cuda = sub1(cuda, old, new, f"cuda patch {i}")
     return cuda
 

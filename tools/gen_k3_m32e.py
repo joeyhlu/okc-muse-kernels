@@ -132,7 +132,8 @@ K2A36_ENABLE = True
 
 
 def main():
-    GM.check(not LAB.exists() and (LAB_ONLY or not OUT.exists()), f"{OUT.name} or its lab copy exists; pick another --n")
+    GM.check("--dry" in sys.argv or (not LAB.exists() and (LAB_ONLY or not OUT.exists())),
+             f"{OUT.name} or its lab copy exists; pick another --n")
     GM.check(all(v in ("d", "d2", "s", "c") for v in BVAR.values()) and set(POOL) <= set(BVAR) and set(SEGC) <= set(BVAR),
              "bad --bvar / --pool / --seg")
     rep = []
@@ -157,6 +158,9 @@ def main():
     s = GM.finish(t, nonce, TAG, chk_base, rep)
     for r in rep:
         print(f"[gen_k3_m32e] OK  {r}")
+    if "--dry" in sys.argv:
+        print(f"[gen_k3_m32e] --dry: nothing written ({len(s.encode())} B, headroom {1_000_000 - len(s.encode())} B)")
+        return 0
     if not LAB_ONLY:
         OUT.write_text(s, encoding="utf-8", newline=NL)
     LAB.write_text(s, encoding="utf-8", newline=NL)
