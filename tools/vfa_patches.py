@@ -71,9 +71,10 @@ constexpr int NCONS = 256;
 constexpr int NPROD = 128;
 constexpr int NTHR = NCONS + NPROD;
 constexpr float LOG2E = 1.4426950408889634f;
-constexpr float POFF = 8.0f;                    // offset = row max - 8: P = 2^(s - off) in (0, 256] (e4m3 keeps 2^-9 .. 448;
-                                                // offset at the max left most keys subnormal: rel 3.5e-2 in R-vfa-1)
-constexpr uint32_t PCHK = 0x02020202u;          // + 2 per byte sets bit 7 for bytes >= 0x7E: P >= 448 (saturation) -> move
+constexpr float POFF = 0.0f;                    // offset = a segment's first-tile row max: P = 2^(s - off) <= 1 there, later
+                                                // tiles may reach 256 before the offset moves (R-vfa-4: offset max - 8 with the
+                                                // 448 threshold repacked so often that verify32 cost 219 vs 191 us, same accuracy)
+constexpr uint32_t PCHK = 0x07070707u;          // + 7 per byte sets bit 7 for bytes > 0x78: P > 256 -> move the offset
 constexpr unsigned FULL = 0xffffffffu;
 
 template <int ST> constexpr int off_v() { return ST * STAGE_BYTES; }
@@ -231,7 +232,7 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
 
 // ---- consumer warpgroups (104 registers): warpgroup h = KV head h, warp w = tokens 2w, 2w + 1 (rows 16 w .. 16 w + 15) ----
 // DIAG (lab builds only): 1 = skeleton (wait / arrive only), 2 = no V^T + PV, 3 = no QK, 4 = exact per-tile row max,
-// 5 = valid variant: PV wait deferred to the next tile, 6 = valid variant: offset at the row max + P > 256 threshold
+// 5 = valid variant: PV wait deferred to the next tile, 6 = valid variant: offset = row max - 8 with the P >= 448 threshold
 template <int ST, int DIAG>
 __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const int* seg, const int* sN, int nseg, uint64_t* full,
                                          uint64_t* empt, int* misc, int tid, int pair, int pairs) {
@@ -240,8 +241,8 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
   const int g = lane >> 2, tig = lane & 3;
   const int hq = p.Hq;
   constexpr bool DEFER = (DIAG == 5);   // PV(i) waited at tile i + 1 (with QK(i + 1)) instead of at the end of tile i
-  constexpr float POF = (DIAG == 6) ? 0.f : POFF;              // DIAG 6: offset at the row max, move when P > 256 (lab)
-  constexpr uint32_t PBK = (DIAG == 6) ? 0x07070707u : PCHK;
+  constexpr float POF = (DIAG == 6) ? 8.f : POFF;              // DIAG 6 (lab): offset = max - 8 with the 448 threshold (R-vfa-2..4)
+  constexpr uint32_t PBK = (DIAG == 6) ? 0x02020202u : PCHK;
   const float vs = __ldg(p.v_scale);
   const float ssc = p.qk_sm * __ldg(p.k_scale) * LOG2E;   // raw e4m3 x e4m3 score -> log2 units
   // wgmma descriptors: low word = (addr >> 4) | LBO 1; high word = SBO | layout (1: 128B swizzle, 2: 64B swizzle)
@@ -370,7 +371,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
           constexpr uint32_t PB = PBK;
           const uint32_t ov = ((pa[0][0] + PB) | (pa[0][1] + PB) | (pa[0][2] + PB) | (pa[0][3] + PB) |
                                (pa[1][0] + PB) | (pa[1][1] + PB) | (pa[1][2] + PB) | (pa[1][3] + PB)) & 0x80808080u;
-          if (__any_sync(FULL, ov != 0u)) {   // rare: offsets up to this tile's row maxima - POFF, state rescaled, repacked (P <= 256 after)
+          if (__any_sync(FULL, ov != 0u)) {   // rare: offsets up to this tile's row maxima, state rescaled, repacked
             float m0 = neg_inf(), m1 = neg_inf();
 #pragma unroll
             for (int nt8 = 0; nt8 < 8; ++nt8) {
@@ -802,7 +803,7 @@ def _vfa_self_test(dev):
         og = _vfa_run(d["qkv"].view(128, -1), d, d["config"])
     gph.replay()
     torch.cuda.synchronize(dev)
-    same = bool(torch.equal(og, o1))
+    same = _k1_rel_rows(og, o1)[0] < 2e-3   # the fp32 red.add merge is order-nondeterministic: not bitwise
     f = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 411)   # same seed = same shapes; fresh values
     gen = torch.Generator(device=dev).manual_seed(412)
     f["qkv"] = (torch.randn(f["qkv"].shape, generator=gen, device=dev) * 1.5).to(torch.bfloat16)
@@ -816,7 +817,7 @@ def _vfa_self_test(dev):
     og.fill_(float("nan"))
     gph.replay()
     torch.cuda.synchronize(dev)
-    same2 = bool(torch.equal(og, o2)) and bool(torch.isfinite(og).all())
+    same2 = _k1_rel_rows(og, o2)[0] < 2e-3 and bool(torch.isfinite(og).all())
     print(f"[vfa] graph check: replay identical {same}, after new inputs {same2}", flush=True)
     if not (same and same2):
         raise RuntimeError("graph check failed")
