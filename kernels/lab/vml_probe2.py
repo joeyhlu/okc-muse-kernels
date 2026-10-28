@@ -23,6 +23,12 @@ weight stage + one x stage, 2 producer warps), with compile-time arms:
          half-broadcast forms (__low2bfloat162 / __high2bfloat162, folded into HMUL2 .H0_H0 / .H1_H1)
   PG_DS  1: x descriptor = slot-0 descriptor + slot offset (no per-stage rebuild)
   PG_CL  1: codes loaded one 4-step group ahead (8 live registers instead of 16), weight slot released after the last load
+  VMP step 0 (journal VMP design, gpu_requests R-vmp-0): PG_PAIR (own kernel vp2_pair_kernel, VP_NS 4, VP_NX 2):
+         every consumer warp takes a heavy RS-wgmma stage (N_h 16..64, real ws13 unit) and a light N8 stage (a
+         different unit) per pair from one 4-slot weight ring filled in pair order, heavy x ring 2 x 32 KB, light
+         x ring 2 x 4 KB. 1 PAIR (light mma.sync m16n8k16 + ldmatrix, issued before the heavy group),
+         2 PAIRW (light as wgmma m64n8k16 in the heavy commit group), 3 SEQ (same ring, heavy stage then light
+         stage), 4 NULL (waits / releases only). Pair time = kernel time x G / (units x 16).
 Stage time = kernel time x G / (units x 16).
 """
 import hashlib
@@ -121,7 +127,22 @@ __device__ __forceinline__ void dec_half2(uint32_t w0, uint32_t w8, uint32_t sw2
 }
 constexpr bool TRICKS = PG_DQ || PG_SC2 || PG_DS || PG_CL;
 constexpr int WSB = 2 * (NS + NX);       // PG_WS barriers after the shared ones: full [q][slot], then empty [q][slot]
-constexpr int SMEM2 = SMEM + (PG_WS ? 8 * 8 * NS : 0);
+#ifndef PG_PAIR
+#define PG_PAIR 0
+#endif
+#ifndef PG_PCH
+#define PG_PCH 2
+#endif
+#ifndef PG_P1W
+#define PG_P1W 0
+#endif
+constexpr int PNTH = 32 * NCW + (PG_P1W ? 32 : 64);   // PG_P1W 1: one producer warp (lane 0 weights, lane 1 x)
+constexpr int XLS = 8 * 512;                    // PG_PAIR light x slot (8 tokens x 256 K bf16)
+constexpr int NXL = 2;
+constexpr int PX_OFF = NS * US, PXL_OFF = NS * US + NX * XS, PBAR_OFF = PXL_OFF + NXL * XLS;
+constexpr int PB_WF = 0, PB_WE = NS, PB_HF = 2 * NS, PB_HE = 2 * NS + NX, PB_LF = 2 * NS + 2 * NX, PB_LE = 2 * NS + 2 * NX + NXL;
+constexpr int PSMEM = PBAR_OFF + 8 * (2 * NS + 2 * NX + 2 * NXL);
+constexpr int SMEM2 = PG_PAIR ? PSMEM : SMEM + (PG_WS ? 8 * 8 * NS : 0);
 __device__ __forceinline__ void prod_w_ws(const Args& A, uint32_t ring, uint32_t bars, int u0, int u1, int q) {
   const uint64_t pol = policy_evict_first();
   int it = 0;
@@ -485,7 +506,7 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
       for (int i = 0; i < 4 * NS; ++i) { mbar_init(bars + 8 * (WSB + i), 1); mbar_init(bars + 8 * (WSB + 4 * NS + i), 4); }
       asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
-    if (A.marks) A.marks[(size_t)blockIdx.x * 8] = gtime();
+    if (A.marks) { A.marks[(size_t)blockIdx.x * 8] = gtime(); A.marks[(size_t)blockIdx.x * 8 + 5] = clock64(); }
   }
   __syncthreads();
   const int2 rg = A.cta[blockIdx.x];
@@ -572,15 +593,277 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
     }
   }
   if (wp == 0 && lane == 0 && A.marks) A.marks[(size_t)blockIdx.x * 8 + 1 + q] = gtime();
+  if (warp == 0 && lane == 0 && A.marks) {
+    A.marks[(size_t)blockIdx.x * 8 + 6] = clock64();
+    A.marks[(size_t)blockIdx.x * 8 + 7] = gtime();
+  }
 }
+#if PG_PAIR
+// ---------------- VMP step 0 (PG_PAIR): one heavy RS-wgmma stage + one light N8 stage per pair, same warps ----------------
+__device__ __forceinline__ void pp_w(const Args& A, uint32_t ring, uint32_t bars, int u0, int u1, int nH) {
+  const uint64_t pol = policy_evict_first();
+  int it = 0;
+  for (int u = u0; u < u1; ++u) {
+    const int2 uh = A.unit[u], ul = A.unit[nH + u];
+    const uint8_t* wh = A.ws13 + ((size_t)A.job[uh.x].x * 64 + 2 * uh.y) * 16 * SW;
+    const uint8_t* wl = A.ws13 + ((size_t)A.job[ul.x].x * 64 + 2 * ul.y) * 16 * SW;
+    for (int s = 0; s < 16; ++s)
+      for (int t = 0; t < 2; ++t, ++it) {   // pair order: heavy stage s, light stage s
+        const uint8_t* wb = t ? wl : wh;
+        const int sl = it % NS;
+        if (it >= NS) mbar_wait(bars + 8 * (PB_WE + sl), ((it / NS) & 1) ^ 1, A.err);
+        const uint32_t fb = bars + 8 * (PB_WF + sl), dst = ring + sl * US;
+        mbar_expect_tx(fb, US);
+        bulk_g2s_ef(dst, wb + (size_t)s * SW, SW, fb, pol);
+        bulk_g2s_ef(dst + SW, wb + (size_t)(16 + s) * SW, SW, fb, pol);
+      }
+  }
+}
+__device__ __forceinline__ void pp_x(const Args& A, uint32_t xh, uint32_t xl, uint32_t bars, int u0, int u1, int nH) {
+  int it = 0;
+  for (int u = u0; u < u1; ++u) {
+    const int4 jh = A.job[A.unit[u].x], jl = A.job[A.unit[nH + u].x];
+    const uint32_t bh = (uint32_t)jh.z * 512u, bl = (uint32_t)jl.z * 512u;
+    for (int s = 0; s < 16; ++s, ++it) {
+      int sl = it % NX;
+      if (it >= NX) mbar_wait(bars + 8 * (PB_HE + sl), ((it / NX) & 1) ^ 1, A.err);
+      mbar_expect_tx(bars + 8 * (PB_HF + sl), bh);
+      bulk_g2s(xh + sl * XS, A.xp + (size_t)jh.w + (size_t)s * bh, bh, bars + 8 * (PB_HF + sl));
+      sl = it % NXL;
+      if (it >= NXL) mbar_wait(bars + 8 * (PB_LE + sl), ((it / NXL) & 1) ^ 1, A.err);
+      mbar_expect_tx(bars + 8 * (PB_LF + sl), bl);
+      bulk_g2s(xl + sl * XLS, A.xp + (size_t)jl.w + (size_t)s * bl, bl, bars + 8 * (PB_LF + sl));
+    }
+  }
+}
+// light half group (2 k16 steps) by mma.sync: dequant into registers, B by ldmatrix.x4, two accumulator chains
+__device__ __forceinline__ void light_half(uint4 cl, int hf, int ii, uint32_t sw2, uint32_t xb, float (&dl)[2][4]) {
+  const uint32_t par = ii & 1;
+  const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
+  const uint32_t S8 = __byte_perm(sw2, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+  uint32_t h[8];
+  dec_half(hf ? cl.y : cl.x, hf ? cl.w : cl.z, Sg, S8, h);
+  uint32_t b0, b1, b2, b3;
+  ldsm4(xb + (uint32_t)((ii * 8 + 4 * hf) * 128), b0, b1, b2, b3);
+  mma16816(dl[0], h[0], h[4], h[1], h[5], b0, b1);
+  mma16816(dl[PG_PCH - 1], h[2], h[6], h[3], h[7], b2, b3);   // PG_PCH 1: one light accumulator chain (4 registers)
+}
+template <int N, int MODE>   // 1 PAIR, 2 PAIRW, 3 SEQ, 4 NULL
+__device__ __forceinline__ void pair_stage(const Args& A, uint8_t* smem, uint32_t bars, int i, int& prevx, int& prevxl,
+                                           float* dh, float (&dl)[2][4], uint32_t (&hb)[2][8], uint32_t (&hl)[2][8],
+                                           int warp, int lane, bool first) {
+  const int iw = 2 * i, wsh = iw % NS, wsl = (iw + 1) % NS, xs = i % NX, xl = i % NXL;
+  const uint32_t ph = (uint32_t)(iw / NS) & 1u, pl = (uint32_t)((iw + 1) / NS) & 1u;
+  if constexpr (MODE == 4) {
+    mbar_wait(bars + 8 * (PB_WF + wsh), ph, A.err);
+    mbar_wait(bars + 8 * (PB_WF + wsl), pl, A.err);
+    mbar_wait(bars + 8 * (PB_HF + xs), (i / NX) & 1, A.err);
+    mbar_wait(bars + 8 * (PB_LF + xl), (i / NXL) & 1, A.err);
+    __syncwarp();
+    if (lane == 0) {
+      mbar_arrive(bars + 8 * (PB_WE + wsh));
+      mbar_arrive(bars + 8 * (PB_WE + wsl));
+      mbar_arrive(bars + 8 * (PB_HE + xs));
+      mbar_arrive(bars + 8 * (PB_LE + xl));
+    }
+    return;
+  } else {
+    const int tile = warp & 7;
+    const uint8_t* sth = smem + wsh * US + (warp >> 3) * SW;
+    const uint8_t* stl = smem + wsl * US + (warp >> 3) * SW;
+    const uint4* cph = reinterpret_cast<const uint4*>(sth + tile * 2048) + lane;
+    const uint4* cpl = reinterpret_cast<const uint4*>(stl + tile * 2048) + lane;
+    const uint32_t* sph = reinterpret_cast<const uint32_t*>(sth + 16384 + tile * 256) + lane;
+    const uint32_t* spl = reinterpret_cast<const uint32_t*>(stl + 16384 + tile * 256) + lane;
+    mbar_wait(bars + 8 * (PB_WF + wsh), ph, A.err);
+    uint4 ch[4];
+    ch[0] = cph[0];
+    uint32_t shw = sph[0];   // scale word of k64 blocks 0-1; blocks 2-3 loaded after its last use (1 live register)
+    mbar_wait(bars + 8 * (PB_WF + wsl), pl, A.err);
+    uint32_t slw = spl[0];
+    mbar_wait(bars + 8 * (PB_HF + xs), (i / NX) & 1, A.err);
+    mbar_wait(bars + 8 * (PB_LF + xl), (i / NXL) & 1, A.err);
+    __syncwarp();
+    const uint64_t d0 = wg_desc_sa(sa(smem + PX_OFF + xs * XS), 4096u);
+    const uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
+    const uint32_t xlb = sa(smem + PXL_OFF + xl * XLS);
+    const uint32_t xb = xlb + (uint32_t)(((lane >> 3) * 8 + (lane & 7)) * 16);
+    const uint64_t e0 = wg_desc_sa(xlb, 4096u);
+    const uint32_t elo = (uint32_t)e0, ehi = (uint32_t)(e0 >> 32);
+    uint4 cl = make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (MODE != 3) cl = cpl[0];
+#pragma unroll
+    for (int gi = 0; gi < 8; ++gi) {
+      const int ii = gi >> 1, hf = gi & 1, par = ii & 1;
+      if constexpr (MODE == 1) {
+        light_half(cl, hf, ii, slw, xb, dl);             // registers consumed at issue
+        if (hf == 1 && ii < 3) cl = cpl[32 * (ii + 1)];  // next group's light codes, after this group's last use
+        if (gi == 3) slw = spl[32];
+      }
+      uint32_t* hh = hb[gi & 1];
+      {
+        const uint32_t Sg = __byte_perm(shw, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
+        const uint32_t S8 = __byte_perm(shw, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+        dec_half(hf ? ch[ii].y : ch[ii].x, hf ? ch[ii].w : ch[ii].z, Sg, S8, hh);
+        if (hf == 1 && ii < 3) ch[ii + 1] = cph[32 * (ii + 1)];   // next group's heavy codes: 4 live code registers
+        if (gi == 3) shw = sph[32];
+      }
+      if constexpr (MODE == 2) {
+        const uint32_t Sg = __byte_perm(slw, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
+        const uint32_t S8 = __byte_perm(slw, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+        dec_half(hf ? cl.y : cl.x, hf ? cl.w : cl.z, Sg, S8, hl[gi & 1]);
+        if (hf == 1 && ii < 3) cl = cpl[32 * (ii + 1)];
+        if (gi == 3) slw = spl[32];
+      }
+      wg_fence();
+      const uint32_t off = 32u * (uint32_t)gi;
+      if (first && gi == 0) mma2<N, true>(dh, hh, dlo + off, dhi);
+      else mma2<N, false>(dh, hh, dlo + off, dhi);
+      if constexpr (MODE == 2) {
+        if (first && gi == 0) mma2<8, true>(dl[0], hl[gi & 1], elo + off, ehi);
+        else mma2<8, false>(dl[0], hl[gi & 1], elo + off, ehi);
+      }
+      wg_commit();
+      wg_wait<1>();
+      if (gi == 0 && prevx >= 0) {   // the previous pair's last group retired: its x slot(s) are free
+        if (lane == 0) {
+          mbar_arrive(bars + 8 * (PB_HE + prevx));
+          if (MODE == 2) mbar_arrive(bars + 8 * (PB_LE + prevxl));
+        }
+        prevx = -1;
+      }
+      if (gi == 6) {   // all codes of both stages are in registers and consumed: release the weight slots
+        __syncwarp();
+        if (lane == 0) {
+          mbar_arrive(bars + 8 * (PB_WE + wsh));
+          if (MODE != 3) mbar_arrive(bars + 8 * (PB_WE + wsl));
+        }
+      }
+    }
+    if constexpr (MODE == 3) {   // SEQ: the light stage after the heavy one
+#pragma unroll
+      for (int gi = 0; gi < 8; ++gi) {
+        const int ii = gi >> 1, hf = gi & 1;
+        if (hf == 0) cl = cpl[32 * ii];
+        if (gi == 4) slw = spl[32];
+        light_half(cl, hf, ii, slw, xb, dl);
+        if (gi == 6) {
+          __syncwarp();
+          if (lane == 0) mbar_arrive(bars + 8 * (PB_WE + wsl));
+        }
+      }
+    }
+    if constexpr (MODE != 2) {   // mma.sync light: its x slot is read synchronously (ldmatrix)
+      __syncwarp();
+      if (lane == 0) mbar_arrive(bars + 8 * (PB_LE + xl));
+    }
+    prevx = xs;
+    prevxl = xl;
+  }
+}
+template <int N, int MODE>
+__device__ __forceinline__ void pair_unit(const Args& A, uint8_t* smem, uint32_t bars, int& i, int& prevx, int& prevxl, int u,
+                                          int nH, int warp, int lane) {
+  float dh[N / 2];
+  float dl[2][4];
+#pragma unroll
+  for (int k = 0; k < 4; ++k) { dl[0][k] = 0.f; dl[1][k] = 0.f; }
+  uint32_t hb[2][8], hl[2][8];
+  pair_stage<N, MODE>(A, smem, bars, i, prevx, prevxl, dh, dl, hb, hl, warp, lane, true);
+  ++i;
+#pragma unroll 1
+  for (int s = 1; s < 16; ++s, ++i) pair_stage<N, MODE>(A, smem, bars, i, prevx, prevxl, dh, dl, hb, hl, warp, lane, false);
+  if constexpr (MODE != 4) {
+    wg_wait<0>();
+    if (lane == 0) {
+      mbar_arrive(bars + 8 * (PB_HE + prevx));
+      if (MODE == 2) mbar_arrive(bars + 8 * (PB_LE + prevxl));
+    }
+    prevx = -1;
+    const int g = lane >> 2, t = lane & 3;
+    {
+      const int2 un = A.unit[u];
+      const int4 jb = A.job[un.x];
+      const float gs = __ldg(A.gsc13 + jb.x);
+      const int col = 8 * ((2 * un.y + (warp >> 3)) * 8 + (warp & 7)) + g;
+      const int rb = A.jbase[un.x];
+#pragma unroll
+      for (int nt = 0; nt < N / 8; ++nt)
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+          const int n = 8 * nt + 2 * t + h2;
+          if (n < jb.y)
+            A.inter[(size_t)(rb + n) * KDIM + col] = __float2bfloat16_rn(swiglu(dh[4 * nt + h2] * gs, dh[4 * nt + 2 + h2] * gs));
+        }
+    }
+    {
+      const int2 un = A.unit[nH + u];
+      const int4 jb = A.job[un.x];
+      const float gs = __ldg(A.gsc13 + jb.x);
+      const int col = 8 * ((2 * un.y + (warp >> 3)) * 8 + (warp & 7)) + g;
+      const int rb = A.jbase[un.x];
+#pragma unroll
+      for (int h2 = 0; h2 < 2; ++h2) {
+        const int n = 2 * t + h2;
+        const float gg = (MODE == 2 || PG_PCH == 1) ? dl[0][h2] : dl[0][h2] + dl[1][h2];
+        const float uu = (MODE == 2 || PG_PCH == 1) ? dl[0][2 + h2] : dl[0][2 + h2] + dl[1][2 + h2];
+        if (n < jb.y) A.inter[(size_t)(rb + n) * KDIM + col] = __float2bfloat16_rn(swiglu(gg * gs, uu * gs));
+      }
+    }
+  }
+}
+__global__ void __launch_bounds__(PNTH, 1) vp2_pair_kernel(const Args A) {
+  extern __shared__ __align__(1024) uint8_t smem[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const uint32_t bars = sa(smem + PBAR_OFF);
+  if (tid == 0) {
+    for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * (PB_WF + i), 1); mbar_init(bars + 8 * (PB_WE + i), NCW); }
+    for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (PB_HF + i), 1); mbar_init(bars + 8 * (PB_HE + i), NCW); }
+    for (int i = 0; i < NXL; ++i) { mbar_init(bars + 8 * (PB_LF + i), 1); mbar_init(bars + 8 * (PB_LE + i), NCW); }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    if (A.marks) { A.marks[(size_t)blockIdx.x * 8] = gtime(); A.marks[(size_t)blockIdx.x * 8 + 5] = clock64(); }
+  }
+  __syncthreads();
+  const int2 rg = A.cta[blockIdx.x];
+  const int nH = A.cta[gridDim.x].x;   // light units follow the heavy ones in A.unit
+  if (warp >= NCW) {
+    const int role = PG_P1W ? lane : (warp - NCW) * 32 + lane;   // 0 weight producer, 32 (or lane 1) x producer
+    if (role == 0) pp_w(A, sa(smem), bars, rg.x, rg.y, nH);
+    else if (role == (PG_P1W ? 1 : 32)) pp_x(A, sa(smem + PX_OFF), sa(smem + PXL_OFF), bars, rg.x, rg.y, nH);
+    return;
+  }
+  constexpr int MD = PG_PAIR ? PG_PAIR : 1;
+  int i = 0, prevx = -1, prevxl = -1;
+  for (int u = rg.x; u < rg.y; ++u) {
+    switch (A.job[A.unit[u].x].z >> 3) {
+      case 2: pair_unit<16, MD>(A, smem, bars, i, prevx, prevxl, u, nH, warp, lane); break;
+      case 4: pair_unit<32, MD>(A, smem, bars, i, prevx, prevxl, u, nH, warp, lane); break;
+      case 6: pair_unit<48, MD>(A, smem, bars, i, prevx, prevxl, u, nH, warp, lane); break;
+      default: pair_unit<64, MD>(A, smem, bars, i, prevx, prevxl, u, nH, warp, lane); break;
+    }
+  }
+  if (lane == 0 && A.marks && (warp & 3) == 0) A.marks[(size_t)blockIdx.x * 8 + 1 + (warp >> 2)] = gtime();
+  if (warp == 0 && lane == 0 && A.marks) {
+    A.marks[(size_t)blockIdx.x * 8 + 6] = clock64();
+    A.marks[(size_t)blockIdx.x * 8 + 7] = gtime();
+  }
+}
+#endif  // PG_PAIR
+#if PG_PAIR
+#define VP2K vp2_pair_kernel
+#define VP2T PNTH
+#else
+#define VP2K vp2_kernel
+#define VP2T NTH2
+#endif
 }  // namespace vp
 
 std::vector<int64_t> vp2_attrs() {
-  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
+  cudaFuncSetAttribute(vp::VP2K, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
   cudaFuncAttributes fa;
-  cudaFuncGetAttributes(&fa, vp::vp2_kernel);
+  cudaFuncGetAttributes(&fa, vp::VP2K);
   int occ = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, vp::vp2_kernel, vp::NTH2, vp::SMEM2);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, vp::VP2K, vp::VP2T, vp::SMEM2);
   return {fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)vp::SMEM2, occ};
 }
 
@@ -597,8 +880,8 @@ void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::
   a.inter = reinterpret_cast<__nv_bfloat16*>(inter.data_ptr());
   a.err = err.data_ptr<int>();
   a.marks = marks.numel() >= G * 8 ? reinterpret_cast<long long*>(marks.data_ptr()) : nullptr;
-  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
-  vp::vp2_kernel<<<(int)G, vp::NTH2, vp::SMEM2, at::cuda::getCurrentCUDAStream()>>>(a);
+  cudaFuncSetAttribute(vp::VP2K, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
+  vp::VP2K<<<(int)G, vp::VP2T, vp::SMEM2, at::cuda::getCurrentCUDAStream()>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
@@ -615,7 +898,9 @@ ARMS = {"F": {}, "PP": {"PG_PP": 1}, "C": {"PG_RES": 1},
         "XR": {"PG_XR": 1}, "XL": {"PG_XL": 1}, "XSW": {"PG_XSW": 1}, "XLSW": {"PG_XL": 1, "PG_XSW": 1},
         "WS": {"PG_WS": 1}, "WSXR": {"PG_WS": 1, "PG_XR": 1},
         "DQ": {"PG_DQ": 1}, "SC2": {"PG_SC2": 1}, "DS": {"PG_DS": 1}, "CL": {"PG_CL": 1},
-        "ALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_CL": 1}, "CALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_RES": 1}}
+        "ALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_CL": 1}, "CALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_RES": 1},
+        "PAIR": {"PG_PAIR": 1, "VP_NS": 4, "VP_NX": 2}, "PAIRW": {"PG_PAIR": 2, "VP_NS": 4, "VP_NX": 2},
+        "PAIR1": {"PG_PAIR": 1, "PG_PCH": 1, "VP_NS": 4, "VP_NX": 2}, "PAIR544": {"PG_PAIR": 1, "PG_P1W": 1, "VP_NS": 4, "VP_NX": 2}, "SEQ": {"PG_PAIR": 3, "VP_NS": 4, "VP_NX": 2}, "NULLP": {"PG_PAIR": 4, "VP_NS": 4, "VP_NX": 2}}
 NOCHECK = ("PG_RES", "PG_XR")   # timing-only arms (results wrong by design)
 
 
@@ -627,6 +912,23 @@ def to_sw128(xp, npad):
     qidx = (torch.arange(8, device=xp.device)[None, :] ^ r[:, None])           # [r][p] -> q
     Y = X[:, :, :, :, r[:, None], qidx, :]                                       # [e][s][i][n8][r][p][16]
     return Y.contiguous().view(torch.uint8).reshape(-1)
+
+
+def plan_pair(nh, G, dev, n_units=924):
+    """PG_PAIR plan: heavy jobs = experts 0.. with nh tokens (V1.plan seed 7), light jobs = the same experts with 8 tokens
+    (seed 11) at job index ne + e; heavy unit u pairs with light unit (u + n_units / 2 + 3) % n_units (a different unit,
+    never one another CTA streams at the same pair index); A.cta[G] = (n_units, 0) = offset of the light units."""
+    Ph = V1.plan(nh, n_units, G, dev, seed=7)
+    Pl = V1.plan(8, n_units, G, dev, seed=11)
+    ne, xh = Ph["ne"], Ph["xp"].numel()
+    jobs = Ph["job"].tolist() + [[e, n, p, xo + xh] for e, n, p, xo in Pl["job"].tolist()]
+    jbase = [e * nh for e in range(ne)] + [ne * nh + e * 8 for e in range(ne)]
+    sh = n_units // 2 + 3
+    ul = [[ne + ((u + sh) % n_units) // 32, ((u + sh) % n_units) % 32] for u in range(n_units)]
+    t = lambda v: torch.tensor(v, dtype=torch.int32).to(dev).contiguous()  # noqa: E731
+    return {"job": t(jobs), "jbase": t(jbase), "unit": t(Ph["unit"].tolist() + ul),
+            "cta": t(Ph["cta"].tolist() + [[n_units, 0]]), "xp": torch.cat([Ph["xp"], Pl["xp"]]).contiguous(),
+            "rows": ne * (nh + 8), "ne": ne, "units": n_units, "Ph": Ph, "Pl": Pl}
 
 
 def flags_of(arm):
