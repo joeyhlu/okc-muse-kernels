@@ -578,7 +578,7 @@ def main_attn():
     t = src.read_text(encoding="utf-8")
     lines = t.split(chr(10))
     assert lines[0] == "# okc: problem=muse_decode_layer", lines[0]
-    sets = [kv.split("=", 1) for kv in ARGS.get("set", "").split(",") if kv]
+    sets = [[k, v.replace(";", ",")] for k, v in (kv.split("=", 1) for kv in ARGS.get("set", "").split(",") if kv)]
     lines[0] = "# okc: problem=muse_attention_decode"
     lines[1] = (f"# nonce va-{N} ({src.stem} attention path for muse_attention_decode (VA1 + VA2 routes), tools/va_patches.py "
                 f"--attn; {' '.join(f'{k}={v}' for k, v in sets) or 'defaults'})")
