@@ -61,6 +61,16 @@ __global__ void l2p_pf_kernel(const unsigned char* p, unsigned long long bytes) 
 #endif
 }
 
+__global__ void l2p_spin_kernel(unsigned long long ns) {
+  unsigned long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t0));
+  do { asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t)); } while (t - t0 < ns);
+}
+
+void l2p_spin(int64_t us) {
+  l2p_spin_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>((unsigned long long)us * 1000ull);
+}
+
 void l2p_sweep(torch::Tensor w, int64_t bytes) {
   const unsigned long long n16 = (unsigned long long)bytes / 16ull;
   static unsigned* sink = nullptr;
@@ -74,6 +84,9 @@ void l2p_pf(torch::Tensor w, int64_t bytes, int64_t nblk, int64_t nthr) {
       reinterpret_cast<const unsigned char*>(w.data_ptr()), (unsigned long long)bytes);
 }
 '''
+
+
+SPIN_US = 60   # GPU-busy spacer before every timed replay (see main)
 
 
 def arg(name, default):
@@ -116,10 +129,21 @@ class Timer:
         e.synchronize()
         return s.elapsed_time(e) * 1e3
 
+    spacer = None
+
+    def space(self):
+        if self.spacer is not None:
+            with torch.cuda.stream(self.stream):
+                self.spacer()
+
     def overhead(self, n=100):
         tiny = torch.zeros(1, device="cuda")
         g = self.capture(lambda: tiny.add_(1))
-        return statistics.median(self.timed(g.replay) for _ in range(n))
+        out = []
+        for _ in range(n):
+            self.space()
+            out.append(self.timed(g.replay))
+        return statistics.median(out)
 
 
 def main():
@@ -138,12 +162,18 @@ def main():
     print(f"[l2p] prepare took {time.time() - t0:.0f} s", flush=True)
     from torch.utils.cpp_extension import load_inline
     cpp = ("#include <torch/extension.h>\nvoid l2p_sweep(torch::Tensor w, int64_t bytes);\n"
-           "void l2p_pf(torch::Tensor w, int64_t bytes, int64_t nblk, int64_t nthr);\n")
-    ext = load_inline(name="l2p_ceiling_ext", cpp_sources=cpp, cuda_sources=CUDA_SRC, functions=["l2p_sweep", "l2p_pf"],
+           "void l2p_pf(torch::Tensor w, int64_t bytes, int64_t nblk, int64_t nthr);\nvoid l2p_spin(int64_t us);\n")
+    ext = load_inline(name="l2p_ceiling_ext2", cpp_sources=cpp, cuda_sources=CUDA_SRC,
+                      functions=["l2p_sweep", "l2p_pf", "l2p_spin"],
                       extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
+    # Spacer: a one-thread %globaltimer spin (no memory traffic) enqueued before EVERY timed replay, so the GPU is busy when
+    # the start event fires and no arm absorbs the CPU-side graph-launch latency (attempt 2 read warm arms ~10 us high: the
+    # cold arm sat behind the 60 us flush, the warm arms behind a 5-16 us op).
     tm = Timer()
+    spin = lambda: ext.l2p_spin(SPIN_US)  # noqa: E731
+    tm.spacer = spin
     ov = tm.overhead()
-    print(f"[l2p] replay overhead {ov:.2f} us; rounds {rounds}; warm cap {cap_mb} MB", flush=True)
+    print(f"[l2p] replay overhead {ov:.2f} us (after a {SPIN_US} us spin spacer); rounds {rounds}; warm cap {cap_mb} MB", flush=True)
     dense = state["dense"]
 
     # ---- consumers: (name, T, call, [weight tensors], prewait_frac, desc)
@@ -204,22 +234,26 @@ def main():
         for _ in range(rounds):
             with torch.cuda.stream(tm.stream):
                 tm.flush()
+            tm.space()
             t["cold"].append(tm.timed(g.replay) - ov)
             with torch.cuda.stream(tm.stream):
                 g.replay()
+            tm.space()
             t["rep"].append(tm.timed(g.replay) - ov)
             with torch.cuda.stream(tm.stream):
                 tm.flush()
             t["t_ldg"].append(tm.timed(sweep))
+            tm.space()
             t["ldg"].append(tm.timed(g.replay) - ov)
             with torch.cuda.stream(tm.stream):
                 tm.flush()
             t["t_pf"].append(tm.timed(pf))
-            torch.cuda.synchronize()
+            tm.space()
             t["pf"].append(tm.timed(g.replay) - ov)
             with torch.cuda.stream(tm.stream):
                 pf()
                 tm.flush()
+            tm.space()
             t["pff"].append(tm.timed(g.replay) - ov)
         m = {k: statistics.median(v) for k, v in t.items()}
         gain = m["cold"] - min(m["rep"], m["ldg"], m["pf"])
