@@ -17,6 +17,8 @@ vm_main: grid = SMs, 576 threads (16 consumer warps = 4 WGs, weight producer war
 vm_fin: grid = M, 256 threads: K2A K3 numerics (bf16r(y) * nw, ss, rsqrt(ss / 4096 + 1e-8) * wt, slot order), and block 0
   resets xready / doneA / fixup counters for the next call. Bounded waits only (error flag, no trap).
 Lab v9: marks cols 24..28 from the x producer (B doneA wait ns / count, A xready wait ns, first / last B acquire); only with marks.
+Lab v10: flags bit 9 = each job's 16 phase-B stages in order of predicted A-unit readiness (afin / bperm_lanes, computed by the
+x-producer warp's idle lanes during phase A; consumers unchanged: only the K order of the B sums changes).
 """
 import hashlib
 import time
@@ -82,6 +84,10 @@ struct Tab {
   uint32_t cpA[JMAX + 1], cpB[JMAX + 1];
   int bA[GMAX + 1], bB[GMAX + 1];
   int est[E_LOC];
+  int bready, pad1;                 // bit 9: B stage orders below are written (x-producer lanes 1-31, during phase A)
+  uint32_t brd[16];                 // bit 9 scratch: predicted readiness of one job's 16 B stages
+  uint8_t bpos[16];                 // bit 9 scratch: order position -> stage
+  unsigned long long bperm[JMAX];   // bit 9: per job, 16 x 4 bits: B order position -> stage
 };
 constexpr int SMEM = TAB_OFF + (int)sizeof(Tab);
 
@@ -306,6 +312,7 @@ __device__ void route(const Args& A, Tab& T, int* hist, uint16_t* ent, uint32_t*
   __syncthreads();
   const int G = gridDim.x;
   if (tid <= G) { T.bA[tid] = stage_at(A, T, 0, tid, G, A.magG); T.bB[tid] = stage_at(A, T, 1, tid, G, A.magG); }
+  if (tid == 0) T.bready = 0;
   __syncthreads();
 }
 
@@ -413,17 +420,78 @@ __device__ void self_fill(const Args& A, const Tab& T, uint8_t* smem, uint32_t b
     for (int f = 0; f < nf; ++f) mbar_arrive(bars + 8 * (2 * NS + f));
 }
 
+// bit 9: B stage order by predicted A readiness. afin = predicted finish (16.16 fraction of its owner's range, in the owner's
+// phase-A processing order, max over owners) of A unit U; a B stage of job j reads A units 2s / 2s + 1. Pure function of the
+// global plan (bA), so every CTA that holds part of a B unit derives the same order. Computed by lanes 1-31 of the x-producer
+// warp while phase A runs (no prologue cost, R-vml-5's lesson); the producers wait for bready before their first B stage.
+__device__ __forceinline__ uint32_t afin(const Args& A, const Tab& T, int U, int G) {
+  const int a = U << 4, b = a + 16;
+  int lo = 0, hi = G - 1;
+  while (lo < hi) { const int m = (lo + hi) >> 1; if (T.bA[m + 1] > a) hi = m; else lo = m + 1; }
+  uint32_t f = 0;
+  for (int c = lo; c < G && T.bA[c] < b; ++c) {
+    const int g0 = T.bA[c], g1 = T.bA[c + 1];
+    if (g1 <= g0) continue;
+    const int sp = split_point(A, 0, g0, g1), l2 = max(a, g0), h2 = min(b, g1);
+    if (h2 <= l2) continue;
+    const int pos = (l2 < sp) ? (g1 - sp) + (min(h2, sp) - 1 - g0) : h2 - 1 - sp;
+    const uint32_t fc = (uint32_t)(((unsigned long long)(pos + 1) << 16) / (unsigned)(g1 - g0));
+    f = fc > f ? fc : f;
+  }
+  return f;
+}
+__device__ void bperm_lanes(const Args& A, Tab& T, int lane) {
+  const unsigned mask = 0xfffffffeu;
+  const int c = blockIdx.x, G = gridDim.x, g0 = T.bB[c], g1 = T.bB[c + 1];
+  if (g1 > g0) {
+    for (int j = g0 >> 8; j <= (g1 - 1) >> 8; ++j) {
+      for (int s = lane - 1; s < 16; s += 31) {
+        const uint32_t f0 = afin(A, T, 32 * j + 2 * s, G), f1 = afin(A, T, 32 * j + 2 * s + 1, G);
+        T.brd[s] = f0 > f1 ? f0 : f1;
+      }
+      __syncwarp(mask);
+      for (int s = lane - 1; s < 16; s += 31) {
+        const uint32_t r = T.brd[s];
+        int rank = 0;
+        for (int t = 0; t < 16; ++t) { const uint32_t q = T.brd[t]; rank += (q < r) || (q == r && t < s); }
+        T.bpos[rank] = (uint8_t)s;
+      }
+      __syncwarp(mask);
+      if (lane == 1) {
+        unsigned long long pm = 0;
+        for (int r = 0; r < 16; ++r) pm |= (unsigned long long)T.bpos[r] << (4 * r);
+        T.bperm[j] = pm;
+      }
+      __syncwarp(mask);
+    }
+  }
+  if (lane == 1) { __threadfence_block(); *reinterpret_cast<volatile int*>(&T.bready) = 1; }
+}
+__device__ __forceinline__ void bperm_wait(const Args& A, const Tab& T) {
+  if (*reinterpret_cast<const volatile int*>(&T.bready) != 0) { __threadfence_block(); return; }
+  const long long t0 = clock64();
+  while (*reinterpret_cast<const volatile int*>(&T.bready) == 0) {
+    __nanosleep(64);
+    if (clock64() - t0 > WAIT_BUDGET) { atomicExch(A.err, 3); break; }
+  }
+  __threadfence_block();
+}
+__device__ __forceinline__ int bstage(const Args& A, const Tab& T, int j, int s) {
+  return (A.flags & 512) ? (int)((T.bperm[j] >> (4 * s)) & 15ull) : s;
+}
+
 __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars) {
   const uint64_t pol = policy_evict_first();
   const int c = blockIdx.x;
   int it = 0;
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
+    if (pb && (A.flags & 512)) bperm_wait(A, T);
     for (int i = 0; i < g1 - g0; ++i, ++it) {
       const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
       const int u = gs >> 4;
       const int j = pb ? (u >> 4) : (u >> 5), ub = pb ? (u & 15) : (u & 31);
-      const int s = gs & 15;
+      const int s = pb ? bstage(A, T, j, gs & 15) : (gs & 15);
       const int e = T.jE[j];
       const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW
                               : A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;
@@ -443,12 +511,13 @@ __device__ void prod_x(const Args& A, const Tab& T, uint32_t xring, uint32_t bar
   int nB = 0;
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
+    if (pb && (A.flags & 512)) bperm_wait(A, T);
     int lastj = -1;
     for (int i = 0; i < g1 - g0; ++i, ++it) {
       const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
       const int u = gs >> 4;
       const int j = pb ? (u >> 4) : (u >> 5);
-      const int s = gs & 15;
+      const int s = pb ? bstage(A, T, j, gs & 15) : (gs & 15);
       const int npad = (T.jC[j] + 7) & ~7;
       if (!pb && i < nf) continue;
       if (!pb) {
@@ -732,6 +801,7 @@ __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
       if (A.flags & 64) gather_warp(A, T, ent, lane);
       bar_sync(6, 32 * NCW + 32);
       if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
+      else if (A.flags & 512) bperm_lanes(A, T, lane);
     }
     return;
   }
@@ -902,7 +972,7 @@ def alloc(dev, G):
             "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
 
-FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments, bit 8: vm_main as a PDL secondary
+FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments, bit 8: vm_main as a PDL secondary, bit 9: phase-B stage order by predicted A readiness
 
 
 def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
