@@ -17,6 +17,10 @@ vm_main: grid = SMs, 576 threads (16 consumer warps = 4 WGs, weight producer war
 vm_fin: grid = M, 256 threads: K2A K3 numerics (bf16r(y) * nw, ss, rsqrt(ss / 4096 + 1e-8) * wt, slot order), and block 0
   resets xready / doneA / fixup counters for the next call. Bounded waits only (error flag, no trap).
 Lab v9: marks cols 24..28 from the x producer (B doneA wait ns / count, A xready wait ns, first / last B acquire); only with marks.
+Lab v12: compile-time VM_DEFER = 1 (build(defines=["-DVM_DEFER=1"])): a phase-A whole unit's proxy fence + WG barrier +
+doneA red.release are not issued after its SwiGLU stores but kept in a per-WG pending record and flushed behind commit
+group 3 of the WG's next segment's first stage (mma.sync path: after its first stage), and at the end of phase A (never
+across the A -> B boundary: phase B's x waits on these releases). vml_vs_wgs.md s4 #1, the doneA part.
 Lab v11: marks cols 29..31 = %smid and two L2 latency probes (cycles per dependent ld.cg, addresses 4 KB apart); marks only.
 Lab v10: flags bit 9 = each job's 16 phase-B stages in order of predicted A-unit readiness (afin / bperm_lanes, computed by the
 x-producer warp's idle lanes during phase A; consumers unchanged: only the K order of the B sums changes).
@@ -579,9 +583,21 @@ __device__ __forceinline__ void mma2(float* d, const uint32_t* hh, uint32_t dlo,
   else wgmma_acc<N>(d, hh[0], hh[4], hh[1], hh[5], dlo, dhi);
   wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + 16, dhi);
 }
+#ifndef VM_DEFER
+#define VM_DEFER 0
+#endif
+struct Pend { int i; };   // doneA index (job x 16 + unit / 2) whose release is still pending (< 0: none); WG-uniform
+__device__ __forceinline__ void pend_flush(const Args& A, Pend& pd, int q, int wp, int lane) {
+  if (pd.i >= 0) {
+    fence_proxy_async();
+    bar_sync(1 + q, 128);
+    if (((wp << 5) | lane) == 0) red_release_add(A.doneA + pd.i, 1);
+    pd.i = -1;
+  }
+}
 template <int N>
 __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bars, int& it, int& prevx, float* d,
-                                      uint32_t (&hb)[2][8], int q, int wp, int lane, bool first) {
+                                      uint32_t (&hb)[2][8], int q, int wp, int lane, bool first, Pend& pd) {
   const int ws = it % NS, xs = it % NX;
   mbar_wait(bars + 8 * ws, (it / NS) & 1, A.err);
   const uint8_t* st = smem + ws * US + (q >> 1) * SW;
@@ -615,6 +631,9 @@ __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bar
       if (i == 0 && hf == 0 && prevx >= 0) {
         if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
         prevx = -1;
+      }
+      if constexpr (VM_DEFER) {
+        if (first && i == 1 && hf == 1) pend_flush(A, pd, q, wp, lane);   // behind commit group 3
       }
     }
   }
@@ -671,7 +690,8 @@ __device__ __forceinline__ void stage_m(const Args& A, uint8_t* smem, uint32_t b
   ++it;
 }
 template <bool PB, int N>
-__device__ __forceinline__ void epilogue(const Args& A, const Tab& T, int j, int ub, int q, int wp, int lane, const float* d) {
+__device__ __forceinline__ void epilogue(const Args& A, const Tab& T, int j, int ub, int q, int wp, int lane, const float* d,
+                                         Pend& pd) {
   const int g = lane >> 2, t = lane & 3, wt = (wp << 5) | lane;
   const int e = T.jE[j], cn = T.jC[j];
   const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;
@@ -690,9 +710,13 @@ __device__ __forceinline__ void epilogue(const Args& A, const Tab& T, int j, int
           xb[((((nt * 4 + i) * 8 + qq) * 8 + (2 * t + hh)) * 4 + tt) * 2 + b] =
               __float2bfloat16_rn(swiglu(d[4 * nt + hh] * gs, d[4 * nt + 2 + hh] * gs));
       }
-    fence_proxy_async();
-    bar_sync(1 + q, 128);
-    if (wt == 0) red_release_add(A.doneA + j * 16 + (ub >> 1), 1);
+    if constexpr (VM_DEFER) {
+      pd.i = j * 16 + (ub >> 1);
+    } else {
+      fence_proxy_async();
+      bar_sync(1 + q, 128);
+      if (wt == 0) red_release_add(A.doneA + j * 16 + (ub >> 1), 1);
+    }
   } else {
     const float gs = __ldg(A.gsc2 + e);
     const int h0 = 16 * tg + g;
@@ -711,7 +735,7 @@ __device__ __forceinline__ void epilogue(const Args& A, const Tab& T, int j, int
 }
 template <bool PB, int N>
 __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32_t bars, int& it, int u, int s0, int s1,
-                                    int q, int wp, int lane) {
+                                    int q, int wp, int lane, Pend& pd) {
   float d[N / 2];
   bool sync_path = false;
   if constexpr (N <= 16) sync_path = (A.flags & 128) != 0;
@@ -719,16 +743,18 @@ __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32
     float d2[2][N / 2];
 #pragma unroll
     for (int k = 0; k < N / 2; ++k) { d2[0][k] = 0.f; d2[1][k] = 0.f; }
+    stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
+    if constexpr (VM_DEFER) pend_flush(A, pd, q, wp, lane);
 #pragma unroll 1
-    for (int s = s0; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
+    for (int s = s0 + 1; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
 #pragma unroll
     for (int k = 0; k < N / 2; ++k) d[k] = d2[0][k] + d2[1][k];
   } else {
     uint32_t hb[2][8];
     int prevx = -1;
-    stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true);
+    stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true, pd);
 #pragma unroll 1
-    for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false);
+    for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false, pd);
     wg_wait<0>();
     if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
   }
@@ -754,12 +780,13 @@ __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32
     }
     if (wt == 0) *fc = 0;
   }
-  epilogue<PB, N>(A, T, j, ub, q, wp, lane, d);
+  epilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);
 }
 template <bool PB>
 __device__ __forceinline__ void phase(const Args& A, Tab& T, uint8_t* smem, uint32_t bars, int& it, int q, int wp, int lane) {
   const int c = blockIdx.x;
   const int g0 = PB ? T.bB[c] : T.bA[c], g1 = PB ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, PB, g0, g1);
+  Pend pd{-1};
 #pragma unroll 1
   for (int gs = sp, ge = g1; ;) {
     if (gs >= ge) {
@@ -769,17 +796,18 @@ __device__ __forceinline__ void phase(const Args& A, Tab& T, uint8_t* smem, uint
     const int j = PB ? (u >> 4) : (u >> 5);
     if (A.marks && q == 0 && wp == 0 && lane == 0) A.marks[(size_t)c * 32 + 8 + 8 * PB + ((T.jC[j] + 7) >> 3) - 1] += s1 - s0;
     switch ((T.jC[j] + 7) >> 3) {
-      case 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 2: seg<PB, 16>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 3: seg<PB, 24>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 4: seg<PB, 32>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 5: seg<PB, 40>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 6: seg<PB, 48>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      case 7: seg<PB, 56>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
-      default: seg<PB, 64>(A, T, smem, bars, it, u, s0, s1, q, wp, lane); break;
+      case 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 2: seg<PB, 16>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 3: seg<PB, 24>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 4: seg<PB, 32>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 5: seg<PB, 40>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 6: seg<PB, 48>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      case 7: seg<PB, 56>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
+      default: seg<PB, 64>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
     }
     gs += s1 - s0;
   }
+  if constexpr (VM_DEFER && !PB) pend_flush(A, pd, q, wp, lane);   // before phase B: its x waits on these releases
 }
 
 __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
@@ -972,12 +1000,14 @@ void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V);
 FLAGS = ["-O3", "--expt-relaxed-constexpr", "-Xptxas=-warn-spills", "-gencode=arch=compute_90a,code=sm_90a"]
 
 
-def build(verbose=False):
+def build(verbose=False, defines=()):
+    """defines: compile-time variants, e.g. ("-DVM_DEFER=1",)."""
     from torch.utils.cpp_extension import load_inline
-    tag = hashlib.sha1((CPP + CUDA + " ".join(FLAGS)).encode()).hexdigest()[:10]
+    fl = FLAGS + list(defines)
+    tag = hashlib.sha1((CPP + CUDA + " ".join(fl)).encode()).hexdigest()[:10]
     t0 = time.time()
     mod = load_inline(name=f"vml_moe_{tag}", cpp_sources=CPP, cuda_sources=CUDA, functions=["vml_run"],
-                      extra_cuda_cflags=FLAGS, verbose=verbose)
+                      extra_cuda_cflags=fl, verbose=verbose)
     return mod, time.time() - t0
 
 

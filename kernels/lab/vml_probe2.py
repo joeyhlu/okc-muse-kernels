@@ -16,6 +16,13 @@ weight stage + one x stage, 2 producer warps), with compile-time arms:
   PG_WS  1: lockstep break (papers_oct28 #1): every weight stage split into 4 per-WG sub-stages (9 KB: the WG's 8 KB of codes
          + 1 KB of scales) with their own full / empty barriers, filled by lanes 0-3 of the weight-producer warp (one per WG),
          so a WG waits only for its own 9 KB; the x ring stays shared (NX slots of slack between WGs)
+  R-vml-15 (per-stage tricks of the public WGS consumer, kernel_diff_oct28 / vm_large s6), compile-time:
+  PG_DQ  1: pipe-balanced dequant: the two left shifts of deq4 as multiplies by opaque constants (IMAD.SHL on the FMA pipe
+         instead of SHF on the ALU pipe; same bits) and the scale decode's x16 as an opaque IMAD
+  PG_SC2 1: one PRMT + one IMAD build both rows' scales (row g low half, row g + 8 high half) and the multiplies use the
+         half-broadcast forms (__low2bfloat162 / __high2bfloat162, folded into HMUL2 .H0_H0 / .H1_H1)
+  PG_DS  1: x descriptor = slot-0 descriptor + slot offset (no per-stage rebuild)
+  PG_CL  1: codes loaded one 4-step group ahead (8 live registers instead of 16), weight slot released after the last load
 Stage time = kernel time x G / (units x 16).
 """
 import hashlib
@@ -68,7 +75,51 @@ BODY = r"""
 #ifndef PG_WS
 #define PG_WS 0
 #endif
+#ifndef PG_DQ
+#define PG_DQ 0
+#endif
+#ifndef PG_SC2
+#define PG_SC2 0
+#endif
+#ifndef PG_DS
+#define PG_DS 0
+#endif
+#ifndef PG_CL
+#define PG_CL 0
+#endif
 constexpr bool XFIX = PG_RES || PG_XR;   // x slot 0 for every stage, no x ring
+__device__ __forceinline__ void deq4_dq(uint32_t w, uint32_t* o, uint32_t k64, uint32_t k4) {   // == deq4 (same bits)
+  o[0] = w & 0x81C081C0u;
+  o[1] = (w * k64) & 0x81C081C0u;                                  // rotl 6: the mask keeps no wrapped bit
+  o[2] = __funnelshift_l(w, w, 12) & 0x81C081C0u;
+  o[3] = ((w >> 6) & 0x01000100u) | ((w * k4) & 0x80C080C0u);
+}
+__device__ __forceinline__ uint32_t bmul2l(uint32_t a, uint32_t b) {   // a x (b.lo, b.lo)
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __low2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+__device__ __forceinline__ uint32_t bmul2h(uint32_t a, uint32_t b) {   // a x (b.hi, b.hi)
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __high2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+// one dequant half group under the R-vml-15 switches: w0 = row g, w8 = row g + 8 (2 k16 steps each)
+__device__ __forceinline__ void dec_half2(uint32_t w0, uint32_t w8, uint32_t sw2, uint32_t par, uint32_t* hh, uint32_t k16,
+                                          uint32_t k64, uint32_t k4) {
+  if constexpr (PG_DQ) { deq4_dq(w0, hh, k64, k4); deq4_dq(w8, hh + 4, k64, k4); }
+  else { deq4(w0, hh); deq4(w8, hh + 4); }
+  if constexpr (PG_SC2) {
+    const uint32_t sb = 2u * par;
+    const uint32_t sgp = __byte_perm(sw2, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16 + 0x75807580u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { hh[j] = bmul2l(hh[j], sgp); hh[4 + j] = bmul2h(hh[4 + j], sgp); }
+  } else {
+    const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * k16 + 0x75807580u;
+    const uint32_t S8 = __byte_perm(sw2, 0u, 0x4141u + 0x0202u * par) * k16 + 0x75807580u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { hh[j] = bmul2(hh[j], Sg); hh[4 + j] = bmul2(hh[4 + j], S8); }
+  }
+}
+constexpr bool TRICKS = PG_DQ || PG_SC2 || PG_DS || PG_CL;
 constexpr int WSB = 2 * (NS + NX);       // PG_WS barriers after the shared ones: full [q][slot], then empty [q][slot]
 constexpr int SMEM2 = SMEM + (PG_WS ? 8 * 8 * NS : 0);
 __device__ __forceinline__ void prod_w_ws(const Args& A, uint32_t ring, uint32_t bars, int u0, int u1, int q) {
@@ -142,26 +193,43 @@ __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bar
   const int tile = (q & 1) * 4 + wp;
   uint4 c[4];
   uint32_t sw0 = 0, sw1 = 0;
+  const uint4* cp = reinterpret_cast<const uint4*>(st + (PG_WS ? wp : tile) * 2048) + lane;
   if constexpr (RES < 2) {
-    const uint4* cp = reinterpret_cast<const uint4*>(st + (PG_WS ? wp : tile) * 2048) + lane;
     const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + (PG_WS ? 8192 + wp * 256 : 16384 + tile * 256)) + lane;
+    if constexpr (PG_CL) c[0] = cp[0];
+    else {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
+      for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
+    }
     sw0 = sp[0]; sw1 = sp[32];
   }
+  const uint32_t zo = (uint32_t)(reinterpret_cast<uintptr_t>(A.inter) >> 63);   // 0, opaque to the compiler
+  const uint32_t k16 = PG_DQ ? 16u + zo : 16u, k64 = 64u + zo, k4 = 4u + zo;
   if constexpr (!RES) {
     __syncwarp();
-    if (lane == 0) mbar_arrive(bars + 8 * (PG_WS ? WSB + 4 * NS + q * NS + ws : NS + ws));
+    if (!PG_CL && lane == 0) mbar_arrive(bars + 8 * (PG_WS ? WSB + 4 * NS + q * NS + ws : NS + ws));
     if constexpr (!PG_XR) mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
     if constexpr (PG_XL) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncwarp();
   }
-  const uint64_t d0 = PG_XSW ? wg_desc_sw(sa(smem + NS * US + xs * XS)) : wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);
-  const uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
+  const uint64_t d0 = PG_XSW ? wg_desc_sw(sa(smem + NS * US + xs * XS))
+                              : wg_desc_sa(sa(smem + NS * US + (PG_DS ? 0 : xs * XS)), 4096u);
+  const uint32_t dlo = PG_DS ? (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4) : (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
 #pragma unroll
   for (int gi = 0; gi < GPS; ++gi) {
     uint32_t* hh = hb[gi % NB];
-    if constexpr (RES < 2) {
+    if constexpr (RES < 2 && TRICKS) {
+      static_assert(GS == 2, "R-vml-15 switches: GS 2 only");
+      const int i = gi >> 1, hf = gi & 1;
+      if constexpr (PG_CL) {
+        if (hf == 0 && i < 3) c[i + 1] = cp[32 * (i + 1)];   // the next 4-step group's codes, one group ahead
+      }
+      const uint32_t sw2 = (i < 2) ? sw0 : sw1, par = i & 1;
+      dec_half2(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, sw2, par, hh, k16, k64, k4);
+      if constexpr (PG_CL && !RES) {
+        if (gi == 6) { __syncwarp(); if (lane == 0) mbar_arrive(bars + 8 * (PG_WS ? WSB + 4 * NS + q * NS + ws : NS + ws)); }
+      }
+    } else if constexpr (RES < 2) {
       const int i = (GS == 2) ? (gi >> 1) : gi;
       const uint32_t sw2 = (i < 2) ? sw0 : sw1, par = i & 1;
       const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
@@ -497,6 +565,7 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
     switch (np >> 3) {
       case 1: unit_run<8>(A, smem, bars, it, u, q, wp, lane, fu); break;
       case 2: unit_run<16>(A, smem, bars, it, u, q, wp, lane, fu); break;
+      case 3: unit_run<24>(A, smem, bars, it, u, q, wp, lane, fu); break;
       case 4: unit_run<32>(A, smem, bars, it, u, q, wp, lane, fu); break;
       case 6: unit_run<48>(A, smem, bars, it, u, q, wp, lane, fu); break;
       default: unit_run<64>(A, smem, bars, it, u, q, wp, lane, fu); break;
@@ -544,7 +613,9 @@ void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::
 ARMS = {"F": {}, "PP": {"PG_PP": 1}, "C": {"PG_RES": 1},
         "W2": {"PG_W2": 1, "PG_W2NP": 2}, "W2a": {"PG_W2": 1, "PG_W2NP": 1}, "M": {"PG_MMA": 1},
         "XR": {"PG_XR": 1}, "XL": {"PG_XL": 1}, "XSW": {"PG_XSW": 1}, "XLSW": {"PG_XL": 1, "PG_XSW": 1},
-        "WS": {"PG_WS": 1}, "WSXR": {"PG_WS": 1, "PG_XR": 1}}
+        "WS": {"PG_WS": 1}, "WSXR": {"PG_WS": 1, "PG_XR": 1},
+        "DQ": {"PG_DQ": 1}, "SC2": {"PG_SC2": 1}, "DS": {"PG_DS": 1}, "CL": {"PG_CL": 1},
+        "ALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_CL": 1}, "CALL": {"PG_DQ": 1, "PG_SC2": 1, "PG_DS": 1, "PG_RES": 1}}
 NOCHECK = ("PG_RES", "PG_XR")   # timing-only arms (results wrong by design)
 
 
