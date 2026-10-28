@@ -163,6 +163,9 @@ constexpr int DPMAX = 384, SLOTSD = SLOTS + (VM_DP ? DPMAX : 0);
 #ifndef VM_LD
 #define VM_LD 0
 #endif
+#ifndef VM_UD2
+#define VM_UD2 0
+#endif
 #if VM_NOB9
 #define VM_F9(a) (0)
 #else
@@ -951,6 +954,9 @@ template <int N>
 __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bars, int& it, int& prevx, float* d,
 uint32_t (&hb)[2][8], int q, int wp, int lane, bool first, Pend& pd) {
 const int ws = it % NS, xs = it % NX;
+#if VM_UD2 == 4
+const uint32_t dlo_e = __reduce_max_sync(0xffffffffu, (uint32_t)wg_desc_sa(sa(smem + NS * US), 4096u) + (uint32_t)xs * (uint32_t)(XS >> 4));
+#endif
 mbar_wait(bars + 8 * ws, (it / NS) & 1, A.err);
 const uint8_t* st = smem + ws * US + (q >> 1) * SW;
 const int tile = (q & 1) * 4 + wp;
@@ -973,9 +979,18 @@ __syncwarp();
 const uint32_t zo = (uint32_t)A.flags >> 30;   // 0 (flags < 2^30), opaque to the compiler
 const uint32_t k16 = 16u + zo, k64 = VM_TRICKS_DQ ? 64u + zo : 64u, k4 = VM_TRICKS_DQ ? 4u + zo : 4u;
 const uint64_t d0 = wg_desc_sa(sa(smem + NS * US), 4096u);
+#if VM_UD2 == 1 || VM_UD2 == 2
+const uint32_t xsd = VM_UD2 == 1 ? __reduce_max_sync(0xffffffffu, (uint32_t)xs) : (uint32_t)__shfl_sync(0xffffffffu, xs, 0);
+const uint32_t dlo = (uint32_t)d0 + xsd * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);
+#elif VM_UD2 == 3
+const uint32_t dlo = __reduce_max_sync(0xffffffffu, (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4)), dhi = (uint32_t)(d0 >> 32);
+#elif VM_UD2 == 4
+const uint32_t dlo = dlo_e, dhi = (uint32_t)(d0 >> 32);
+#else
 const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);
+#endif
 #if VM_UD
-const uint64_t dsc = d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));
+const uint64_t dsc = VM_UD2 ? (((uint64_t)dhi << 32) | dlo) : d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));
 #endif
 #else
 const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);

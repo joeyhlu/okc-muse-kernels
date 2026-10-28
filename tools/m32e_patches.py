@@ -677,7 +677,32 @@ UD_PATCHES = [
      "if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * MKW + 6] = gtime();\n"
      "#if VM_LD\nif (tid == 0) asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n#endif\n"),
 ]
-CUDA_PATCHES = CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES + PS_PATCHES + AD_PATCHES + GF_PATCHES + UD_PATCHES
+# ---- R-m32e-12 (parent GO 2026-10-28): VM_UD2 = the wgmma B descriptor from a PROVABLY warp-uniform value. bf2 SASS: every
+# HGMMA reads gdesc[UR4] whose B half (UR6/UR7) is refilled per wgmma by VIADD (lo) + IMAD.MOV (hi = 0x100) + 2 x R2UR,
+# because `it` (stage counter, carried through table-driven loops) is not uniform to ptxas. A REDUX (result in a UR) or
+# SHFL re-uniformizes it: 1 = REDUX of xs, 2 = SHFL of xs, 3 = REDUX of the stage's dlo, 4 = 3 at stage entry.
+UD2_PATCHES = [
+    ("#ifndef VM_LD\n#define VM_LD 0\n#endif\n", "#ifndef VM_LD\n#define VM_LD 0\n#endif\n#ifndef VM_UD2\n#define VM_UD2 0\n#endif\n"),
+    ("uint32_t (&hb)[2][8], int q, int wp, int lane, bool first, Pend& pd) {\nconst int ws = it % NS, xs = it % NX;\n",
+     "uint32_t (&hb)[2][8], int q, int wp, int lane, bool first, Pend& pd) {\nconst int ws = it % NS, xs = it % NX;\n"
+     "#if VM_UD2 == 4\nconst uint32_t dlo_e = __reduce_max_sync(0xffffffffu, (uint32_t)wg_desc_sa(sa(smem + NS * US), 4096u)"
+     " + (uint32_t)xs * (uint32_t)(XS >> 4));\n#endif\n"),
+    ("const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);\n"
+     "#if VM_UD\nconst uint64_t dsc = d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));\n#endif\n",
+     "#if VM_UD2 == 1 || VM_UD2 == 2\n"
+     "const uint32_t xsd = VM_UD2 == 1 ? __reduce_max_sync(0xffffffffu, (uint32_t)xs) : (uint32_t)__shfl_sync(0xffffffffu, xs, 0);\n"
+     "const uint32_t dlo = (uint32_t)d0 + xsd * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);\n"
+     "#elif VM_UD2 == 3\n"
+     "const uint32_t dlo = __reduce_max_sync(0xffffffffu, (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4)), dhi = (uint32_t)(d0 >> 32);\n"
+     "#elif VM_UD2 == 4\n"
+     "const uint32_t dlo = dlo_e, dhi = (uint32_t)(d0 >> 32);\n"
+     "#else\n"
+     "const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);\n"
+     "#endif\n"
+     "#if VM_UD\nconst uint64_t dsc = VM_UD2 ? (((uint64_t)dhi << 32) | dlo) : d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));\n#endif\n"),
+]
+CUDA_PATCHES = (CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES + PS_PATCHES + AD_PATCHES + GF_PATCHES + UD_PATCHES
+                + UD2_PATCHES)
 CUDA_REPLACE_ALL = [("(A.flags & 512)", "VM_F9(A)")]   # every bit-9 test (compile-time 0 under VM_NOB9)
 
 # wgmma specializations with the B descriptor as one 64-bit operand (VM_UD); same formatting as the 32-bit-pair specs
