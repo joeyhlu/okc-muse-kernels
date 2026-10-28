@@ -32,6 +32,8 @@ VFA_L1_MIN_B = 1
 VFA_L1_MAX_B = 256
 VFA_NC_SMALLB = 8
 VFA_PKV = False
+VFA_COOP_B1 = True
+VFA_COOP_MS = 20
 VFA_STAGES = 4
 VFA_SEGK = 300
 VFA_PDL = True
@@ -41,14 +43,15 @@ VFA_CASES = ((2, 3000, 8, 1, 1.0, 401), (3, 1500, 8, 64, 1.0, 402), (16, 700, 8,
              (33, 300, 8, 1, 1.0, 405), (32, 2500, 8, 1, 1.0, 406), (2, 20, 8, 1, 1.0, 407), (17, 100, 8, 1, 1.0, 408), (4, 70, 8, 64, 1.0, 409),
              (1, 9000, 8, 1, 1.0, 421), (1, 20, 8, 1, 1.0, 422), (1, 9000, 1, 1, 1.0, 431), (1, 20, 1, 1, 1.0, 432), (2, 3000, 1, 1, 1.0, 433),
              (16, 700, 1, 1, 1.0 / 64, 434), (33, 300, 1, 1, 1.0, 435), (32, 2500, 1, 64, 1.0, 436))
-_VFA = {"mod": None, "ws": {}, "sms": {}, "occ": {}}
+_VFA = {"mod": None, "ws": {}, "sms": {}, "occ": {}, "coop_ok": False}
 
 VFA_CPP_SRC = r"""
 #include <torch/extension.h>
 void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor page_table, torch::Tensor k_cache,
                  torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor ws_o, torch::Tensor ws_l,
                  torch::Tensor tickets, torch::Tensor out, int64_t B, int64_t Hq, int64_t Hkv, int64_t page_shift, int64_t G,
-                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv);
+                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv,
+                 int64_t coop);
 int64_t vfa_occupancy(int64_t stages);
 """
 
@@ -109,6 +112,9 @@ struct Params {
   __nv_bfloat16* out;           // [B*8, Hq*64]
   int B, Hq, Hkv, ld_qkv, page_shift, pt_stride, segk, pdl;
   int nc;                       // workspace copies per (request, pair): 8 at B <= 2 spreads the same-address red contention
+  int coop;                     // B = 1: grid-wide cooperative finalize (counters tickets[MAXB + 2 bp + parity], epoch tickets[3 MAXB + bp],
+                                // sticky timeout flag tickets[4 MAXB]); the grid must be co-resident (host-checked occupancy)
+  long long coop_ns;            // bounded wait
   float qk_sm;                  // qk_scale_factor * sm_scale
 };
 
@@ -180,6 +186,7 @@ __device__ __forceinline__ void wg_pv(float (&d)[36], const uint32_t (&a)[4], ui
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(1));
 }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ unsigned long long gtimer() { unsigned long long v; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(v)); return v; }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 
 // ---- producer warpgroup (32 registers): thread q copies 16-B chunk (q & 7) of rows (q >> 3) + 16 k of every tile ----
@@ -474,6 +481,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
     }
     }   // live
     bar_named(3, NCONS);
+    if (p.coop) continue;   // B = 1: one segment per CTA; the grid-wide barrier + slice finalize follow the loop
     if (tid == 0) {
       __threadfence();
       const int mine = k1 - k0;
@@ -532,6 +540,89 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
       }
       }   // rows
       if (tid == 0) p.tickets[bp] = 0;
+    }
+  }
+  if (p.coop) {   // B = 1 (every CTA, keys or not): arrive with its key count, wait (bounded) for all keys, finalize row blockIdx.x
+    const int bp = pair, nb = sN[0];
+    int mine = 0;
+    for (int s = 0; s < nseg; ++s) mine += seg[4 * s + 2] - seg[4 * s + 1];
+    if (tid == 0) {
+      __threadfence();
+      const int ep = misc[2];
+      int* ctr = p.tickets + MAXB + 2 * bp + (ep & 1);
+      int old;
+      asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;" : "=r"(old) : "l"(ctr), "r"(mine) : "memory");
+      int ok = 1;
+      if (old < nb && old + mine == nb) {   // the arrival that completes the count: next call's counter cleared, epoch bumped
+        p.tickets[MAXB + 2 * bp + ((ep + 1) & 1)] = 0;
+        p.tickets[3 * MAXB + bp] = ep + 1;
+      } else if (old + mine < nb) {
+        const unsigned long long t0 = gtimer();
+        for (;;) {
+          int v;
+          asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(ctr) : "memory");
+          if (v >= nb) break;
+          if ((long long)(gtimer() - t0) > p.coop_ns) { p.tickets[4 * MAXB] = 1; ok = 0; break; }   // sticky flag, no trap
+          __nanosleep(128);
+        }
+      }
+      misc[1] = ok;
+    }
+    bar_named(3, NCONS);
+    if (misc[1] && warp == 0 && (int)blockIdx.x < ROWS) {   // this CTA's row: warp 0, lane = 2 c + hf sums copy c's half row
+      const int rr = (int)blockIdx.x, c = lane >> 1, hf = lane & 1;
+      float4 v[8];
+      float l = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) v[e] = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (c < nc) {
+        const long long R = ((long long)bp * nc + c) * ROWS + rr;
+        float4* src = reinterpret_cast<float4*>(p.ws_o + R * 64 + hf * 32);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) { v[e] = __ldcg(src + e); src[e] = make_float4(0.f, 0.f, 0.f, 0.f); }
+        l = __ldcg(p.ws_l + R);
+        if (hf == 0) p.ws_l[R] = 0.f;
+      }
+#pragma unroll
+      for (int m = 2; m <= 8; m <<= 1) {   // sum the copies (lane bits 1..3)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          v[e].x += __shfl_xor_sync(FULL, v[e].x, m); v[e].y += __shfl_xor_sync(FULL, v[e].y, m);
+          v[e].z += __shfl_xor_sync(FULL, v[e].z, m); v[e].w += __shfl_xor_sync(FULL, v[e].w, m);
+        }
+        l += __shfl_xor_sync(FULL, l, m);
+      }
+      const float inv = l > 0.f ? __fdividef(vs, l) : 0.f;
+      float ss = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        v[e].x *= inv; v[e].y *= inv; v[e].z *= inv; v[e].w *= inv;
+        ss += v[e].x * v[e].x + v[e].y * v[e].y + v[e].z * v[e].z + v[e].w * v[e].w;
+      }
+      ss += __shfl_xor_sync(FULL, ss, 1);
+      if (c == 0) {
+        const float rn = rsqrtf(ss * (1.f / 64.f) + 1e-5f);
+        const int j = rr >> 4, hh = pair * 16 + (rr & 15);
+        const long long tok = (long long)j;   // b = 0
+        const uint4* gp = reinterpret_cast<const uint4*>(p.qkv + tok * p.ld_qkv + (hq + 2 * p.Hkv) * 64 + hh * 64 + hf * 32);
+        uint4* op = reinterpret_cast<uint4*>(p.out + tok * hq * 64 + hh * 64 + hf * 32);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const uint4 gr = __ldg(gp + e);
+          const uint32_t gw[4] = {gr.x, gr.y, gr.z, gr.w};
+          uint32_t ow[4];
+#pragma unroll
+          for (int cc = 0; cc < 4; ++cc) {
+            const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(&gw[cc]);
+            const float ga = __bfloat162float(g2.x), gb = __bfloat162float(g2.y);
+            const float ya = (cc & 1 ? v[2 * e + (cc >> 1)].z : v[2 * e + (cc >> 1)].x) * rn * __fdividef(1.f, 1.f + __expf(-ga));
+            const float yb = (cc & 1 ? v[2 * e + (cc >> 1)].w : v[2 * e + (cc >> 1)].y) * rn * __fdividef(1.f, 1.f + __expf(-gb));
+            const __nv_bfloat162 o2 = __floats2bfloat162_rn(ya, yb);
+            ow[cc] = *reinterpret_cast<const uint32_t*>(&o2);
+          }
+          op[e] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+        }
+      }
     }
   }
 }
@@ -593,6 +684,7 @@ __global__ void __launch_bounds__(NTHR, 2) vfa_main(const __grid_constant__ Para
     }
     misc[0] = ns;
     misc[1] = 0;
+    misc[2] = p.coop ? p.tickets[3 * MAXB + pair] : 0;   // the cooperative barrier's epoch (bumped only after every CTA arrived)
   }
   __syncthreads();
   const int nseg = misc[0];
@@ -670,8 +762,10 @@ int64_t vfa_occupancy(int64_t stages) {
 void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor page_table, torch::Tensor k_cache,
                  torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor ws_o, torch::Tensor ws_l,
                  torch::Tensor tickets, torch::Tensor out, int64_t B, int64_t Hq, int64_t Hkv, int64_t page_shift, int64_t G,
-                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv) {
+                 int64_t segk, int64_t pdl, double qk_sm, int64_t stages, int64_t diag, int64_t L, int64_t nc, int64_t pkv,
+                 int64_t coop) {
   TORCH_CHECK(stages == 4 || stages == 5, "vfa: stages 4 or 5");
+  TORCH_CHECK(coop == 0 || (B == 1 && G >= 16 * L && tickets.numel() >= 4 * vfa::MAXB + 8), "vfa: coop needs B 1, G >= rows, counters");
   TORCH_CHECK((L == 8 || L == 1) && (L == 8 || stages == 4), "vfa: q_len 1 or 8 (q_len 1: stages 4)");
   TORCH_CHECK(nc >= 1 && nc <= 64, "vfa: nc");
   TORCH_CHECK(Hq == 8 * Hkv && Hkv % 2 == 0 && Hkv > 0, "vfa: need Hq == 8*Hkv and even Hkv");
@@ -707,6 +801,7 @@ void vfa_forward(torch::Tensor q8, torch::Tensor qkv, torch::Tensor seq_lens, to
   p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   p.B = (int)B; p.Hq = (int)Hq; p.Hkv = (int)Hkv; p.ld_qkv = (int)qkv.stride(0); p.page_shift = (int)page_shift;
   p.pt_stride = (int)page_table.size(1); p.segk = (int)segk; p.pdl = (int)pdl; p.nc = (int)nc;
+  p.coop = (int)coop; p.coop_ns = 20000000ll;
   p.qk_sm = (float)qk_sm;
   const bool o32 = (k_cache.numel() < (1ll << 32)) && (v_cache.numel() < (1ll << 32));
   const dim3 grid((unsigned)G, (unsigned)(Hkv / 2));
@@ -745,6 +840,8 @@ def _vfa_wanted(qkv, data, cfg, state):
         okb = VFA_L1 and VFA_L1_MIN_B <= B <= VFA_L1_MAX_B
     else:
         okb = False
+    if B == 1 and not (VFA_COOP_B1 and _VFA["coop_ok"]):   # B = 1 only with the cooperative finalize (occupancy + self-test proven)
+        okb = False
     return (VFA_ENABLE and state.get("vfa_ok") and okb and B <= 256 and not cfg["window"] and cfg["rope_theta"] in (0.0, ROPE_THETA)
             and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
             and cfg["head_dim"] == 64 and str(qkv.device) in _VFA["ws"] and qkv.dtype == torch.bfloat16 and qkv.dim() == 2
@@ -755,11 +852,12 @@ def _vfa_wanted(qkv, data, cfg, state):
             and data["cache_loc"].is_contiguous() and data["positions"].is_contiguous())
 
 
-def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None, pkv=None, nc=None):
+def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None, pkv=None, nc=None, coop=None):
     B, L, hq, hkv, d = cfg["batch"], cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
     tokens = B * L
     nc = (VFA_NC_SMALLB if B <= 2 else 1) if nc is None else int(nc)
     pkv = VFA_PKV if pkv is None else bool(pkv)
+    coop = (B == 1 and VFA_COOP_B1 and _VFA["coop_ok"]) if coop is None else bool(coop)
     dev = qkv.device
     k_cache, v_cache = data["k_cache"], data["v_cache"]
     pdl = VFA_PDL if pdl is None else bool(pdl)
@@ -781,7 +879,7 @@ def _vfa_run(qkv, data, cfg, stages=None, segk=None, pdl=None, diag=None, pkv=No
                             v_cache.view(torch.uint8), data["k_scale"], data["v_scale"], ws[0], ws[1], ws[2], out, B, hq, hkv,
                             cfg["page_size"].bit_length() - 1, G, int(VFA_SEGK if segk is None else segk), 1 if pdl else 0,
                             float(cfg["qk_scale_factor"] * cfg["sm_scale"]), st, int(VFA_DIAG if diag is None else diag), L, nc,
-                            1 if (pkv and pdl) else 0)
+                            1 if (pkv and pdl) else 0, 1 if coop else 0)
     return out
 
 
@@ -847,9 +945,9 @@ def _vfa_self_test(dev):
                     vp = _k1_rel_rows(out, pr(dict(d3, qkv=d3["qkv"].view(B * 8, -1)), pdl=False))[0]
                 except Exception as ex:
                     print(f"[vfa] (P206 comparison unavailable: {ex!r}"[:200] + ")", flush=True)
-            clean = not (int(ws[2].abs().sum()) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
+            clean = not (int(ws[2][:VFA_MAX_B].abs().sum()) or int(ws[2][4 * VFA_MAX_B]) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
             print(f"[vfa] self-test B={B} ctx={ctx} L={L} page={page} kvs={kvs:g} #{rep}: rel {tot:.2e} row {row:.2e} vs K1 {vk:.2e} "
-                  f"vs P206 {vp:.2e} ws {'clean' if clean else 'DIRTY'}", flush=True)
+                  f"vs P206 {vp:.2e} ws {'clean' if clean else 'DIRTY'}{' coop' if B == 1 and _VFA['coop_ok'] else ''}", flush=True)
             if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < (6e-2 if L == 8 else 1.2e-1) and vp < 2e-2):   # K1 q_len 1 keeps f16 queries: wider gap
                 raise RuntimeError(f"self-test mismatch B={B} ctx={ctx} L={L} page={page}")
     # graph replay: identical output, and correct after new inputs are copied in
@@ -896,11 +994,15 @@ def _vfa_prepare(state, t0):
             _VFA["occ"][(st, str(dev))] = int(mod.vfa_occupancy(st))
         rows = VFA_MAX_B * 128
         _VFA["ws"][str(dev)] = (torch.zeros((rows, 64), dtype=torch.float32, device=dev), torch.zeros(rows, dtype=torch.float32, device=dev),
-                                torch.zeros(VFA_MAX_B, dtype=torch.int32, device=dev))
+                                torch.zeros(4 * VFA_MAX_B + 8, dtype=torch.int32, device=dev))
+        # B = 1 (cooperative grid-wide finalize) only if the whole grid is co-resident: 2 CTAs / SM x SMs >= 2 x SMs
+        _VFA["coop_ok"] = bool(VFA_COOP_B1 and _VFA["occ"][(4, str(dev))] >= 2)
         if VFA_SELF_TEST:
             _vfa_self_test(dev)
+        if int(_VFA["ws"][str(dev)][2][4 * VFA_MAX_B]) != 0:
+            raise RuntimeError("cooperative barrier timed out in the self-test")
         state["vfa_ok"] = True
-        print(f"[vfa] LIVE: verify full {VFA_MIN_B} <= B <= {VFA_MAX_B} (B = 1: {VFA_B1}), decode full q_len 1 {VFA_L1} B {VFA_L1_MIN_B}..{VFA_L1_MAX_B}, "
+        print(f"[vfa] LIVE: verify full {VFA_MIN_B} <= B <= {VFA_MAX_B} (B = 1: {VFA_B1}, coop {_VFA['coop_ok']}), decode full q_len 1 {VFA_L1} B {VFA_L1_MIN_B}..{VFA_L1_MAX_B}, "
               f"stages {VFA_STAGES} (occupancy {_VFA['occ']}), segk {VFA_SEGK}, nc(B <= 2) {VFA_NC_SMALLB}, pdl {VFA_PDL}, early K/V {VFA_PKV}, "
               f"enable {VFA_ENABLE}, build {_K3_BUILD_S.get('vfa', 0):.0f}s, prepare so far {time.time() - t0:.1f}s", flush=True)
     except Exception as ex:
