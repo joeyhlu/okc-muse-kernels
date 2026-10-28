@@ -160,6 +160,9 @@ def builtin():
             note="PX (finalize-free W2 queue) vs K2A v3.6 vid 3 at T = 25-48")
     variant("moe", "px", (32,), {"VML_BUCKETS": "{**VML_BUCKETS, 32: False}"},
             when=vml32 + ' and M32_PX and _at_k(S).get("px_ok")', note="VML at 32 shipped -> PX alternative")
+    variant("moe", "k2a", (32,), {"VML_BUCKETS": "{**VML_BUCKETS, 32: False}"},
+            when=vml32 + ' and not (M32_PX and _at_k(S).get("px_ok")) and 32 in (_at_k(S).get("r36") or {})',
+            note="VML shipped at 32 without PX (slim bases) -> K2A v3.6 vid 3")
     variant("moe", "vml", (32,), {"VML_BUCKETS": "{**VML_BUCKETS, 32: True}"},
             when='VML_ENABLE and not VML_BUCKETS.get(32) and _VML["ok"].get(32)', ship=False,
             note="VML1 at T = 32 (research: needs the AT_DIAG prepare-time self-test of bucket 32)")
