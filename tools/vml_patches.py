@@ -173,7 +173,8 @@ def replace(text, t32=False, flags=None, cost=None):
     PT1 job, prepare call and route hook stay as they are (same names). Asserts exactly one old block."""
     START_OLD = "_vml_E_LOC, _vml_TOPK, _vml_KDIM = 32, 8, 4096\n"
     assert text.count(START_OLD) == 1 and text.count(ANCHOR) == 1
-    for new in (PT1_NEW, PREP_NEW, CALL_NEW):
+    hook = CALL_NEW[:CALL_NEW.index("    if M32_PX and rep == 32")]   # the PX line after it may be stripped
+    for new in (PT1_NEW, PREP_NEW, hook):
         assert text.count(new) == 1, new[:80]
     a, b = text.index(START_OLD), text.index(ANCHOR)
     block, _ = lab_block()

@@ -695,6 +695,7 @@ __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
       asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_cast<const uint8_t*>(A.x) + off),
                    "r"(min(S, tot - off)) : "memory");
   }
+  if (A.flags & 256) asm volatile("griddepcontrol.wait;\n" ::: "memory");   // PDL: ids / x come from the previous kernel
   uint8_t* scr = smem + NS * US + (NX - 1) * XS;
   int* hist = reinterpret_cast<int*>(scr);
   uint16_t* ent = reinterpret_cast<uint16_t*>(scr + 4096);
@@ -828,8 +829,13 @@ void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V) {
   auto stream = at::cuda::getCurrentCUDAStream();
   if (mask & 1) {
     cudaFuncSetAttribute(vm::vm_main, cudaFuncAttributeMaxDynamicSharedMemorySize, vm::SMEM);
-    vm::vm_main<<<(int)G, vm::NTH, vm::SMEM, stream>>>(a);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    cudaLaunchConfig_t cm = {};
+    cm.gridDim = dim3((unsigned)G); cm.blockDim = dim3(vm::NTH); cm.dynamicSmemBytes = vm::SMEM; cm.stream = stream;
+    cudaLaunchAttribute am[1];
+    am[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    am[0].val.programmaticStreamSerializationAllowed = 1;
+    cm.attrs = am; cm.numAttrs = (V[5] & 256) ? 1 : 0;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cm, vm::vm_main, a));
   }
   if ((mask & 2) && M > 0) {
     cudaLaunchConfig_t cfg = {};
@@ -873,7 +879,7 @@ def alloc(dev, G):
             "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
 
-FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments
+FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments, bit 8: vm_main as a PDL secondary
 
 
 def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None):
