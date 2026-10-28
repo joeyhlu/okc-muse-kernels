@@ -20,7 +20,8 @@ sys.argv = _argv
 import vml_patches  # noqa: E402
 
 N = ARGS.get("n", "1")
-BASE = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_vms_1')}.py"
+_b = ARGS.get("base", "k3_vms_1")
+BASE = pathlib.Path(_b) if (_b.endswith(".py") or "/" in _b or chr(92) in _b) else ROOT / f"kernels/muse_decode_layer/{_b}.py"
 T32 = "--t32" in sys.argv
 SLIM = "--slim" in sys.argv
 LABONLY = "--lab-only" in sys.argv
