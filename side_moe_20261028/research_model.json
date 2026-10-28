@@ -1,0 +1,108 @@
+{
+  "warning": "Accounting only, not predicted runtime. Includes 192-row end padding; excludes barriers, splits, bandwidth and clocks.",
+  "by_tokens": {
+    "32": {
+      "96": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      },
+      "112": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      },
+      "128": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      }
+    },
+    "128": {
+      "96": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      },
+      "112": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      },
+      "128": {
+        "median_jobs_removed": 0.0,
+        "changes_pct": {
+          "weight_bytes": 1.56,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 35.42
+        }
+      }
+    },
+    "256": {
+      "96": {
+        "median_jobs_removed": 1.0,
+        "changes_pct": {
+          "weight_bytes": -3.16,
+          "padded_tensor_work": 1.56,
+          "activation_stage_bytes": 35.42,
+          "segments": 29.11
+        }
+      },
+      "112": {
+        "median_jobs_removed": 1.5,
+        "changes_pct": {
+          "weight_bytes": -5.21,
+          "padded_tensor_work": 0.04,
+          "activation_stage_bytes": 33.38,
+          "segments": 26.39
+        }
+      },
+      "128": {
+        "median_jobs_removed": 2.0,
+        "changes_pct": {
+          "weight_bytes": -7.29,
+          "padded_tensor_work": 0.04,
+          "activation_stage_bytes": 33.38,
+          "segments": 23.62
+        }
+      }
+    }
+  },
+  "registers": {
+    "consumer_144_producer_64": 63488,
+    "consumer_152_producer_56": 65536,
+    "launch_512_threads_128_regs": 65536
+  },
+  "ring_bytes_excluding_metadata": {
+    "N96_W2_X3": 202752,
+    "N128_W3_X2": 214016
+  },
+  "decode32_double_rows": {
+    "weight_bytes": 0.0,
+    "padded_tensor_work": 0.0,
+    "activation_stage_bytes": -50.0,
+    "segments": -50.0,
+    "ring_bytes_excluding_metadata": 196608
+  }
+}
