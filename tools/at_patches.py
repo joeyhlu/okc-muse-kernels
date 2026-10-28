@@ -801,8 +801,33 @@ def apply(text, diag=False, with_builtin=True, report=None, lean=None):
     return text.rstrip(chr(10)) + chr(10) + src.rstrip(chr(10)) + chr(10)
 
 
+def drop_gd(text, keys, rep):
+    """Static 0-byte route change: remove (proj, bucket) entries from the base's GD_ROUTE literal (the next route in the chain
+    then serves them, e.g. DG1 at o/32). Verified with ast.literal_eval: only those keys disappear, nothing else changes."""
+    m = re.search(r"(?ms)^GD_ROUTE = (\{.*?\})$", text)
+    if not m:
+        raise ValueError("GD_ROUTE literal not found")
+    old = ast.literal_eval(m.group(1))
+    lit = m.group(1)
+    for p, b in keys:
+        if (p, b) not in old:
+            raise ValueError(f"GD_ROUTE has no {(p, b)}")
+        pat = re.escape(f'("{p}", {b}): ') + r"\([^()]*\)"
+        n0 = len(lit)
+        lit = re.sub(pat + r",\s*", "", lit, count=1)
+        if len(lit) == n0:
+            lit = re.sub(r",\s*" + pat, "", lit, count=1)
+    new = ast.literal_eval(lit)
+    want = {k: v for k, v in old.items() if k not in set(keys)}
+    if new != want:
+        raise ValueError("GD_ROUTE edit changed more than the dropped keys")
+    rep.append(f"static: GD_ROUTE without {keys} ({len(m.group(1)) - len(lit)} B less)")
+    return text[:m.start(1)] + lit + text[m.end(1):]
+
+
 def main():
     args = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+    gdkeys = [(k.split(":")[0], int(k.split(":")[1])) for k in args.get("drop-gd", "").split(",") if k]
     _argv, sys.argv = sys.argv, [sys.argv[0]]
     import gen_k3_m32 as GM
     sys.argv = _argv
@@ -823,10 +848,14 @@ def main():
         sfx = "r" if diag else ""
         tag = f"k3-at-{n}{sfx}"
         nonce = (f"# nonce {tag} ({base.stem} + AT: prepare()-time route autotuner over the registered variants, "
-                 f"default kept unless > 1.5 % faster; {'research copy, AT_DIAG True' if diag else 'lean ship copy'})")
+                 f"default kept unless > 1.5 % faster; {'research copy, AT_DIAG True' if diag else 'lean ship copy'}"
+                 + (f"; static GD_ROUTE without {', '.join(f'{k[0]}/{k[1]}' for k in gdkeys)}" if gdkeys else "") + ")")
         rep = [f"base {base.name} {len(b.encode())} B is a finish() fixed point"]
         reg = [dict(v) for v in REGISTRY], [dict(p) for p in PREPARE_SET]
-        t = apply(b.replace(bn, nonce), diag=diag, with_builtin=False, report=rep)
+        t0 = b.replace(bn, nonce)
+        if gdkeys:
+            t0 = drop_gd(t0, gdkeys, rep)
+        t = apply(t0, diag=diag, with_builtin=False, report=rep)
         kept = sum(1 for v in REGISTRY if v["ship"])
         REGISTRY[:], PREPARE_SET[:] = reg
         if lab_only:

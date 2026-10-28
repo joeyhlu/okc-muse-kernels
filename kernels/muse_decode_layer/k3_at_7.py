@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-at-7 (k3_vd_8 + AT: prepare()-time route autotuner over the registered variants, default kept unless > 1.5 % faster; lean ship copy)
+# nonce k3-at-7 (k3_vd_8 + AT: prepare()-time route autotuner over the registered variants, default kept unless > 1.5 % faster; lean ship copy; static GD_ROUTE without o/32)
 
 from typing import TypedDict
 
@@ -19284,7 +19284,6 @@ GD_ESC_CAP = 32
 GD_ROUTE = {("qkv", 1): (1, 1, 4, 8, 2, 4, 1), ("qkv", 8): (1, 1, 4, 8, 2, 4, 1), ("qkv", 16): (2, 1, 4, 8, 1, 4, 0),
             ("qkv", 32): (4, 1, 4, 8, 1, 4, 0),
             ("o", 1): (1, 2, 4, 4, 2, 1, 0), ("o", 8): (1, 1, 8, 2, 2, 1, 0), ("o", 16): (2, 2, 4, 4, 2, 1, 0),
-            ("o", 32): (4, 2, 4, 4, 1, 1, 0),
             ("pooler", 1): (1, 1, 8, 16, 2, 1, 1), ("pooler", 8): (1, 1, 8, 16, 2, 1, 1),
             ("unpooler", 1): (1, 1, 16, 4, 2, 1, 0), ("unpooler", 8): (1, 1, 16, 4, 2, 1, 0),
             ("unpooler", 16): (2, 2, 4, 16, 2, 1, 0), ("unpooler", 32): (4, 2, 4, 16, 1, 1, 0)}
