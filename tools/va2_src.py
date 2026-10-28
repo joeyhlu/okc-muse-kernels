@@ -15,9 +15,9 @@ VA2_CUDA = r'''// VA2 (tools/va2_src.py): verify full q_len 8; part_o / part_lse
 #ifndef VA2_DIAG
 #define VA2_DIAG 0   // lab timing probes (wrong results): 1 no V^T transpose, 2 no softmax math, 3 no PV, 4 no QK, 5 no consumer work
 #endif
-template <int ST, int NVT> constexpr int va2_off_new() { return ST * STAGE_BYTES + NVT * VT_BYTES; }
-template <int ST, int NVT> constexpr int va2_off_bar() { return va2_off_new<ST, NVT>() + NEW8_BYTES + 8192; }
-template <int ST, int NVT> constexpr int va2_smem() { return va2_off_bar<ST, NVT>() + 16 * ST + 4 * 264; }   // B <= 128
+template <int ST, int NVT, int NB = 0> constexpr int va2_off_new() { return ST * STAGE_BYTES + NVT * VT_BYTES; }
+template <int ST, int NVT, int NB = 0> constexpr int va2_off_bar() { return va2_off_new<ST, NVT>() + (NB ? 0 : NEW8_BYTES) + 8192; }
+template <int ST, int NVT, int NB = 0> constexpr int va2_smem() { return va2_off_bar<ST, NVT, NB>() + 16 * ST + 4 * 264; }   // B <= 128
 __device__ __forceinline__ void va_red2(float* a, float x, float y) {
 #if __CUDA_ARCH__ >= 900
   asm volatile("red.global.add.v2.f32 [%0], {%1, %2};\n" ::"l"(a), "f"(x), "f"(y) : "memory");
@@ -63,15 +63,15 @@ __device__ __forceinline__ bool va2_softmax_lazy(float (&S)[32], const float (&m
 // Registers: 2 CTAs/SM put 5-6 warps on an SM sub-partition (16 K regs each). PW 1: 288 threads, ptxas caps at 96 regs.
 // PW 4: 384 threads (launch 80 regs), the producer warpgroup drops to 32 and the consumers rise to 104 (setmaxnreg;
 // the pool must balance per sub-partition: 4 x (80 - 32) >= 8 x (104 - 80), else setmaxnreg.inc never returns).
-template <int ST, int PW, int NVT, int KV = 0>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0>
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #if K1_ARCH_OK
   constexpr int L = 8;
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t* vtb = smem + ST * STAGE_BYTES;
-  uint8_t* newk = smem + va2_off_new<ST, NVT>();
-  uint8_t* qs = newk + NEW8_BYTES;
-  uint64_t* full = reinterpret_cast<uint64_t*>(smem + va2_off_bar<ST, NVT>());
+  uint8_t* newk = smem + va2_off_new<ST, NVT>();   // NB 1: no separate new tile (newk unused)
+  uint8_t* qs = newk + (NB ? 0 : NEW8_BYTES);
+  uint64_t* full = reinterpret_cast<uint64_t*>(smem + va2_off_bar<ST, NVT, NB>());
   uint64_t* empt = full + ST;
   int* flag = reinterpret_cast<int*>(empt + ST);
   int* sV = flag + 4;
@@ -79,7 +79,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int hp = blockIdx.y, HP = gridDim.y, B = p.B, segk = p.min_chunk;
   constexpr int NPL = 32 * PW, MPT = 512 / NPL, XS = NPL / 8;   // producer lanes, (key, chunk) pairs per lane, key stride
-  for (int i = tid; i < NEW8_BYTES / 16; i += 256 + NPL) reinterpret_cast<uint4*>(newk)[i] = make_uint4(0u, 0u, 0u, 0u);
+  if (NB) {   // the V^T buffers double as new-token tiles: zero them once (no NaN bit patterns under P = 0)
+    for (int i = tid; i < NVT * VT_BYTES / 16; i += 256 + NPL) reinterpret_cast<uint4*>(vtb)[i] = make_uint4(0u, 0u, 0u, 0u);
+  } else {
+    for (int i = tid; i < NEW8_BYTES / 16; i += 256 + NPL) reinterpret_cast<uint4*>(newk)[i] = make_uint4(0u, 0u, 0u, 0u);
+  }
   if (tid < ST) {
     asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" ::"r"(va_sa(full + tid)), "n"(NPL) : "memory");
     asm volatile("mbarrier.init.shared.b64 [%0], 8;\n" ::"r"(va_sa(empt + tid)) : "memory");
@@ -101,7 +105,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     if (lane == 0) sV[B] = carry;
   }
   __syncthreads();
-  if (tid < 64 * (NVT + 1)) {   // e4m3 ones in row group 8 of every V^T region (NVT ring buffers + the new tile): row sums
+  if (tid < 64 * (NVT + 1 - NB)) {   // e4m3 ones in row group 8 of every V^T region (NVT ring buffers + the new tile)
     const int buf = tid >> 6, rg = (tid >> 4) & 3, ch = tid & 15;
     uint8_t* base = (buf < NVT) ? (vtb + buf * VT_BYTES) : (newk + 8192);
     *reinterpret_cast<uint4*>(base + rg * VT_REGION + 8 * VT_SBO + (ch & 7) * 16 + (ch >> 3) * 128) =
@@ -240,7 +244,8 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         const float sc = kind ? vsc : ksc;
         const uint16_t q8 = (uint16_t)__nv_cvt_float2_to_fp8x2(make_float2(x.x / sc, x.y / sc), __NV_SATFINITE, __NV_E4M3);
         *reinterpret_cast<uint16_t*>((kind ? p.v_cache : p.k_cache) + (size_t)p.cache_loc[(size_t)b * L + j] * rowB + (size_t)head * 64 + 2 * lane) = q8;
-        if (kind == 0) {
+        if (NB) {
+        } else if (kind == 0) {
           *reinterpret_cast<uint16_t*>(newk + h * 4096 + il_off(j, 2 * lane, 128, 512)) = q8;
         } else {
           int s8, kl;
@@ -284,11 +289,38 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       }
       if (VA2_DIAG != 3 && VA2_DIAG != 5) pv_issue7(O, pa, vtb + (n % NVT) * VT_BYTES, h);
     }
+    uint8_t* nK = NB ? vtb + ((n + 1) % NVT) * VT_BYTES : newk;
+    uint8_t* nV = NB ? vtb + ((n + 2) % NVT) * VT_BYTES : newk + 8192;
+    if (NB && has_new) {   // both warpgroups are past their loops before the V^T buffers take the new rows
+      wg_wait<0>();
+      asm volatile("bar.sync 3, 256;\n" ::: "memory");
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int R = wq + 4 * k, kind = R >> 3, j = R & 7, head = 2 * hp + h;
+        float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(qb + (size_t)j * stride + (size_t)(p.Hq + kind * p.Hkv + head) * 64 + 2 * lane));
+        if (kind == 0) {
+          const float rs = rsqrtf(warp_sum(x.x * x.x + x.y * x.y) * (1.f / 64.f) + 1e-5f);
+          x.x *= rs; x.y *= rs;
+        }
+        const float sc = kind ? vsc : ksc;
+        const uint16_t q8 = (uint16_t)__nv_cvt_float2_to_fp8x2(make_float2(x.x / sc, x.y / sc), __NV_SATFINITE, __NV_E4M3);
+        if (kind == 0) {
+          *reinterpret_cast<uint16_t*>(nK + h * 4096 + il_off(j, 2 * lane, 128, 512)) = q8;
+        } else {
+          int s8, kl;
+          key_to_sk(j, s8, kl);
+          nV[vt_off(h, s8, 2 * lane, kl)] = (uint8_t)(q8 & 0xFF);
+          nV[vt_off(h, s8, 2 * lane + 1, kl)] = (uint8_t)(q8 >> 8);
+        }
+      }
+      fence_async_smem();
+      asm volatile("bar.sync %0, 128;\n" ::"r"(1 + h) : "memory");
+    }
     if (has_new) {
-      qk_issue(S, dq, desc_il(newk + h * 4096, 128, 512));
+      qk_issue(S, dq, desc_il(nK + h * 4096, 128, 512));
       wg_wait<0>();
       softmax_pack7(S, O, m, pa, t, cl2, true, seq, seq + L, seq, 0, j0);
-      pv_issue7(O, pa, newk + 8192, h);
+      pv_issue7(O, pa, nV, h);
     }
     wg_wait<0>();
     const size_t r0 = (size_t)(b * HP + hp) * 128;
@@ -303,6 +335,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     __threadfence();
     asm volatile("bar.sync 3, 256;\n" ::: "memory");
     if (tid == 0) flag[0] = (atomicAdd(p.counters + b * HP + hp, k1 - k0) + k1 - k0 == sN[b]) ? 1 : 0;
+    if (NB && has_new && tid < 64) {
+      const int rg = tid >> 4, ch = tid & 15;
+      *reinterpret_cast<uint4*>(nK + rg * VT_REGION + 8 * VT_SBO + (ch & 7) * 16 + (ch >> 3) * 128) =
+          make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
+    }
     asm volatile("bar.sync 3, 256;\n" ::: "memory");
     if (flag[0]) {
       __threadfence();
@@ -342,11 +379,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 '''
 
 VA2_HOST = r'''
-template <int ST, int PW, int NVT, int KV = 0>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0>
 static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
   static bool attr = false;
   if (!attr) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT, NB>()));
     attr = true;
   }
   int nb = 0;
@@ -355,10 +392,10 @@ static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT>(); cfg.stream = s;
+    cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT, NB>(); cfg.stream = s;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV>, *p));
-  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV>, 256 + 32 * PW, k1::va2_smem<ST, NVT>()));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV, NB>, *p));
+  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV, NB>, 256 + 32 * PW, k1::va2_smem<ST, NVT, NB>()));
   return nb;
 }'''
 
@@ -419,7 +456,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 323, 344, 345):
+        for code in (303, 323, 344, 345, 347):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -432,7 +469,7 @@ def _va2_prepare(state):
                         and kt < 3e-2 and vt < 3e-2):
                     raise RuntimeError(f"self-test mismatch B={B} ctx={ctx}")
         state["va2_ok"] = True
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 323, 344, 345)]} (variant {VA2_VAR}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 323, 344, 345, 347)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
@@ -446,15 +483,17 @@ def va2_patches(text):
     K1_MAIN = "template <int L, int ST>\n__global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {"
     steps = (
         ("VA2 kernel", K1_MAIN, VA2_CUDA + K1_MAIN),
-        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || ST == 303 || ST == 313 || ST == 323 || ST == 333 || ST == 344 || ST == 354 || ST == 345 || ST == 355); }"),
+        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || ST == 303 || ST == 313 || ST == 323 || ST == 333 || ST == 344 || ST == 354 || ST == 345 || ST == 355 || ST == 347 || ST == 357); }"),
         ("VA2 host", "int64_t k1_occupancy(int64_t L, int64_t ST) {", VA2_HOST + "\n\nint64_t k1_occupancy(int64_t L, int64_t ST) {"),
         ("occupancy", "  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>",
-         "  if (ST > 300) return (int64_t)(ST % 10 == 5 ? va2_go<4, 4, 2, 1>(nullptr, dim3(1), 0, false) : ST >= 344 ? "
+         "  if (ST > 300) return (int64_t)(ST % 10 == 7 ? va2_go<4, 4, 3, 1, 1>(nullptr, dim3(1), 0, false) : ST % 10 == 5 ? "
+         "va2_go<4, 4, 2, 1>(nullptr, dim3(1), 0, false) : ST >= 344 ? "
          "va2_go<4, 4, 2>(nullptr, dim3(1), 0, false) : ST >= 320 ? "
          "va2_go<3, 4, 3>(nullptr, dim3(1), 0, false) : va2_go<3, 1, 3>(nullptr, dim3(1), 0, false));\n  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>"),
         ("launch", "  if (stages > 200) {",
          "  if (stages > 300) {\n    TORCH_CHECK(L == 8 && fold == 1 && B <= 128, \"va2: L 8, fold, B <= 128\");\n"
-         "    if (stages % 10 == 5) va2_go<4, 4, 2, 1>(&p, grid, st, stages > 350);\n"
+         "    if (stages % 10 == 7) va2_go<4, 4, 3, 1, 1>(&p, grid, st, stages > 350);\n"
+         "    else if (stages % 10 == 5) va2_go<4, 4, 2, 1>(&p, grid, st, stages > 350);\n"
          "    else if (stages >= 344) va2_go<4, 4, 2>(&p, grid, st, stages > 350);\n"
          "    else if (stages >= 320) va2_go<3, 4, 3>(&p, grid, st, stages > 330);\n    else va2_go<3, 1, 3>(&p, grid, st, stages > 310);\n    C10_CUDA_KERNEL_LAUNCH_CHECK();\n    return;\n  }\n  if (stages > 200) {"),
         ("rows", "VA1_ROWS = 16 * 1024\n", "VA1_ROWS = 34 * 1024\n"),

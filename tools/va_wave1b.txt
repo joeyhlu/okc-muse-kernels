@@ -1,0 +1,3 @@
+muse_attention_decode kernels/muse_attention_decode/va_5.py
+muse_attention_decode kernels/muse_attention_decode/va_6.py
+muse_attention_decode kernels/muse_attention_decode/va_4.py
