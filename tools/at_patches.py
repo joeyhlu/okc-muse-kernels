@@ -50,6 +50,7 @@ PREPARE_SET = []   # dicts: name, expr, diag_only, note
 TIMELINES = []     # dicts: name, buckets, fn (function name in the emitted code), src
 KINDS = ("sliding", "full")
 BUCKETS = (1, 8, 16, 32, 128, 256)
+DENSE_SHIP = "--dense=research" not in sys.argv   # GD-vs-fallback units: ship (default) or research-only (saves ~0.9 KB)
 # Output-agreement tolerance vs the shipped route (rel-L2 of the next attention input and of the residual update). Attention
 # routes differ in their own error vs FP32 (FA4 / stock ~8-9 %, KS1 / KS3 / PR206 ~1-2 %; R-at-2), so an attention op gets
 # the judge's upper bound 0.15 (garbage / NaN still fails); everything else 3e-2 (AT_TOL in the layer).
@@ -197,7 +198,7 @@ def builtin():
     rows = [(p, b) for p, bs in (("qkv", (1, 8, 16, 32)), ("o", (1, 8, 16, 32)), ("pooler", (8,)), ("unpooler", (1, 8, 16, 32)))
             for b in bs]
     family(("P", "B"), rows, "P", "P + '-nogd'", "(B,)", {"GD_ROUTE": "_at_gdrop(P, B)"}, "_at_gdok(S, P, B)",
-           note="GD GEMV vs the next route (P1M / P1 / DG1 / cuBLAS)")
+           ship=DENSE_SHIP, note="GD GEMV vs the next route (P1M / P1 / DG1 / cuBLAS)")
     timeline("vms", (1, 8, 16), "_at_tl_vms", TL_VMS)
     timeline("vml", (32, 128, 256), "_at_tl_vml", TL_VML)
 
@@ -241,12 +242,14 @@ def _at_k(S):
     return (S.get("k2a33") or {}).get("st") or {}
 
 
+#@G+
 def _at_gdrop(proj, b):
     return {k: v for k, v in GD_ROUTE.items() if k != (proj, b)}
 
 
 def _at_gdok(S, proj, b):
     return GD_ENABLE and S.get("gd") is not None and (proj, b) in S["gd"]["route"]
+#@G-
 
 
 @SWAP@
@@ -757,6 +760,10 @@ def apply(text, diag=False, with_builtin=True, report=None, lean=None):
     if lean:
         src = re.sub(r"(?ms)^#@D\+$.*?^#@D-$\n?", "", src)
     src = re.sub(r"(?m)^#@D[+-]$\n?", "", src)
+    vtext = src[src.index("def _at_variants(S):"):]
+    if "_at_gdrop(" not in vtext.split("return out", 1)[0]:   # GD helpers only where a variant uses them
+        src = re.sub(r"(?ms)^#@G\+$.*?^#@G-$\n?", "", src)
+    src = re.sub(r"(?m)^#@G[+-]$\n?", "", src)
     if lean and re.search(r"_at_timelines|_at_tl_|\[at\] diag", src):
         raise ValueError("lean copy still carries diag-only code")
     if re.search(r"@[A-Z]+@", src):
