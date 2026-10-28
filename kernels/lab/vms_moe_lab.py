@@ -50,7 +50,7 @@ CUDA_SRC = r'''
 #ifndef VMS_FL
 #define VMS_FL 0
 #endif
-#define VMS_DW ((VMS_FL & 64) != 0)
+#define VMS_DW ((VMS_FL & 64) != 0)   /* 1024: ER barrier early return (R-ver-1) */
 #define VMS_SKT ((VMS_FL & 128) ? 16 : 8)
 #define VMS_CLK ((VMS_FL & 256) != 0)
 #define VMS_WSBL ((VMS_FL & 512) != 0 && !VMS_DW && VMS_SKT == 8)
@@ -604,6 +604,12 @@ __global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {
   asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
   const int gen = S.gen;
+#if (VMS_FL & 1024)
+  if (c >= max(1, p.m * 4)) {   // ER: no final-pass items -> arrive and leave (c == 0 still waits for all G)
+    if (tid == 0) { __threadfence(); atomicAdd(p.ctr + 1, 1); }
+    return;
+  }
+#endif
   if (tid == 0) {
     __threadfence();
     atomicAdd(p.ctr + 1, 1);
