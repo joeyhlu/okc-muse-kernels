@@ -57,7 +57,7 @@ DENSE_SHIP = "--dense=research" not in sys.argv   # GD-vs-fallback units: ship (
 ATTN_TOL = 0.15
 
 
-def variant(op, name, buckets, overrides, when="True", kinds=None, ship=True, note="", tol=None):
+def variant(op, name, buckets, overrides, when="True", kinds=None, ship=True, note="", tol=None, margin=None):
     """Register one candidate route (see the module docstring); `overrides` = {MODULE_GLOBAL: python expression}."""
     kinds = tuple(kinds or KINDS)
     buckets = tuple(int(b) for b in buckets)
@@ -80,13 +80,13 @@ def variant(op, name, buckets, overrides, when="True", kinds=None, ship=True, no
         ast.parse(e, mode="eval")
     ast.parse(when, mode="eval")
     REGISTRY.append(dict(op=op, name=name, buckets=buckets, set=dict(overrides), when=when, kinds=kinds, ship=bool(ship),
-                         note=note, tol=None if tol is None else float(tol)))
+                         note=note, tol=None if tol is None else float(tol), margin=None if margin is None else float(margin)))
 
 
 FAMILIES = []      # dicts: vars, rows, op, name, buckets, set, when, kinds, ship, tol (emitted as one loop)
 
 
-def family(names, rows, op, name, buckets, overrides, when, kinds=None, ship=True, tol=None, note=""):
+def family(names, rows, op, name, buckets, overrides, when, kinds=None, ship=True, tol=None, note="", margin=None):
     """Many variants of one shape, emitted as ONE loop in the layer (bytes): `names` = loop variable names, `rows` = their
     literal values; `op`, `name`, `buckets` are python expressions over the loop variables (evaluated here, so each member
     is validated like a `variant`), `overrides` values and `when` are expressions emitted inside the loop."""
@@ -96,7 +96,7 @@ def family(names, rows, op, name, buckets, overrides, when, kinds=None, ship=Tru
     for row in rows:
         env = dict(zip(names, row))
         variant(eval(op, {}, env), eval(name, {}, env), eval(buckets, {}, env), dict(overrides), when=when, kinds=kinds,
-                ship=ship, note=note, tol=tol)
+                ship=ship, note=note, tol=tol, margin=margin)
         REGISTRY[-1]["fam"] = fid
 
 
@@ -104,11 +104,11 @@ def set_overlap(a, b):
     return bool(frozenset(a) & frozenset(b))
 
 
-def prepare_set(name, expr, diag_only=True, note=""):
+def prepare_set(name, expr, diag_only=True, note="", unless=None):
     """A module-global override active only while the ORIGINAL prepare runs (e.g. self-test an extra bucket so a research
     variant becomes valid); restored before the autotune and the timed calls."""
     ast.parse(expr, mode="eval")
-    PREPARE_SET.append(dict(name=name, expr=expr, diag_only=bool(diag_only), note=note))
+    PREPARE_SET.append(dict(name=name, expr=expr, diag_only=bool(diag_only), note=note, unless=unless))
 
 
 def timeline(name, buckets, fn, src):
@@ -202,6 +202,20 @@ def builtin():
             for b in bs]
     family(("P", "B"), rows, "P", "P + '-nogd'", "(B,)", {"GD_ROUTE": "_at_gdrop(P, B)"}, "_at_gdok(S, P, B)",
            ship=DENSE_SHIP, note="GD GEMV vs the next route (P1M / P1 / DG1 / cuBLAS)")
+    # VD bases (k3_vd_*): dense at T = 128 / 256 = VD (SS-wgmma swap-AB, VD_ROUTE) vs cuBLAS vs torchT (cuBLAS on a K-major
+    # weight copy, VD_TT). torchT copies are built in prepare via the ship-mode prepare set (lossless repack, ~0.2 GB), then
+    # VD_TT is restored, so the shipped routes are unchanged unless AT picks torchT. The judge's proj board ranks these within
+    # 1-2 us of each other (0.3-0.6 % of the layer at T = 128), hence the 0.3 % unit margin (confirm needs half of it).
+    vdp = ("qkv", "o", "cat", "unpooler")
+    family(("P", "B"), [(p, 128) for p in vdp], "P", "'cublas'", "(B,)",
+           {"VD_ROUTE": "{k: v for k, v in VD_ROUTE.items() if k != (P, B)}", "VD_TT": "{k: v for k, v in VD_TT.items() if k != (P, B)}"},
+           'VD_ENABLE and S.get("vd") is not None and (P, B) in S["vd"]["route"] and VD_ROUTE.get((P, B)) is not None '
+           "and not VD_TT.get((P, B))", margin=0.003, note="VD shipped -> cuBLAS")
+    family(("P", "B"), [(p, b) for p in vdp for b in (128, 256)], "P", "'torcht'", "(B,)", {"VD_TT": "{**VD_TT, (P, B): True}"},
+           'VD_ENABLE and S.get("vd") is not None and P in S["vd"]["wt"] and not VD_TT.get((P, B))', margin=0.003,
+           note="cuBLAS on the K-major weight copy")
+    prepare_set("VD_TT", "{**VD_TT, **{(p, b): True for p in ('qkv', 'o', 'cat', 'unpooler') for b in (128, 256)}}",
+                diag_only=False, note="build + self-test the torchT weight copies (restored after prepare)", unless="VD_TT_PREP")
     timeline("vms", (1, 8, 16), "_at_tl_vms", TL_VMS)
     timeline("vml", (32, 128, 256), "_at_tl_vml", TL_VML)
 
@@ -600,8 +614,9 @@ def _at_tune(state, weights, t0, base):
             shp = [(b, k) for k in cand[0][3] if (b, k) in res]
             if shp:
                 gs = [(v[1], _at_gain(res, shp, (v[0], v[1]))) for v in cand]
-                best = max(((g, n) for n, g in gs if g is not None), default=(0.0, None))
-                if best[0] > 1 + AT_MARGIN:
+                mg = {v[1]: AT_MARGIN if v[8] is None else v[8] for v in cand}
+                best = max(((g, n) for n, g in gs if g is not None and g > 1 + mg[n]), default=(0.0, None))
+                if best[1] is not None:
                     choice[(op, b)] = best[1]
                 bad = lambda n: "; ".join(res[k]["bad"][(op, n)] for k in shp if (op, n) in res[k]["bad"])
                 rows.append((op, b, f"[at] {op}/{b} ({'+'.join(k[1][0] for k in shp)}): ship " + "/".join(
@@ -613,17 +628,20 @@ def _at_tune(state, weights, t0, base):
                 B, L = loads[b]
                 T, num, den = B * L, 0.0, 0.0
                 data = _at_input(B, L, 3000 + T, dev)
+                ch = [v for v in vs if choice.get((v[0], b)) == v[1] and b in v[2]]
+                tl = max([AT_TOL] + [v[7] for v in ch if v[7] is not None])
+                mg = min(AT_MARGIN if v[8] is None else v[8] for v in ch) if ch else AT_MARGIN
                 for kind in ("sliding", "full"):
                     if tab.get((b, kind)):
-                        tl = max([AT_TOL] + [v[7] for v in vs if v[7] is not None and choice.get((v[0], b)) == v[1] and b in v[2]])
                         r = _at_measure(dict(data, config=_at_cfg(B, L, kind)), state, base, cal[T][0],
-                                        [None, ("all", "combo", (b,), (kind,), tab[(b, kind)], True, True, tl)], tm, 4000 + T, 2, dl2)
+                                        [None, ("all", "combo", (b,), (kind,), tab[(b, kind)], True, True, tl, None)], tm,
+                                        4000 + T, 2, dl2)
                         num += AT_WEIGHT[kind] * r["t"][0]
                         den += AT_WEIGHT[kind] * r["t"][0] / r["r"][1] if not r["bad"] and len(r["r"]) > 1 else 1e30
                 g = num / den if den > 0 else 0.0
                 lines.append(f"[at] confirm bucket {b}: combination x{g:.3f} vs ship -> "
-                             + ("kept" if g > 1 + AT_MARGIN / 2 else "REVERTED to ship"))
-                if g <= 1 + AT_MARGIN / 2:
+                             + ("kept" if g > 1 + mg / 2 else "REVERTED to ship"))
+                if g <= 1 + mg / 2:
                     choice = {u: n for u, n in choice.items() if u[1] != b}
                 del data
         for op, b, txt in rows:
@@ -678,20 +696,21 @@ def _emit(names, diag, vmlfc="", lean=False):
         ps += [f"{ind}try:", f"{ind}    ov[{p['name']!r}] = {p['expr']}", f"{ind}except Exception:", f"{ind}    pass"]
     ps.append("    return ov")
     va = ["def _at_variants(S):", "    out = []", "",
-          "    def add(op, name, buckets, kinds, ship, fn, tol=None):",
+          "    def add(op, name, buckets, kinds, ship, fn, tol=None, margin=None):",
           "        try:",
           "            ov, ok = fn()",
           "            ok = bool(ok)",
           "        except Exception:",
           "            ov, ok = {}, False",
-          "        out.append((op, name, buckets, kinds or ('sliding', 'full'), ov, ok, ship, tol))", ""]
+          "        out.append((op, name, buckets, kinds or ('sliding', 'full'), ov, ok, ship, tol, margin))", ""]
     done = set()
     for v in REGISTRY:
         if lean and not v["ship"]:
             continue
         ov = "{" + ", ".join(f'"{k}": {e}' for k, e in v["set"].items()) + "}"
         kd = None if v["kinds"] == KINDS else v["kinds"]
-        tl = "" if v["tol"] is None else f", {v['tol']!r}"
+        tl = ("" if v["tol"] is None and v.get("margin") is None else f", {v['tol']!r}") + (
+            "" if v.get("margin") is None else f", {v['margin']!r}")
         if "fam" in v:   # one loop per family, at its first surviving member
             if v["fam"] in done:
                 continue
@@ -742,7 +761,10 @@ def apply(text, diag=False, with_builtin=True, report=None, lean=None):
         keep.append(v)
     REGISTRY[:] = keep
     for p in list(PREPARE_SET):
-        if p["name"] not in glob:
+        if p.get("unless") and p["unless"] in glob:
+            rep.append(f"dropped prepare_set {p['name']}: the base defines {p['unless']}")
+            PREPARE_SET.remove(p)
+        elif p["name"] not in glob:
             rep.append(f"dropped prepare_set {p['name']}: not module-level in the base")
             PREPARE_SET.remove(p)
     ops = {}
@@ -805,6 +827,7 @@ def main():
         rep = [f"base {base.name} {len(b.encode())} B is a finish() fixed point"]
         reg = [dict(v) for v in REGISTRY], [dict(p) for p in PREPARE_SET]
         t = apply(b.replace(bn, nonce), diag=diag, with_builtin=False, report=rep)
+        kept = sum(1 for v in REGISTRY if v["ship"])
         REGISTRY[:], PREPARE_SET[:] = reg
         if lab_only:
             chk0 = GM.check
@@ -844,7 +867,7 @@ def main():
         return keep
     GM.check(ship_adds(a) == ship_adds(r), "ship variants differ between the ship and the research copy")
     GM.check(", False, lambda" not in a and "_at_timelines" not in a, "ship copy carries research variants / timelines")
-    nship = sum(1 for v in REGISTRY if v["ship"])
+    nship = kept
     print(f"[at_patches] OK  ship copy (lean, {nship} ship variants) and research copy share the layer and the ship "
           f"variants; AT costs {len(a.encode()) - len(b.encode())} B in the ship copy, {len(r.encode()) - len(b.encode())} B in "
           f"the research copy")
