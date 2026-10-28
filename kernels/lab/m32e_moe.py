@@ -1720,7 +1720,7 @@ def alloc(dev, G):
     xrows = RMAX + 8 * JMAX
     assert G <= SLOTS and G <= 136
     return {"xA": z((xrows * KDIM,), torch.bfloat16), "xB": z((xrows * KDIM,), torch.bfloat16),
-            "y": z((RMAX * KDIM,), torch.float32), "fix": z((2 * (SLOTS + 384) * 4 * FIXW,), torch.float32),
+            "y": z((RMAX * KDIM,), torch.float32), "fix": z((2 * (SLOTS + 384) * 4 * max(FIXW, 10 * 512),), torch.float32),
             "cnt": z((2 * (SLOTS + 384) * 4,)), "xready": z((JMAX,)), "doneA": z((JMAX * 16,)), "rmap": z((RMAX,)),
             "err": z((4,)), "gbar": z((2,)), "nomark": z((0,), torch.int64), "G": G, "magG": _mag(G)}
 
@@ -1728,7 +1728,7 @@ def alloc(dev, G):
 def cost_ext(mod, cost):
     """cost table for a build: 16 entries (nt 1..8 per phase) are extended to 2 x NTM by the nt7 -> nt8 step (m32e)."""
     ntm = cfg(mod)[1]
-    assert ntm == 8, "m32e scratch (fix regions of 4096 floats) supports NTM 8 builds only"
+    assert 8 <= ntm <= 10, "m32e scratch (fix regions of max(FIXW, 5120) floats) supports NTM 8..10 builds"
     c = list(cost)
     if len(c) == 2 * ntm:
         return c
@@ -1737,7 +1737,7 @@ def cost_ext(mod, cost):
     for pb in (0, 1):
         h = c[8 * pb:8 * pb + 8]
         step = max(1, h[7] - h[6])
-        out += h + [h[7] + step * (k - 7) for k in range(8, ntm + 1)]
+        out += h + [h[7] + step * (k - 8) for k in range(9, ntm + 1)]
     return out
 
 

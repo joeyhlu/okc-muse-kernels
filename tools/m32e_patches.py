@@ -764,7 +764,7 @@ PY_PATCHES = [
     ('void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V);\n',
      'void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V);\nstd::vector<int64_t> vml_cfg();\n'),
     ('functions=["vml_run"]', 'functions=["vml_run", "vml_cfg"]'),
-    ('"fix": z((2 * @P@SLOTS * 4 * @P@FIXW,), torch.float32)', '"fix": z((2 * (@P@SLOTS + 384) * 4 * @P@FIXW,), torch.float32)'),
+    ('"fix": z((2 * @P@SLOTS * 4 * @P@FIXW,), torch.float32)', '"fix": z((2 * (@P@SLOTS + 384) * 4 * max(@P@FIXW, 10 * 512),), torch.float32)'),
     ('"cnt": z((2 * @P@SLOTS * 4,))', '"cnt": z((2 * (@P@SLOTS + 384) * 4,))'),
     ('mask=3, out=None, flags=None, cost=None):', 'mask=3, out=None, flags=None, cost=None, pool=(0, 0), seg=(0, 0), pdel=0):'),
     ('list(@P@COST + @P@COST if cost is None else cost))',
@@ -777,7 +777,7 @@ COST_EXT = '''
 def @P@cost_ext(mod, cost):
     """cost table for a build: 16 entries (nt 1..8 per phase) are extended to 2 x NTM by the nt7 -> nt8 step (m32e)."""
     ntm = @P@cfg(mod)[1]
-    assert ntm == 8, "m32e scratch (fix regions of 4096 floats) supports NTM 8 builds only"
+    assert 8 <= ntm <= 10, "m32e scratch (fix regions of max(FIXW, 5120) floats) supports NTM 8..10 builds"
     c = list(cost)
     if len(c) == 2 * ntm:
         return c
@@ -786,7 +786,7 @@ def @P@cost_ext(mod, cost):
     for pb in (0, 1):
         h = c[8 * pb:8 * pb + 8]
         step = max(1, h[7] - h[6])
-        out += h + [h[7] + step * (k - 7) for k in range(8, ntm + 1)]
+        out += h + [h[7] + step * (k - 8) for k in range(9, ntm + 1)]
     return out
 
 

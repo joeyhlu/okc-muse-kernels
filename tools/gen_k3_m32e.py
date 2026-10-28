@@ -48,7 +48,13 @@ GLUE = [
      '             "bf": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1"), "bg": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_GSM=1", "-DVM_FSW=1"),\n'
      '             "bf2": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1"),\n'
      '             "bu": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_UD2=3", "-DVM_UD=1"),\n'
-     '             "bv": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_UD2=4", "-DVM_UD=1")}\n'),
+     '             "bv": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_UD2=4", "-DVM_UD=1"),\n'
+     '             "w64": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_WG5=2", "-DVM_PREG=32",\n'
+     '                     "-DVM_CREG=112", "-DVM_GV=2"),\n'
+     '             "w72": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_WG5=2", "-DVM_PREG=32",\n'
+     '                     "-DVM_CREG=112", "-DVM_GV=2", "-DVM_JN=72", "-DVM_XSN=72"),\n'
+     '             "w80": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", "-DVM_WG5=2", "-DVM_PREG=32",\n'
+     '                     "-DVM_CREG=112", "-DVM_GV=2", "-DVM_JN=80", "-DVM_NX=2", "-DVM_XSN=80")}\n'),
     ("VML_ABVARS = ()\n",
      "VML_ABVARS = @ABV@\nVML_BVAR = @BVAR@\nVML_POOL = @POOL@\nVML_DPFLAGS = 8192\nVML_SEG = @SEG@\nVML_SCFLAGS = @SCF@\n"
      "VML_PDEL = @PDEL@\n"),
@@ -71,7 +77,7 @@ GLUE = [
     fl = VML_FLAGS.get(rep)
     fl = (_vml_FLAGS_DEFAULT if fl is None else fl) | (VML_DPFLAGS if dp else 0) | (VML_SCFLAGS if sc else 0)
     sg = int(VML_SEG.get(rep, 0)) if sc else 0
-    scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "bu", "bv") else _VML["sc"]
+    scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "bu", "bv", "w64", "w72", "w80") else _VML["sc"]
     pdl = int(VML_PDEL.get(rep, 0)) if var == "p" else 0
     return _vml_call(_VML["mods"].get(var, _VML["mod"]), st, scx, x, data["topk_ids"].to(torch.int32).contiguous(),
                      data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]),
@@ -149,7 +155,7 @@ K2A36_ENABLE = True
 def main():
     GM.check("--dry" in sys.argv or (not LAB.exists() and (LAB_ONLY or not OUT.exists())),
              f"{OUT.name} or its lab copy exists; pick another --n")
-    GM.check(all(v in ("d", "d2", "s", "c", "b", "bd", "e", "p", "bf", "bg", "bf2", "bu", "bv") for v in BVAR.values()) and set(POOL) <= set(BVAR) and set(SEGC) <= set(BVAR),
+    GM.check(all(v in ("d", "d2", "s", "c", "b", "bd", "e", "p", "bf", "bg", "bf2", "bu", "bv", "w64", "w72", "w80") for v in BVAR.values()) and set(POOL) <= set(BVAR) and set(SEGC) <= set(BVAR),
              "bad --bvar / --pool / --seg")
     rep = []
     _, chk_base, _ = GM.G37.generate()
