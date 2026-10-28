@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-lt-1 (k3_vf_10 + LT2: static pinned cuBLASLt algorithms at none (sweep copy); LT_ENABLE)
+# nonce k3-vf-11 (k3_vf_10 + VF S2 refinement: fused T = 8 router variants (2 / 3 / 4 / 5), default 2; self-tested with fallback)
 
 from typing import TypedDict
 
@@ -8649,8 +8649,6 @@ def _pt1_start():
         jobs.append(("vml", _vml_build_job))
     if VMS_ENABLE:
         jobs.append(("vms", _vms_build))
-    if LT_ENABLE and LT_PIN:
-        jobs.append(("lt", _lt_build))
     for name, fn in jobs:
         th = threading.Thread(target=_pt1_target(name, fn), name=f"pt1-{name}", daemon=True)
         _PT1["threads"][name] = th
@@ -8728,7 +8726,6 @@ def prepare(weights):
     _g2_prepare(state, t0)
     _ks1_prepare(state, t0)
     _dg1_prepare(state, t0)
-    _lt_prepare(state)
     _sbb1_prepare(state, t0)
     _vf_prepare(state, t0)
     _vg_prepare(state, t0)
@@ -17206,9 +17203,6 @@ def _dg1_weight(state, proj):
 
 
 def _dg1(state, proj, x):
-    lt_out = _lt(state, proj, x)
-    if lt_out is not None:
-        return lt_out
     st = state.get("dg1")
     if not DG1_ENABLE or st is None:
         return None
@@ -18698,7 +18692,7 @@ int gdr_info_raw(int vf, int64_t* res);
 void gdr_run(int64_t vf, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, int64_t M, int64_t K,
              int64_t ldo, int64_t tb, int64_t nbx, int64_t pdl, torch::Tensor x32, torch::Tensor w32, torch::Tensor part,
              torch::Tensor marks) {
-  if (vf == 2)
+  if (vf >= 2)
     TORCH_CHECK(x32.scalar_type() == at::kFloat && x32.is_contiguous() && x32.size(0) == M && x32.size(1) == 8192 &&
                 w32.scalar_type() == at::kFloat && w32.is_contiguous() && w32.size(0) == 256 && w32.size(1) == 8192 &&
                 part.scalar_type() == at::kFloat && part.is_contiguous() && part.numel() == 8 * M * 256 && M >= 1 && M <= 8 &&
@@ -18707,8 +18701,8 @@ void gdr_run(int64_t vf, torch::Tensor w, torch::Tensor esc, torch::Tensor x, to
   TORCH_CHECK(nbx == 256, "gdr_run: the T = 8 pooler grid (256 row tiles)");
   long long* mk = marks.numel() >= 4 * nbx ? reinterpret_cast<long long*>(marks.data_ptr()) : nullptr;
   const int e = gdr_run_raw((int)vf, w.data_ptr(), esc.data_ptr(), x.data_ptr(), out.data_ptr(), (int)M, (int)K, (int)ldo,
-                            (uint32_t)tb, (int)nbx, (int)pdl, vf == 2 ? x32.data_ptr<float>() : nullptr,
-                            vf == 2 ? w32.data_ptr<float>() : nullptr, vf == 2 ? part.data_ptr<float>() : nullptr, mk,
+                            (uint32_t)tb, (int)nbx, (int)pdl, vf >= 2 ? x32.data_ptr<float>() : nullptr,
+                            vf >= 2 ? w32.data_ptr<float>() : nullptr, vf >= 2 ? part.data_ptr<float>() : nullptr, mk,
                             at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(e == 0, "gdr_run: vf ", vf, " CUDA error ", e, " ", cudaGetErrorString((cudaError_t)(e < 0 ? 1 : e)));
 }
@@ -18895,7 +18889,7 @@ __global__ void __launch_bounds__(WR * WK * 32, MB) gd_kernel(const __grid_const
   if constexpr (VF >= 1) {
     if (A.marks && threadIdx.x == 0) { A.marks[vf_c * 4 + 0] = vf_smid(); A.marks[vf_c * 4 + 1] = vf_gt(); }
   }
-  if constexpr (VF == 2) {   // router32 CTA (vf_bx, vf_sl): 8 rows x 1024 K of FP32 weights (no producer dependency)
+  if constexpr (VF >= 2) {   // router32 CTA (vf_bx, vf_sl): 8 rows x 1024 K of FP32 weights (no producer dependency)
     for (int idx = (int)threadIdx.x; idx < 8 * 256; idx += NT) {
       const int r = idx >> 8, c = idx & 255;
       vf_cp16(gd_vf_dsm + idx, reinterpret_cast<const float4*>(A.w32 + (size_t)(vf_bx * 8 + r) * 8192 + vf_sl * 1024) + c);
@@ -18906,7 +18900,7 @@ __global__ void __launch_bounds__(WR * WK * 32, MB) gd_kernel(const __grid_const
   if constexpr (VF >= 1) {
     if (A.marks && threadIdx.x == 0) A.marks[vf_c * 4 + 2] = vf_gt();
   }
-  if constexpr (VF == 2) {   // the router input slice (the boundary's FP32 output), tokens >= M zero
+  if constexpr (VF >= 2) {   // the router input slice (the boundary's FP32 output), tokens >= M zero
     float4* xs = gd_vf_dsm + 8 * 256;
     for (int idx = (int)threadIdx.x; idx < 8 * 256; idx += NT) {
       const int j = idx >> 8, c = idx & 255;
@@ -18965,6 +18959,47 @@ __global__ void __launch_bounds__(WR * WK * 32, MB) gd_kernel(const __grid_const
 #pragma unroll
       for (int p = 0; p < NP; ++p) R[slot][p] = ldw(wp + (size_t)(s + ST) * wstep + p * 32);
     }
+    if constexpr (VF == 4) {   // vfr2: the router row of this warp, overlapping the in-flight pooler stages
+      if (s == KU / 2) {
+        asm volatile("cp.async.wait_all;\n" ::: "memory");
+        __syncthreads();
+        if (warp < 8) {
+          const float4* xsr = gd_vf_dsm + 8 * 256;
+          float racc[1][8];
+#pragma unroll
+          for (int rr = 0; rr < 1; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) racc[rr][j] = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int c = i * 32 + lane;
+            float4 xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xv[j] = xsr[j * 256 + c];
+#pragma unroll
+            for (int rr = 0; rr < 1; ++rr) {
+              const float4 wv = gd_vf_dsm[(warp * 1 + rr) * 256 + c];
+#pragma unroll
+              for (int j = 0; j < 8; ++j) {
+                racc[rr][j] = fmaf(wv.x, xv[j].x, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.y, xv[j].y, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.z, xv[j].z, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.w, xv[j].w, racc[rr][j]);
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < 1; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              float a = racc[rr][j];
+#pragma unroll
+              for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+              if (lane == 0 && j < A.M) A.part[((long)vf_sl * A.M + j) * 256 + vf_bx * 8 + warp * 1 + rr] = a;
+            }
+        }
+      }
+    }
     while ((int)(enx >> 20) == s) {
       patch(a, enx, lane);
       ++ecur;
@@ -19011,6 +19046,83 @@ __global__ void __launch_bounds__(WR * WK * 32, MB) gd_kernel(const __grid_const
   };
   if constexpr (S == 1) {
     for (int i = (int)threadIdx.x; i < NO; i += NT) store(i, cta_value(i));
+    if constexpr (VF == 3 || VF == 5) {   // vfr2: R rows per warp, the x slice read once per R rows
+      asm volatile("cp.async.wait_all;\n" ::: "memory");
+      __syncthreads();
+      if constexpr (VF == 3) {
+        if (warp < 4) {
+          const float4* xsr = gd_vf_dsm + 8 * 256;
+          float racc[2][8];
+#pragma unroll
+          for (int rr = 0; rr < 2; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) racc[rr][j] = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int c = i * 32 + lane;
+            float4 xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xv[j] = xsr[j * 256 + c];
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+              const float4 wv = gd_vf_dsm[(warp * 2 + rr) * 256 + c];
+#pragma unroll
+              for (int j = 0; j < 8; ++j) {
+                racc[rr][j] = fmaf(wv.x, xv[j].x, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.y, xv[j].y, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.z, xv[j].z, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.w, xv[j].w, racc[rr][j]);
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < 2; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              float a = racc[rr][j];
+#pragma unroll
+              for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+              if (lane == 0 && j < A.M) A.part[((long)vf_sl * A.M + j) * 256 + vf_bx * 8 + warp * 2 + rr] = a;
+            }
+        }
+      } else {
+        if (warp < 2) {
+          const float4* xsr = gd_vf_dsm + 8 * 256;
+          float racc[4][8];
+#pragma unroll
+          for (int rr = 0; rr < 4; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) racc[rr][j] = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int c = i * 32 + lane;
+            float4 xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) xv[j] = xsr[j * 256 + c];
+#pragma unroll
+            for (int rr = 0; rr < 4; ++rr) {
+              const float4 wv = gd_vf_dsm[(warp * 4 + rr) * 256 + c];
+#pragma unroll
+              for (int j = 0; j < 8; ++j) {
+                racc[rr][j] = fmaf(wv.x, xv[j].x, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.y, xv[j].y, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.z, xv[j].z, racc[rr][j]);
+                racc[rr][j] = fmaf(wv.w, xv[j].w, racc[rr][j]);
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < 4; ++rr)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              float a = racc[rr][j];
+#pragma unroll
+              for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+              if (lane == 0 && j < A.M) A.part[((long)vf_sl * A.M + j) * 256 + vf_bx * 8 + warp * 4 + rr] = a;
+            }
+        }
+      }
+    }
     if constexpr (VF == 2) {   // router32_kernel<8>'s arithmetic for row vf_bx * 8 + warp, K slice vf_sl
       asm volatile("cp.async.wait_all;\n" ::: "memory");
       __syncthreads();
@@ -19198,15 +19310,16 @@ int gdr_run_raw(int vf, const void* w, const void* esc, const void* x, void* out
   }
   cfg.attrs = attr;
   cfg.numAttrs = na;
-  if (vf == 2) {
-    static bool set = false;
-    if (!set) {
-      const int e = (int)cudaFuncSetAttribute(gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, GDR_DS);
+  if (vf >= 2 && vf <= 5) {
+    static bool set[6] = {false, false, false, false, false, false};
+    auto fn = vf == 2 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2> : vf == 3 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 3> : vf == 4 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 4> : gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 5>;
+    if (!set[vf]) {
+      const int e = (int)cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, GDR_DS);
       if (e) return e;
-      set = true;
+      set[vf] = true;
     }
     cfg.dynamicSmemBytes = GDR_DS;
-    return (int)cudaLaunchKernelEx(&cfg, gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2>, A);
+    return (int)cudaLaunchKernelEx(&cfg, fn, A);
   }
   cfg.dynamicSmemBytes = 0;
   return (int)cudaLaunchKernelEx(&cfg, gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 1>, A);
@@ -19214,8 +19327,9 @@ int gdr_run_raw(int vf, const void* w, const void* esc, const void* x, void* out
 
 int gdr_info_raw(int vf, int64_t* res) {
   cudaFuncAttributes fa;
-  auto fn = vf == 2 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2> : gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 1>;
-  const int ds = vf == 2 ? GDR_DS : 0;
+  auto fn = vf == 2 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2> : vf == 3 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 3> : vf == 4 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 4>
+            : vf == 5 ? gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 5> : gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 1>;
+  const int ds = vf >= 2 ? GDR_DS : 0;
   int e = (int)cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, ds > 0 ? ds : 0);
   if (e) return e;
   e = (int)cudaFuncGetAttributes(&fa, fn);
@@ -19244,7 +19358,8 @@ int gd_unpack_raw(const void* w, const void* esc, void* out, int K, int G, int n
 
 VF_GDR = True
 VF_GDM = False
-_VFR = {"ok": False, "marks": None, "seen": set()}
+VF_GDR_V = 2
+_VFR = {"ok": False, "marks": None, "seen": set(), "vok": {}}
 
 
 def _vfr_gdr(state, x, z, vf):
@@ -19257,7 +19372,7 @@ def _vfr_gdr(state, x, z, vf):
     pdl = (1 if GD_PDL.get("pooler") else 0) | (2 if GD_TRIG.get("pooler") else 0)
     mk = _VFR["marks"] if VF_GDM else _VFR["nomk"]
     r["mod"].gdr_run(vf, r["w"], r["esc"], x, y, T, r["K"], r["N"], r["tb"], r["nbx"], pdl,
-                     z if vf == 2 else _VFR["nomk"], state["router"], part, mk)
+                     z if vf >= 2 else _VFR["nomk"], state["router"], part, mk)
     if (vf, T) not in _VFR["seen"]:
         _VFR["seen"].add((vf, T))
         print(f"[vfr] first call vf {vf} T={T} pdl {pdl} marks {VF_GDM}", flush=True)
@@ -19269,7 +19384,8 @@ def _vfr_fused(state, ffn_input, router_input):
         return None
     if not (2 <= ffn_input.shape[0] <= 8 and router_input.is_contiguous() and ffn_input.is_contiguous()):
         return None
-    return _vfr_gdr(state, ffn_input, router_input, 2)
+    v = VF_GDR_V if _VFR["vok"].get(VF_GDR_V) else 2
+    return _vfr_gdr(state, ffn_input, router_input, v)
 
 
 def _vfr_marked_pooler(state, x):
@@ -19312,8 +19428,20 @@ def _vfr_prepare(state):
             print(f"[vfr] self-test m={m}: fused pooler bitwise {e[0]}, router partials bitwise vs router32 {e[1]}, "
                   f"marked pooler bitwise {e[2]}", flush=True)
             ok &= all(e)
+            for vv in (3, 4, 5):
+                try:
+                    info = r["mod"].gdr_info(vv)
+                    yv, pv = _vfr_gdr(state, h, z, vv)
+                    torch.cuda.synchronize()
+                    good = (bool(torch.equal(y0, yv)) and bool(torch.equal(p0, pv)) and info[2] >= 2 and info[1] <= 128)
+                except Exception as ex:
+                    info, good = [ex], False
+                _VFR["vok"][vv] = _VFR["vok"].get(vv, True) and good
+                print(f"[vfr] self-test m={m} variant {vv}: {list(info)} bitwise / 2 CTAs per SM {good}", flush=True)
         _VFR["seen"].clear()
         _VFR["ok"] = ok
+        _VFR["vok"][2] = ok
+        print(f"[vfr] variants live {sorted(k for k, x in _VFR['vok'].items() if x)} (VF_GDR_V {VF_GDR_V})", flush=True)
     except Exception as ex:
         print(f"[vfr] FALLBACK: {ex!r} -> side-stream router32", flush=True)
         _VFR["ok"] = False
@@ -19759,197 +19887,3 @@ def kernel_fn(data, state):
 
     next_attn_input, stream, _ = _v9_bnd("ffn", stream, ffn_output, None, state, tokens)
     return next_attn_input, stream, topk_ids
-
-
-LT_ENABLE = True
-LT_PIN = {}
-LT_WS = 32 << 20
-LT_CPP = r'''
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cublasLt.h>
-#include <vector>
-struct LtPlan {
-  cublasLtMatmulDesc_t op = nullptr;
-  cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
-  cudaDataType_t ct = CUDA_R_16BF;
-  std::vector<cublasLtMatmulHeuristicResult_t> res;
-};
-static cublasLtHandle_t g_h = nullptr;
-static std::vector<LtPlan> g_plans;
-static const cublasLtMatmulAlgoConfigAttributes_t kAttrs[9] = {
-    CUBLASLT_ALGO_CONFIG_ID, CUBLASLT_ALGO_CONFIG_TILE_ID, CUBLASLT_ALGO_CONFIG_STAGES_ID,
-    CUBLASLT_ALGO_CONFIG_SPLITK_NUM, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
-    CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
-static const cublasLtMatmulAlgo_t* lt_algo(int64_t pid, int64_t ai) {
-  TORCH_CHECK(pid >= 0 && (size_t)pid < g_plans.size() && ai >= 0 && (size_t)ai < g_plans[(size_t)pid].res.size(), "lt: index");
-  return &g_plans[(size_t)pid].res[(size_t)ai].algo;
-}
-int64_t lt_plan(int64_t m, int64_t n, int64_t k, int64_t out_f32, int64_t ws_bytes, int64_t max_algos) {
-  if (!g_h) TORCH_CHECK(cublasLtCreate(&g_h) == CUBLAS_STATUS_SUCCESS, "lt: create");
-  LtPlan p;
-  TORCH_CHECK(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS, "lt: desc");
-  cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
-  cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
-  cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
-  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_16BF, k, n, k) == CUBLAS_STATUS_SUCCESS, "lt: la");
-  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_16BF, k, m, k) == CUBLAS_STATUS_SUCCESS, "lt: lb");
-  p.ct = out_f32 ? CUDA_R_32F : CUDA_R_16BF;
-  TORCH_CHECK(cublasLtMatrixLayoutCreate(&p.lc, p.ct, n, m, n) == CUBLAS_STATUS_SUCCESS, "lt: lc");
-  cublasLtMatmulPreference_t pref;
-  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS, "lt: pref");
-  uint64_t ws = (uint64_t)ws_bytes;
-  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
-  p.res.resize((size_t)max_algos);
-  int got = 0;
-  cublasStatus_t s = cublasLtMatmulAlgoGetHeuristic(g_h, p.op, p.la, p.lb, p.lc, p.lc, pref, (int)max_algos,
-                                                    p.res.data(), &got);
-  cublasLtMatmulPreferenceDestroy(pref);
-  TORCH_CHECK(s == CUBLAS_STATUS_SUCCESS, "lt: heuristic status ", (int)s);
-  p.res.resize((size_t)got);
-  g_plans.push_back(p);
-  return ((int64_t)(g_plans.size() - 1) << 8) | (int64_t)got;
-}
-std::vector<int64_t> lt_cfg(int64_t pid, int64_t ai) {
-  const cublasLtMatmulAlgo_t* a = lt_algo(pid, ai);
-  std::vector<int64_t> v;
-  for (auto t : kAttrs) {
-    size_t sz = 0;
-    uint64_t x = 0;
-    bool ok = cublasLtMatmulAlgoConfigGetAttribute(a, t, nullptr, 0, &sz) == CUBLAS_STATUS_SUCCESS && sz > 0 &&
-              sz <= sizeof(x) && cublasLtMatmulAlgoConfigGetAttribute(a, t, &x, sz, &sz) == CUBLAS_STATUS_SUCCESS;
-    v.push_back(ok ? (int64_t)x : -1);
-  }
-  return v;
-}
-int64_t lt_make(int64_t pid, std::vector<int64_t> cfg, int64_t ws_bytes) {
-  TORCH_CHECK(pid >= 0 && (size_t)pid < g_plans.size() && cfg.size() == 9, "lt: make");
-  LtPlan& p = g_plans[(size_t)pid];
-  cublasLtMatmulAlgo_t a;
-  if (cublasLtMatmulAlgoInit(g_h, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF, p.ct, p.ct, (int)cfg[0], &a) !=
-      CUBLAS_STATUS_SUCCESS)
-    return -1;
-  for (int i = 1; i < 9; ++i) {
-    size_t sz = 0;
-    uint64_t v = (uint64_t)cfg[(size_t)i];
-    if (cublasLtMatmulAlgoConfigGetAttribute(&a, kAttrs[i], nullptr, 0, &sz) != CUBLAS_STATUS_SUCCESS || sz == 0 ||
-        sz > sizeof(v) || cublasLtMatmulAlgoConfigSetAttribute(&a, kAttrs[i], &v, sz) != CUBLAS_STATUS_SUCCESS)
-      return -1;
-  }
-  cublasLtMatmulHeuristicResult_t r = {};
-  if (cublasLtMatmulAlgoCheck(g_h, p.op, p.la, p.lb, p.lc, p.lc, &a, &r) != CUBLAS_STATUS_SUCCESS ||
-      r.workspaceSize > (size_t)ws_bytes)
-    return -1;
-  r.algo = a;
-  p.res.push_back(r);
-  return (int64_t)p.res.size() - 1;
-}
-void lt_run(int64_t pid, int64_t ai, torch::Tensor w, torch::Tensor x, torch::Tensor out, double beta, torch::Tensor ws) {
-  const cublasLtMatmulAlgo_t* a = lt_algo(pid, ai);
-  LtPlan& p = g_plans[(size_t)pid];
-  const float alpha = 1.f, b = (float)beta;
-  cublasStatus_t s = cublasLtMatmul(g_h, p.op, &alpha, w.data_ptr(), p.la, x.data_ptr(), p.lb, &b, out.data_ptr(), p.lc,
-                                    out.data_ptr(), p.lc, a, ws.data_ptr(), (size_t)ws.numel(),
-                                    at::cuda::getCurrentCUDAStream());
-  TORCH_CHECK(s == CUBLAS_STATUS_SUCCESS, "lt_run: status ", (int)s);
-}
-'''
-_LT = {"mod": None, "err": None}
-
-
-def _lt_flags():
-    import glob
-    import os
-    from torch.utils.cpp_extension import CUDA_HOME
-    dirs = [os.path.join(CUDA_HOME, d) for d in ("lib64", "lib", os.path.join("targets", "x86_64-linux", "lib"))] if CUDA_HOME else []
-    tdir = os.path.dirname(torch.__file__)
-    dirs += glob.glob(os.path.join(os.path.dirname(tdir), "nvidia", "*", "lib")) + [os.path.join(tdir, "lib")]
-    for d in dirs:
-        libs = sorted(glob.glob(os.path.join(d, "libcublasLt.so*")))
-        if libs:
-            lib = "-lcublasLt" if any(x.endswith("libcublasLt.so") for x in libs) else "-l:" + os.path.basename(libs[-1])
-            return ["-L" + d, lib, "-Wl,-rpath," + d]
-    return ["-lcublasLt"]
-
-
-def _lt_build():
-    if _LT["mod"] is None and _LT["err"] is None:
-        from torch.utils.cpp_extension import load_inline
-        flags = _lt_flags()
-        try:
-            _LT["mod"] = load_inline(name="lt2_" + hashlib.sha1((LT_CPP + " ".join(flags)).encode()).hexdigest()[:10],
-                                     cpp_sources=LT_CPP, functions=["lt_plan", "lt_cfg", "lt_make", "lt_run"], extra_ldflags=flags,
-                                     with_cuda=True, verbose=False)
-        except Exception as ex:
-            _LT["err"] = f"{str(ex)[-600:]} (flags {flags})"
-    return _LT["mod"]
-
-
-def _lt_today(proj, x, w):
-    return torch.mm(x, w.t(), out_dtype=torch.float32) if proj == "cat" else _gemm(x, w)
-
-
-def _lt_prepare(state):
-    state["lt"] = None
-    if not (LT_ENABLE and LT_PIN):
-        return
-    t1 = time.time()
-    _pt1_wait("lt")
-    mod = _lt_build()
-    if mod is None:
-        print(f"[lt] build FAILED -> today's GEMMs: {str(_LT['err'])[-300:]}", flush=True)
-        return
-    dev = state["dense"]["qkv_gate"].device
-    ws = torch.empty((LT_WS,), dtype=torch.uint8, device=dev)
-    gen = torch.Generator(device=dev).manual_seed(4321)
-    pins, notes = {}, []
-    for (proj, T), cfg in sorted(LT_PIN.items()):
-        try:
-            w = _dg1_weight(state, proj)
-            n, k = w.shape
-            f32 = proj == "cat"
-            code = int(mod.lt_plan(T, n, k, int(f32), LT_WS, 32))
-            pid, cnt = code >> 8, code & 255
-            ai = next((i for i in range(cnt) if tuple(mod.lt_cfg(pid, i)) == tuple(cfg)), None)
-            if ai is None:
-                ai = int(mod.lt_make(pid, list(cfg), LT_WS))
-                if ai < 0 or tuple(mod.lt_cfg(pid, ai)) != tuple(cfg):
-                    notes.append(f"{proj}/{T}: config {tuple(cfg)} rejected by cuBLASLt -> today")
-                    continue
-            x = torch.randn((T, k), generator=gen, device=dev).to(torch.bfloat16)
-            y = [torch.full((T, n), float("nan"), dtype=torch.float32 if f32 else torch.bfloat16, device=dev) for _ in range(2)]
-            for o in y:
-                mod.lt_run(pid, ai, w, x, o, 0.0, ws)
-            ref = x.double() @ w.double().t()
-            today = _lt_today(proj, x, w).float()
-            e64 = float((y[0].double() - ref).norm() / ref.norm())
-            et = float((y[0].float() - today).norm() / today.norm())
-            ok = (bool(torch.isfinite(y[0]).all()) and torch.equal(y[0], y[1]) and e64 < DG1_TOL[1 if f32 else 0]
-                  and et < DG1_TOL[2])
-            notes.append(f"{proj}/{T}: lt{ai}{'' if ai < cnt else ' (built)'} rel {e64:.1e}, vs today {et:.1e} -> "
-                         f"{'pinned' if ok else 'FAIL: today'}")
-            if ok:
-                pins[(proj, T)] = (pid, ai, n, k, f32)
-        except Exception as ex:
-            notes.append(f"{proj}/{T}: FALLBACK {ex!r}"[:160])
-    torch.cuda.synchronize()
-    state["lt"] = {"mod": mod, "pins": pins, "ws": ws} if pins else None
-    print(f"[lt] LT2 ({time.time() - t1:.1f}s): " + "; ".join(notes), flush=True)
-
-
-def _lt(state, proj, x):
-    st = state.get("lt")
-    if not LT_ENABLE or st is None or (proj, x.shape[0]) not in LT_PIN:
-        return None
-    p = st["pins"].get((proj, x.shape[0]))
-    ok = (p is not None and x.dtype == torch.bfloat16 and x.dim() == 2 and x.shape[1] == p[3] and x.is_contiguous()
-          and x.data_ptr() % 256 == 0)
-    if (proj, x.shape[0]) not in _LT.setdefault("seen", set()):
-        _LT["seen"].add((proj, x.shape[0]))
-        print(f"[lt] first call {proj}/{x.shape[0]}: {'pinned lt' + str(p[1]) if ok else 'today'} (x ptr % 256 = "
-              f"{x.data_ptr() % 256})", flush=True)
-    if not ok:
-        return None
-    out = torch.empty((x.shape[0], p[2]), dtype=torch.float32 if p[4] else torch.bfloat16, device=x.device)
-    st["mod"].lt_run(p[0], p[1], _dg1_weight(state, proj), x, out, 0.0, st["ws"])
-    return out
