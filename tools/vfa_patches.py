@@ -230,7 +230,8 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
 }
 
 // ---- consumer warpgroups (104 registers): warpgroup h = KV head h, warp w = tokens 2w, 2w + 1 (rows 16 w .. 16 w + 15) ----
-// DIAG (lab builds only): 1 = skeleton (wait / arrive only), 2 = no V^T + PV, 3 = no QK, 4 = exact per-tile row max
+// DIAG (lab builds only): 1 = skeleton (wait / arrive only), 2 = no V^T + PV, 3 = no QK, 4 = exact per-tile row max,
+// 5 = valid variant: PV wait deferred to the next tile
 template <int ST, int DIAG>
 __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const int* seg, const int* sN, int nseg, uint64_t* full,
                                          uint64_t* empt, int* misc, int tid, int pair, int pairs) {
@@ -238,6 +239,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
   const int h = warp >> 2, w = warp & 3;
   const int g = lane >> 2, tig = lane & 3;
   const int hq = p.Hq;
+  constexpr bool DEFER = (DIAG == 5);   // PV(i) waited at tile i + 1 (with QK(i + 1)) instead of at the end of tile i
   const float vs = __ldg(p.v_scale);
   const float ssc = p.qk_sm * __ldg(p.k_scale) * LOG2E;   // raw e4m3 x e4m3 score -> log2 units
   // wgmma descriptors: low word = (addr >> 4) | LBO 1; high word = SBO | layout (1: 128B swizzle, 2: 64B swizzle)
@@ -278,6 +280,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
     for (int e = 0; e < 36; ++e) { acc[e] = 0.f; VFA_RF(acc[e]); }
     float cr0 = 0.f, cr1 = 0.f;
     bool first = true;
+    uint32_t pa[2][4] = {{0u, 0u, 0u, 0u}, {0u, 0u, 0u, 0u}};   // P fragments (loop-carried: live until the PV wait)
     for (int i = 0; i < nt; ++i, ++n) {
       mbar_wait(full + st_c, ph_c);
       if (DIAG == 1) {
@@ -308,9 +311,15 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
             sts32(db + 1024 * (2 * u + 1), prmt(r[2], r[3], vsel_b));
           }
         }
-        if (DIAG != 3) wg_wait0();
+        if (DIAG != 3) wg_wait0();                               // QK(i) (and, deferred, PV(i - 1))
 #pragma unroll
         for (int e = 0; e < 32; ++e) VFA_RF(sc[e]);
+        if (DEFER) {
+#pragma unroll
+          for (int e = 0; e < 36; ++e) VFA_RF(acc[e]);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) VFA_RR(pa[e >> 2][e & 3]);
+        }
         mbar_arrive(empt + st_c);                                // K (wgmma) and V (ldmatrix) of the stage consumed
         const int t0 = k0 + i * TILE;
         if (t0 + TILE - 1 >= lim) {                              // edge tile: range + causal mask
@@ -344,7 +353,6 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
             cr0 = n0; cr1 = n1;
           }
         }
-        uint32_t pa[2][4];
         auto pack = [&]() {   // P = e4m3(ex2(s * ssc - offset)), keys permuted into the PV A-fragment order
 #pragma unroll
           for (int kk = 0; kk < 2; ++kk) {
@@ -390,17 +398,26 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
           wg_pv(acc, pa[0], HI64 | vl);
           wg_pv(acc, pa[1], HI64 | (vl + 2u));
           wg_commit();
-          wg_wait0();                                            // nothing in flight across the loop edge
+          if (!DEFER) {
+            wg_wait0();                                          // nothing in flight across the loop edge
 #pragma unroll
-          for (int e = 0; e < 36; ++e) VFA_RF(acc[e]);
+            for (int e = 0; e < 36; ++e) VFA_RF(acc[e]);
 #pragma unroll
-          for (int e = 0; e < 8; ++e) VFA_RR(pa[e >> 2][e & 3]);
+            for (int e = 0; e < 8; ++e) VFA_RR(pa[e >> 2][e & 3]);
+          }
         }
       }
       buf ^= 1;
       if (++st_c == ST) { st_c = 0; ph_c ^= 1u; }
     }
     if (DIAG == 1) continue;
+    if (DEFER) {   // the last tile's PV
+      wg_wait0();
+#pragma unroll
+      for (int e = 0; e < 36; ++e) VFA_RF(acc[e]);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) VFA_RR(pa[e >> 2][e & 3]);
+    }
     // ---- merge: rows (token 2w, head 8h + g) and (token 2w + 1, same head) rescaled to 2^0, fp32 red.add ----
     const float f0 = ex2(fminf(cr0, 126.f)), f1 = ex2(fminf(cr1, 126.f));
     const int R0 = bp * 128 + (2 * w) * 16 + 8 * h + g, R1 = R0 + 16;
@@ -581,6 +598,7 @@ static void vfa_diag(const Params& p, dim3 grid, cudaStream_t stream, bool pdl, 
       case 2: vfa_go<ST, 2, true>(p, grid, stream, pdl); return;
       case 3: vfa_go<ST, 3, true>(p, grid, stream, pdl); return;
       case 4: vfa_go<ST, 4, true>(p, grid, stream, pdl); return;
+      case 5: vfa_go<ST, 5, true>(p, grid, stream, pdl); return;
       default: break;
     }
   }
@@ -716,6 +734,34 @@ def _vfa_try(qkv, data, cfg, state):
     return None
 
 
+def _vfa_ref_attention(data, k_new, v_new):
+    """K1's torch reference with the stock / FA4-prologue query path: RMS-normalized q rounded to bf16 BEFORE e4m3 (SGLang's
+    qk-norm output is bf16). Against the fp32 -> e4m3 reference the bf16 step alone moves the output 2-7e-2 (3-4 % of the e4m3
+    query elements flip one ulp), which is what R-vfa-1 / R-vfa-2 measured; the PR206 route shares the prologue."""
+    cfg = data["config"]
+    B, L = cfg["batch"], cfg["q_len"]
+    hq, hkv, page = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["page_size"]
+    qkv = data["qkv"].float()
+    q = _k1_rms_t(qkv[..., :hq * 64].reshape(B, L, hq, 64)).to(torch.bfloat16).float().clamp(-448.0, 448.0).to(FP8).float()
+    q = q * cfg["qk_scale_factor"]
+    ks, vs = data["k_scale"].float(), data["v_scale"].float()
+    kf = data["k_cache"].view(torch.uint8).view(-1, hkv, 64)
+    vf = data["v_cache"].view(torch.uint8).view(-1, hkv, 64)
+    seq_l = data["seq_lens"].long()
+    out = torch.empty((B, L, hq, 64), device=q.device)
+    for b in range(B):
+        seq = int(seq_l[b])
+        idx = torch.arange(seq, device=q.device)
+        rows = data["page_table"][b].long()[idx // page] * page + idx % page
+        keys = torch.cat([kf[rows].view(FP8).float(), k_new[b].view(FP8).float()]) * ks
+        vals = torch.cat([vf[rows].view(FP8).float(), v_new[b].view(FP8).float()]) * vs
+        for j in range(L):
+            att = torch.einsum("kgd,tkd->kgt", q[b, j].view(hkv, hq // hkv, 64), keys[:seq + j + 1]) * cfg["sm_scale"]
+            out[b, j] = torch.einsum("kgt,tkd->kgd", att.softmax(-1), vals[:seq + j + 1]).reshape(hq, 64)
+    gate = qkv[..., (hq + 2 * hkv) * 64:].reshape(B, L, hq, 64)
+    return (_k1_rms_t(out) * torch.sigmoid(gate)).reshape(B, L, hq * 64)
+
+
 def _vfa_self_test(dev):
     ws = _VFA["ws"][str(dev)]
     for (B, ctx, page, kvs, seed) in VFA_CASES:
@@ -726,13 +772,20 @@ def _vfa_self_test(dev):
             pos = d["seq_lens"].long()[:, None] + torch.arange(8, device=dev)
             slots = torch.gather(d["page_table"].long(), 1, pos // page) * page + pos % page
             kn, vn = (c.view(torch.uint8).view(-1, d["config"]["num_kv_heads"], 64)[slots] for c in (d["k_cache"], d["v_cache"]))
-            tot, row = _k1_rel_rows(out, _k1_ref_attention(d, kn, vn, q_e4m3=True))
+            tot, row = _k1_rel_rows(out, _vfa_ref_attention(d, kn, vn))
             d2 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
             vk = _k1_rel_rows(out, _k1_run(d2["qkv"].view(B * 8, -1), d2, d2["config"]))[0] if _K1_MOD is not None else 0.0
+            vp = -1.0
+            if B >= P206_MIN_BATCH and page == 1:   # same prologue, different attention core: the two must agree closely
+                try:
+                    d3 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
+                    vp = _k1_rel_rows(out, p206_run(dict(d3, qkv=d3["qkv"].view(B * 8, -1)), pdl=False))[0]
+                except Exception as ex:
+                    print(f"[vfa] (P206 comparison unavailable: {ex!r}"[:200] + ")", flush=True)
             clean = not (int(ws[2].abs().sum()) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
             print(f"[vfa] self-test B={B} ctx={ctx} page={page} kvs={kvs:g} #{rep}: rel {tot:.2e} row {row:.2e} vs K1 {vk:.2e} "
-                  f"ws {'clean' if clean else 'DIRTY'}", flush=True)
-            if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < 1.5e-2):
+                  f"vs P206 {vp:.2e} ws {'clean' if clean else 'DIRTY'}", flush=True)
+            if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < 6e-2 and vp < 2e-2):
                 raise RuntimeError(f"self-test mismatch B={B} ctx={ctx} page={page}")
     # graph replay: identical output, and correct after new inputs are copied in
     d = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 411)
@@ -820,8 +873,146 @@ def VFA_CUDA_SRC_TEXT(lab):
     return VFA_BLOCK[a:b].replace("#if VFA_LAB", "#if 1" if lab else "#if 0")
 
 
+ATTN_ADAPTER = r'''
+
+_AD = {"state": None}
+
+
+def _ad_watchdog(limit_s):
+    import os
+    import threading
+    done = threading.Event()
+    def run():
+        if not done.wait(limit_s):
+            print(f"[vfa] prepare watchdog: no progress in {limit_s} s, exiting", flush=True)
+            os._exit(17)
+    threading.Thread(target=run, daemon=True).start()
+    return done
+
+
+def _ad_prepare(device):
+    """The layer prepare's attention part, once, on the first eager call (this problem has no prepare): K1 (+ VA1 in its
+    source), v10qk, FA4 v6 / v8, KS1 / KS2 / KS3, PR206, VA1 and VFA with their self-tests; the VFA module builds in a thread."""
+    global _K1_MOD
+    done = _ad_watchdog(280)
+    t0 = time.time()
+    th = threading.Thread(target=_pt1_target("vfa", _vfa_build), name="pt1-vfa", daemon=True)
+    _PT1["threads"]["vfa"] = th
+    th.start()
+    inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, 64, 2, dtype=torch.float, device=device) / 64))
+    freqs = torch.einsum("i,j -> ij", torch.arange(ROPE_POSITIONS, dtype=torch.float, device=device), inv_freq)
+    state = {
+        "router": torch.empty((1,), dtype=torch.float32, device=device),
+        "cos_sin": torch.cat((freqs.cos(), freqs.sin()), dim=-1),
+        "qk_norm": FusedQKNorm(head_dim=64, num_q_heads=16, num_kv_heads=2, eps=RMS_EPS),
+        "o_norm_gate": FusedRMSNormGate(MuseSpark1xRMSNorm(64, eps=RMS_EPS, has_weight=False), True, 64),
+        "stage_loc": torch.arange(1, STAGE_LOC_MAX + 1, dtype=torch.int64, device=device),
+        "k1_ok": False,
+    }
+    del freqs
+    if USE_K1:
+        try:
+            if _K1_MOD is None:
+                _K1_MOD = _k1_build()
+            state["k1_ok"] = _k1_prepare(device)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[ad] K1 build / prepare FAILED, K1 off: {ex!r}", flush=True)
+    state["v10qk"] = _v10_qk_prepare(state)
+    _v18_fa4_prepare(state, t0)
+    _ks1_prepare(state, t0)
+    _p206_prepare(state, t0)
+    _va1_prepare(state)
+    _vfa_prepare(state, t0)
+    torch.cuda.synchronize()
+    done.set()
+    print(f"[vfa] attention prepare {time.time() - t0:.1f}s: k1 {state['k1_ok']} fa4v6 {bool(state.get('fa4v6'))} "
+          f"ks1 {bool(state.get('ks1'))} p206 {bool(state.get('p206'))} va1 {state.get('va1_ok')} vfa {state.get('vfa_ok')} "
+          f"(stages {VFA_STAGES}, segk {VFA_SEGK}, pdl {VFA_PDL})", flush=True)
+    return state
+
+
+def _ad_attention(qkv, data, cfg, state):
+    """The layer kernel_fn's attention block, verbatim: routes, order and fallbacks."""
+    tokens = cfg["tokens"]
+    hq, d = cfg["num_q_heads"], cfg["head_dim"]
+@BLOCK@
+    return o
+
+
+def kernel_fn(data):
+    cfg = data["config"]
+    if (cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]) != (16, 2, 64):
+        return _ad_r1_kernel_fn(data)
+    if _AD["state"] is None:
+        if torch.cuda.is_current_stream_capturing():
+            return _ad_r1_kernel_fn(data)
+        _AD["state"] = _ad_prepare(data["qkv"].device)
+    batch, length = cfg["batch"], cfg["q_len"]
+    tokens = batch * length
+    lcfg = dict(cfg)
+    lcfg["tokens"] = tokens
+    ldata = dict(data)
+    ldata["config"] = lcfg
+    o = _ad_attention(data["qkv"].reshape(tokens, -1), ldata, lcfg, _AD["state"])
+    return o.view(batch, length, cfg["num_q_heads"] * cfg["head_dim"])
+'''
+
+
+def main_attn(args):
+    """--attn --src=kernels/lab/vfa_k3_vfa_3_ab.py --n=1 [--set=NAME=VALUE,...]: kernels/muse_attention_decode/vfa_<n>.py = the
+    layer file's attention block (all routes incl. VFA) behind this problem's kernel_fn(data); other head shapes take our previous
+    entry's stock path (names prefixed _ad_); module globals set by --set (one file per variant for the free board checks)."""
+    import py_compile
+    import re
+    _argv, sys.argv = sys.argv, [sys.argv[0]]
+    import va_patches as VP  # noqa: E402  (ATTN_OLD_NAMES: the stock-path names of kernels/muse_attention_decode/k1_fa4v6_route.py)
+    sys.argv = _argv
+    n = args.get("n", "1")
+    src = ROOT / args.get("src", "kernels/lab/vfa_k3_vfa_3_ab.py")
+    t = src.read_text(encoding="utf-8")
+    lines = t.split(NL)
+    assert lines[0] == "# okc: problem=muse_decode_layer", lines[0]
+    sets = [[k, v.replace(";", ",")] for k, v in (kv.split("=", 1) for kv in args.get("set", "").split(",") if kv)]
+    lines[0] = "# okc: problem=muse_attention_decode"
+    lines[1] = (f"# nonce vfa-{n} ({src.stem} attention path for muse_attention_decode (VFA + VA1 + PR206 + K1 routes), "
+                f"tools/vfa_patches.py --attn; {' '.join(f'{k}={v}' for k, v in sets) or 'defaults'})")
+    t = NL.join(lines)
+    for old, new in ((NL + "def prepare(weights):" + NL, NL + "def _layer_prepare(weights):" + NL),
+                     (NL + "def kernel_fn(data, state):" + NL, NL + "def _layer_kernel_fn(data, state):" + NL)):
+        assert t.count(old) == 1, old
+        t = t.replace(old, new)
+    for k, v in sets:
+        old = next(ln for ln in t.split(NL) if ln.startswith(f"{k} = "))
+        assert t.count(NL + old + NL) == 1, k
+        t = t.replace(NL + old + NL, NL + f"{k} = {v}" + NL)
+    a = t.index(NL + "def _layer_kernel_fn(data, state):" + NL)
+    b0 = t.index("    o = None" + NL + "    ks1_ran = False" + NL, a)
+    end_mark = "    if o is None:" + NL + "        o = _r1_attention(qkv, data, state)" + NL
+    b1 = t.index(end_mark, b0) + len(end_mark)
+    block = t[b0:b1].rstrip(NL)
+    o = (ROOT / "kernels/muse_attention_decode/k1_fa4v6_route.py").read_text(encoding="utf-8")
+    s = o.index(NL + "RMS_EPS = 1e-5" + NL) + 1
+    tail = "    return o.view(batch, length, hq * d)" + NL
+    e = o.index(tail, o.index(NL + "def _r1_kernel_fn(data):" + NL)) + len(tail)
+    old_block = o[s:e]
+    for nm in sorted(VP.ATTN_OLD_NAMES, key=len, reverse=True):
+        old_block = re.sub(rf"(?<![\w.]){re.escape(nm)}\b", f"_ad_{nm.lstrip('_')}", old_block)
+    head = (NL * 2 + "# muse_attention_decode package (tools/vfa_patches.py --attn): the layer's attention block; stock path for other "
+            "head shapes = our previous entry's r1, names prefixed _ad_." + NL +
+            "from sglang.kernels.ops.muse_spark_v12.norm_gate import rms_norm_gate as _ad_rms_norm_gate  # noqa: E402" + NL * 2)
+    t = t.rstrip(NL) + head + old_block + ATTN_ADAPTER.replace("@BLOCK@", block)
+    out = ROOT / f"kernels/muse_attention_decode/vfa_{n}.py"
+    out.write_bytes(t.encode("utf-8"))
+    py_compile.compile(str(out), doraise=True)
+    assert t.isascii() and len(t.encode()) < 1_000_000, len(t.encode())
+    print(f"[vfa_patches] wrote {out.relative_to(ROOT)} ({len(t.encode())} B, compiles, ASCII; sets {sets})")
+    return 0
+
+
 def main():
     args = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+    if "--attn" in sys.argv:
+        return main_attn(args)
     if "--cuda" in sys.argv:
         sys.stdout.write(cuda_source(lab="--ship" not in sys.argv))
         return 0
