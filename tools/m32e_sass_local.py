@@ -22,6 +22,14 @@ BASE = ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_N
 VARS = {"bf2": BASE, "ud": BASE + ("-DVM_UD=1",), "u2": BASE + ("-DVM_UD2=1",), "u3": BASE + ("-DVM_UD2=2",),
         "u4": BASE + ("-DVM_UD2=3",), "u5": BASE + ("-DVM_UD2=4",),
         "u4l": BASE + ("-DVM_UD2=3", "-DVM_UD=1"), "u5l": BASE + ("-DVM_UD2=4", "-DVM_UD=1")}
+W5 = lambda m, p, c, g: BASE + (f"-DVM_WG5={m}", f"-DVM_PREG={p}", f"-DVM_CREG={c}", f"-DVM_GV={g}")   # noqa: E731
+VARS.update({"w1g8": W5(1, 56, 112, 8), "w1": W5(1, 32, 112, 2), "w2": W5(2, 32, 112, 2), "w2p24": W5(2, 24, 112, 2),
+             "w2g8": W5(2, 32, 112, 8), "w3": W5(3, 32, 112, 2), "w2c120": W5(2, 24, 120, 2),
+             "w2j72": W5(2, 32, 112, 2) + ("-DVM_JN=72", "-DVM_XSN=72"),
+             "w2j80": W5(2, 32, 112, 2) + ("-DVM_JN=80", "-DVM_NX=2", "-DVM_XSN=80"), "w2g1": W5(2, 32, 112, 1),
+             "w2j72g1": W5(2, 32, 112, 1) + ("-DVM_JN=72", "-DVM_XSN=72"),
+             "w2j96": W5(2, 32, 112, 2) + ("-DVM_JN=96", "-DVM_NX=2", "-DVM_XSN=96"),
+             "w2j112": W5(2, 32, 112, 2) + ("-DVM_JN=112", "-DVM_NX=2", "-DVM_XSN=112")})
 KEYS = ["R2UR", "IMAD.MOV", "UIADD3", "UMOV", "VIADD", "HGMMA", "REDUX", "SHFL", "STL", "LDL"]
 OBJ = "/root/cudaenv/lib/python3.14/site-packages/triton/backends/nvidia/bin/cuobjdump"
 
@@ -88,7 +96,7 @@ def main():
         if st != "ok":
             print(info)
             continue
-        main_lines = [ln for ln in info.splitlines() if "Used" in ln or "spill" in ln]
+        main_lines = [ln for ln in info.splitlines() if "Used" in ln or "spill" in ln or "C75" in ln]
         print("\n".join("   " + ln.strip()[:160] for ln in main_lines[-6:]))
         for fn, c in per.items():
             if "vm_main" in fn:

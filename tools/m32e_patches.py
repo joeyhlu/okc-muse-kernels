@@ -701,8 +701,41 @@ UD2_PATCHES = [
      "#endif\n"
      "#if VM_UD\nconst uint64_t dsc = VM_UD2 ? (((uint64_t)dhi << 32) | dlo) : d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));\n#endif\n"),
 ]
+# ---- R-m32e-13 ($0 compile, parent 2026-10-28, external review of WG5's C7600): VM_WG5 >= 2 = the producer warpgroup
+# diverges at the very top of vm_main (setmaxnreg.dec before route / gather: no live range shared with the consumers crosses
+# the cap change); consumers run route() on named barrier 8 (512 threads) and release the producers on barrier 9 (640).
+# 2 = consumer setmaxnreg.inc at the top too; 3 = consumer inc after self_fill / gather (where VM_WG5 1 has it).
+_W5TOP = (
+    "#if VM_WG5 >= 2\n"
+    "if (warp >= NCW) {   // producer WG: diverge before route / gather (no shared live range crosses the cap change)\n"
+    "asm volatile(\"setmaxnreg.dec.sync.aligned.u32 \" VM_S(VM_PREG) \";\\n\" ::: \"memory\");\n"
+    "if (A.flags & 256) asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n"
+    "bar_sync(9, NTH);   // the consumers arrive after the mbarrier init + route()\n"
+    "const uint16_t* ent = reinterpret_cast<const uint16_t*>(smem + NS * US + (NX - 1) * XS + 4096);\n"
+    "if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); return; }\n"
+    "if (warp == NCW) {\nif (A.flags & 4) bar_sync(7, 32 * NCW + 32);\nif (lane == 0) prod_w(A, T, sa(smem), bars);\n"
+    "} else {\nif (A.flags & 64) gather_w5(A, T, ent, lane, 0);\nbar_sync(6, 32 * NCW + 32);\n"
+    "if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);\nelse if VM_F9(A) bperm_lanes(A, T, lane);\n}\nreturn;\n}\n"
+    "#if VM_WG5 == 2\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n"
+    "#endif\n")
+W5T_PATCHES = [
+    ("constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);\n",
+     "constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);\n#if VM_WG5 >= 2\n#define VM_RSYNC() bar_sync(8, 32 * NCW)\n"
+     "#define VM_RNT (32 * NCW)\n#else\n#define VM_RSYNC() __syncthreads()\n#define VM_RNT NTH\n#endif\n"),
+    ("const uint32_t bars = sa(smem + BAR_OFF);\nif (tid == 0) {\n", "const uint32_t bars = sa(smem + BAR_OFF);\n" + _W5TOP + "if (tid == 0) {\n"),
+    ("route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));\n",
+     "route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));\n#if VM_WG5 >= 2\nbar_arrive(9, NTH);\n#endif\n"),
+    ("if (warp >= NCW) {\n#if VM_WG5\nasm volatile(\"setmaxnreg.dec", "#if VM_WG5 < 2\nif (warp >= NCW) {\n#if VM_WG5\nasm volatile(\"setmaxnreg.dec"),
+    ("}\nreturn;\n}\nif (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));\n",
+     "}\nreturn;\n}\n#endif\nif (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));\n"),
+    ("#if VM_WG5\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n",
+     "#if VM_WG5 == 1 || VM_WG5 == 3\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n"),
+]
+# (span start, span end, old, new, count): replacements inside one function only
+SPAN_PATCHES = [("__device__ void route(", "__device__ void gather(", "__syncthreads();", "VM_RSYNC();", 6),
+                ("__device__ void route(", "__device__ void gather(", "i += NTH)", "i += VM_RNT)", 1)]
 CUDA_PATCHES = (CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES + PS_PATCHES + AD_PATCHES + GF_PATCHES + UD_PATCHES
-                + UD2_PATCHES)
+                + UD2_PATCHES + W5T_PATCHES)
 CUDA_REPLACE_ALL = [("(A.flags & 512)", "VM_F9(A)")]   # every bit-9 test (compile-time 0 under VM_NOB9)
 
 # wgmma specializations with the B descriptor as one 64-bit operand (VM_UD); same formatting as the 32-bit-pair specs
@@ -808,6 +841,11 @@ def patch_cuda(cuda):
             new = new.replace(_LOOP_SPLIT, mb)
             old = mb
         cuda = sub1(cuda, old, new, f"cuda patch {i}")
+    for a0, b0, old, new, cnt in SPAN_PATCHES:
+        a = cuda.index(a0)
+        b = cuda.index(b0, a)
+        assert cuda[a:b].count(old) == cnt, (a0, old, cuda[a:b].count(old))
+        cuda = cuda[:a] + cuda[a:b].replace(old, new) + cuda[b:]
     for old, new in CUDA_REPLACE_ALL:
         assert cuda.count(old) >= 1, old
         cuda = cuda.replace(old, new)

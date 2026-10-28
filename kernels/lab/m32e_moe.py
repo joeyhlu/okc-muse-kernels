@@ -128,6 +128,13 @@ constexpr int NCW = 16;
 #define VM_S2(x) #x
 #define VM_S(x) VM_S2(x)
 constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);
+#if VM_WG5 >= 2
+#define VM_RSYNC() bar_sync(8, 32 * NCW)
+#define VM_RNT (32 * NCW)
+#else
+#define VM_RSYNC() __syncthreads()
+#define VM_RNT NTH
+#endif
 constexpr int JMAX = @JMAX@, GMAX = 136, SLOTS = @SLOTS@, FIXW = (@FIXW@ > VM_NTM * 512) ? @FIXW@ : VM_NTM * 512;
 #ifndef VM_DP
 #define VM_DP 0
@@ -410,8 +417,8 @@ const int e = e0 + 32 * k + lane;
 xv[k] = -1;
 if (warp < NCW && 32 * k < C && e < e1) { const int id = __ldg(A.ids + e) - A.ls; xv[k] = ((unsigned)id < (unsigned)E_LOC) ? id : -1; }
 }
-for (int i = tid; i < 16 * 33; i += NTH) hist[i] = 0;
-__syncthreads();
+for (int i = tid; i < 16 * 33; i += VM_RNT) hist[i] = 0;
+VM_RSYNC();
 if (warp < NCW) {
 #pragma unroll
 for (int k = 0; k < 5; ++k) {
@@ -422,7 +429,7 @@ if (x >= 0 && lane == __ffs(m) - 1) hist[warp * 33 + x] += __popc(m);
 __syncwarp();
 }
 }
-__syncthreads();
+VM_RSYNC();
 if (warp == 0) {
 int tot = 0;
 for (int w = 0; w < NCW; ++w) { const int h = hist[w * 33 + lane]; hist[w * 33 + lane] = tot; tot += h; }
@@ -471,7 +478,7 @@ T.jS[jst + nj] = est + tot; T.jrow[jst + nj] = rst + prow;
 }
 #endif
 }
-__syncthreads();
+VM_RSYNC();
 if (warp < NCW) {
 #pragma unroll
 for (int k = 0; k < 5; ++k) {
@@ -487,7 +494,7 @@ if (x >= 0 && lane == __ffs(m) - 1) hist[warp * 33 + x] += __popc(m);
 __syncwarp();
 }
 }
-__syncthreads();
+VM_RSYNC();
 if (warp == 0) {
 uint32_t accA = 0, accB = 0;
 for (int j0 = 0; j0 < T.nj; j0 += 32) {
@@ -520,11 +527,11 @@ T.qpub = 0;
 }
 #endif
 }
-__syncthreads();
+VM_RSYNC();
 const int G = gridDim.x;
 if (tid <= G) { T.bA[tid] = stage_at(A, T, 0, tid, G, A.magG); T.bB[tid] = stage_at(A, T, 1, tid, G, A.magG); }
 if (tid == 0) T.bready = 0;
-__syncthreads();
+VM_RSYNC();
 }
 
 __device__ void gather(const Args& A, const Tab& T, const uint16_t* ent) {
@@ -1421,6 +1428,28 @@ extern __shared__ __align__(1024) uint8_t smem[];
 Tab& T = *reinterpret_cast<Tab*>(smem + TAB_OFF);
 const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
 const uint32_t bars = sa(smem + BAR_OFF);
+#if VM_WG5 >= 2
+if (warp >= NCW) {   // producer WG: diverge before route / gather (no shared live range crosses the cap change)
+asm volatile("setmaxnreg.dec.sync.aligned.u32 " VM_S(VM_PREG) ";\n" ::: "memory");
+if (A.flags & 256) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+bar_sync(9, NTH);   // the consumers arrive after the mbarrier init + route()
+const uint16_t* ent = reinterpret_cast<const uint16_t*>(smem + NS * US + (NX - 1) * XS + 4096);
+if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); return; }
+if (warp == NCW) {
+if (A.flags & 4) bar_sync(7, 32 * NCW + 32);
+if (lane == 0) prod_w(A, T, sa(smem), bars);
+} else {
+if (A.flags & 64) gather_w5(A, T, ent, lane, 0);
+bar_sync(6, 32 * NCW + 32);
+if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
+else if VM_F9(A) bperm_lanes(A, T, lane);
+}
+return;
+}
+#if VM_WG5 == 2
+asm volatile("setmaxnreg.inc.sync.aligned.u32 " VM_S(VM_CREG) ";\n" ::: "memory");
+#endif
+#endif
 if (tid == 0) {
 for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW); }
 for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
@@ -1445,7 +1474,11 @@ uint8_t* scr = smem + NS * US + (NX - 1) * XS;
 int* hist = reinterpret_cast<int*>(scr);
 uint16_t* ent = reinterpret_cast<uint16_t*>(scr + 4096);
 route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));
+#if VM_WG5 >= 2
+bar_arrive(9, NTH);
+#endif
 if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * MKW + 7] = gtime();
+#if VM_WG5 < 2
 if (warp >= NCW) {
 #if VM_WG5
 asm volatile("setmaxnreg.dec.sync.aligned.u32 " VM_S(VM_PREG) ";\n" ::: "memory");
@@ -1466,11 +1499,12 @@ else if VM_F9(A) bperm_lanes(A, T, lane);
 }
 return;
 }
+#endif
 if (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));
 else gather(A, T, ent);
 bar_arrive(6, 32 * NCW + 32);
 if (A.flags & 4) bar_arrive(7, 32 * NCW + 32);
-#if VM_WG5
+#if VM_WG5 == 1 || VM_WG5 == 3
 asm volatile("setmaxnreg.inc.sync.aligned.u32 " VM_S(VM_CREG) ";\n" ::: "memory");
 #endif
 if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * MKW + 5] = gtime();
