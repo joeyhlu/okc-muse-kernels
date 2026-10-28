@@ -20706,8 +20706,6 @@ def _ad_watchdog(limit_s):
 
 
 def _ad_prepare(device):
-    """The layer prepare's attention part, once, on the first eager call (this problem has no prepare): K1 (+ VA1 in its
-    source), v10qk, FA4 v6 / v8, KS1 / KS2 / KS3, PR206, VA1 and VFA with their self-tests; the VFA module builds in a thread."""
     global _K1_MOD
     done = _ad_watchdog(280)
     t0 = time.time()
@@ -20747,7 +20745,6 @@ def _ad_prepare(device):
 
 
 def _ad_attention(qkv, data, cfg, state):
-    """The layer kernel_fn's attention block, verbatim: routes, order and fallbacks."""
     tokens = cfg["tokens"]
     hq, d = cfg["num_q_heads"], cfg["head_dim"]
     o = None

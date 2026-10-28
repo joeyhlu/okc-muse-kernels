@@ -901,8 +901,6 @@ def _ad_watchdog(limit_s):
 
 
 def _ad_prepare(device):
-    """The layer prepare's attention part, once, on the first eager call (this problem has no prepare): K1 (+ VA1 in its
-    source), v10qk, FA4 v6 / v8, KS1 / KS2 / KS3, PR206, VA1 and VFA with their self-tests; the VFA module builds in a thread."""
     global _K1_MOD
     done = _ad_watchdog(280)
     t0 = time.time()
@@ -942,7 +940,6 @@ def _ad_prepare(device):
 
 
 def _ad_attention(qkv, data, cfg, state):
-    """The layer kernel_fn's attention block, verbatim: routes, order and fallbacks."""
     tokens = cfg["tokens"]
     hq, d = cfg["num_q_heads"], cfg["head_dim"]
 @BLOCK@
@@ -1012,9 +1009,9 @@ def main_attn(args):
             "from sglang.kernels.ops.muse_spark_v12.norm_gate import rms_norm_gate as _ad_rms_norm_gate  # noqa: E402" + NL * 2)
     t = t.rstrip(NL) + head + old_block + ATTN_ADAPTER.replace("@BLOCK@", block)
     out = ROOT / f"kernels/muse_attention_decode/vfa_{n}.py"
+    assert t.isascii() and len(t.encode()) < 1_000_000, f"package {len(t.encode())} B >= 1 MB: not written"
     out.write_bytes(t.encode("utf-8"))
     py_compile.compile(str(out), doraise=True)
-    assert t.isascii() and len(t.encode()) < 1_000_000, len(t.encode())
     print(f"[vfa_patches] wrote {out.relative_to(ROOT)} ({len(t.encode())} B, compiles, ASCII; sets {sets})")
     return 0
 
