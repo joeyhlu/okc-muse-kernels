@@ -120,6 +120,13 @@ constexpr int JMAX = @JMAX@, GMAX = 136, SLOTS = @SLOTS@, FIXW = (@FIXW@ > VM_NT
 #define VM_DPI 4
 #endif
 constexpr int DPMAX = 384, SLOTSD = SLOTS + (VM_DP ? DPMAX : 0);
+#ifndef VM_BRED
+#define VM_BRED 0
+#endif
+#ifndef VM_DEFER2
+#define VM_DEFER2 0
+#endif
+static_assert(!(VM_BRED && VM_DP), "m32e: VM_BRED and VM_DP use different split paths");
 #ifndef VM_SC
 #define VM_SC 0
 #endif
@@ -991,7 +998,7 @@ if (n < cn)
 xb[((((nt * 4 + i) * 8 + qq) * 8 + (2 * t + hh)) * 4 + tt) * 2 + b] =
 __float2bfloat16_rn(swiglu(d[4 * nt + hh] * gs, d[4 * nt + 2 + hh] * gs));
 }
-if constexpr (VM_DEFER) {
+if constexpr (VM_DEFER || VM_DEFER2) {
 pd.i = j * 16 + (ub >> 1);
 } else {
 fence_proxy_async();
@@ -1014,6 +1021,27 @@ yb[(size_t)n * KDIM + h0 + 8] = d[4 * nt + 2 + hh] * gs;
 }
 }
 }
+#if VM_BRED
+template <int N>
+__device__ __forceinline__ void bred(const Args& A, const Tab& T, int j, int ub, int q, int wp, int lane, const float* d) {
+const int g = lane >> 2, t = lane & 3;
+const int e = T.jE[j], cn = T.jC[j];
+const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;
+const float gs = __ldg(A.gsc2 + e);
+const int h0 = 16 * tg + g;
+float* yb = A.y + (size_t)T.jS[j] * KDIM;
+#pragma unroll
+for (int nt = 0; nt < N / 8; ++nt)
+#pragma unroll
+for (int hh = 0; hh < 2; ++hh) {
+const int n = 8 * nt + 2 * t + hh;
+if (n < cn) {
+asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0), "f"(d[4 * nt + hh] * gs) : "memory");
+asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0 + 8), "f"(d[4 * nt + 2 + hh] * gs) : "memory");
+}
+}
+}
+#endif
 template <bool PB, int N>
 __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32_t bars, int& it, int u, int s0, int s1,
 int q, int wp, int lane, Pend& pd) {
@@ -1039,9 +1067,13 @@ for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, w
 wg_wait<0>();
 if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
 }
+if constexpr (VM_DEFER2) pend_flush(A, pd, q, wp, lane);
 constexpr int UBL = PB ? 4 : 5;
 const int j = u >> UBL, ub = u & ((1 << UBL) - 1);
 if (!(s0 == 0 && s1 == 16)) {
+#if VM_BRED
+if constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); return; }
+#endif
 const int wt = (wp << 5) | lane;
 #if VM_DP
 const int s0u = (PB ? T.sB : T.sA) >> 4;
@@ -1170,7 +1202,7 @@ default: seg<PB, VM_NTM * 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); 
 }
 gs += s1 - s0;
 }
-if constexpr (VM_DEFER && !PB) pend_flush(A, pd, q, wp, lane);   // before phase B: its x waits on these releases
+if constexpr ((VM_DEFER || VM_DEFER2) && !PB) pend_flush(A, pd, q, wp, lane);   // before phase B: its x waits on these releases
 }
 
 __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
@@ -1333,6 +1365,16 @@ a[m][2] += bf16r(v[jj][m].z) * w4[m].z * fr; a[m][3] += bf16r(v[jj][m].w) * w4[m
 }
 }
 }
+#if VM_BRED
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) {
+const int r = (c0 + jj < nloc) ? s_r[c0 + jj] : -1;
+if (r >= 0) {
+#pragma unroll
+for (int m = 0; m < 4; ++m) __stcg(reinterpret_cast<float4*>(A.y + (size_t)r * KDIM + 1024 * m + 4 * tid), z4);
+}
+}
+#endif
 }
 #pragma unroll
 for (int m = 0; m < 4; ++m) {
@@ -1395,7 +1437,7 @@ cfg.attrs = at; cfg.numAttrs = 1;
 C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vm::vm_fin, a));
 }
 }
-std::vector<int64_t> vml_cfg() { return {VM_JN, VM_NTM, VM_NX, VM_XSN, VM_MKW, (int64_t)vm::SMEM, VM_DP, VM_SC}; }
+std::vector<int64_t> vml_cfg() { return {VM_JN, VM_NTM, VM_NX, VM_XSN, VM_MKW, (int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2}; }
 """
 CUDA = (CUDA_T.replace("@WGSPECS@", "".join(_wg_spec(n) for n in range(8, 129, 8)))
         .replace("@JMAX@", str(JMAX)).replace("@SLOTS@", str(SLOTS)).replace("@FIXW@", str(FIXW))

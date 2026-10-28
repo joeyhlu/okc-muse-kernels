@@ -29,6 +29,8 @@ VARS = {"base": ("-DVM_TRICKS_DQ=0",), "wide": ("-DVM_TRICKS_DQ=0",) + P.WIDE_DE
         "dp": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1"), "dpm": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1", "-DVM_MKW=64"),
         "dp2": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1", "-DVM_DPI=2"), "bm": ("-DVM_TRICKS_DQ=0", "-DVM_MKW=64"),
         "sc": ("-DVM_TRICKS_DQ=0", "-DVM_SC=1"), "scm": ("-DVM_TRICKS_DQ=0", "-DVM_SC=1", "-DVM_MKW=64"),
+        "cb": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1"), "cd": ("-DVM_TRICKS_DQ=0", "-DVM_DEFER2=1"),
+        "cbd": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_DEFER2=1"),
         "y4": ("-DVM_TRICKS_DQ=0", "-DVM_WG5=1", "-DVM_PREG=32", "-DVM_CREG=120", "-DVM_GV=4", "-DVM_JN=80", "-DVM_NX=2", "-DVM_XSN=80")}
 
 

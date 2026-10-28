@@ -26,24 +26,30 @@ import m32e_patches as P  # noqa: E402
 
 N = ARGS.get("n", "1")
 BASE = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_vfa_7')}.py"
-OUT = ROOT / f"kernels/muse_decode_layer/k3_m32e_{N}.py"
-LAB = ROOT / f"kernels/lab/{ARGS.get('lab', f'k3_m32e_{N}_ab')}.py"
-TAG = f"k3-m32e-{N}"
+OUTN = ARGS.get("out", f"k3_m32e_{N}")   # --out=k3_gc_2: a ship name (its tag k3-gc-2)
+OUT = ROOT / f"kernels/muse_decode_layer/{OUTN}.py"
+LAB = ROOT / f"kernels/lab/{ARGS.get('lab', OUTN + '_ab')}.py"
+TAG = OUTN.replace("_", "-")
 NL = chr(10)
 BVAR = {int(k): v for k, v in (kv.split(":") for kv in ARGS.get("bvar", "").split(",") if kv)}
 POOL = {int(b): (int(a), int(c)) for b, a, c in (kv.split(":") for kv in ARGS.get("pool", "").split(",") if kv)}
 SEGC = {int(b): int(v) for b, v in (kv.split(":") for kv in ARGS.get("seg", "").split(",") if kv)}
 SCF = 16384 if "--snap" in sys.argv else 0
+ABV = tuple(a for a in ARGS.get("abvars", "").split(",") if a)
 VAR = ARGS.get("var", "s")
 
 GLUE = [
     ('_VML_DEFS = {"": (), "o": ("-DVM_TRICKS=0",), "s": ("-DVM_TRICKS_DQ=0",)}\n',
      '_VML_DEFS = {"": (), "o": ("-DVM_TRICKS=0",), "s": ("-DVM_TRICKS_DQ=0",), "d": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1"),\n'
-     '             "d2": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1", "-DVM_DPI=2")}\n'),
+     '             "d2": ("-DVM_TRICKS_DQ=0", "-DVM_DP=1", "-DVM_DPI=2"), "c": ("-DVM_TRICKS_DQ=0", "-DVM_SC=1"),\n'
+     '             "b": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1"), "bd": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_DEFER2=1"),\n'
+     '             "e": ("-DVM_TRICKS_DQ=0", "-DVM_DEFER2=1")}\n'),
     ("VML_ABVARS = ()\n",
-     "VML_ABVARS = ()\nVML_BVAR = @BVAR@\nVML_POOL = @POOL@\nVML_DPFLAGS = 8192\n"),
+     "VML_ABVARS = @ABV@\nVML_BVAR = @BVAR@\nVML_POOL = @POOL@\nVML_DPFLAGS = 8192\nVML_SEG = @SEG@\nVML_SCFLAGS = @SCF@\n"),
     ('_VML = {"mod": None, "mods": {}, "sc": None, "ok": {}, "err": None}\n',
-     '_VML = {"mod": None, "mods": {}, "sc": None, "ok": {}, "err": None, "okv": {}, "force": None}\n'),
+     '_VML = {"mod": None, "mods": {}, "sc": None, "scb": None, "ok": {}, "err": None, "okv": {}, "force": None}\n'),
+    ('        _VML["sc"] = _vml_alloc(dev, sms)\n',
+     '        _VML["sc"] = _vml_alloc(dev, sms)\n        _VML["scb"] = dict(_VML["sc"], y=torch.zeros_like(_VML["sc"]["y"]))\n'),
     ("    for v in (VML_VAR,) + tuple(a for a in VML_ABVARS if a != VML_VAR):\n",
      "    for v in (VML_VAR,) + tuple(dict.fromkeys(a for a in tuple(VML_ABVARS) + tuple(VML_BVAR.values()) if a != VML_VAR)):\n"),
     ('''    rep = _k2a_bucket_of(x.shape[0])
@@ -59,7 +65,8 @@ GLUE = [
     fl = VML_FLAGS.get(rep)
     fl = (_vml_FLAGS_DEFAULT if fl is None else fl) | (VML_DPFLAGS if dp else 0) | (VML_SCFLAGS if sc else 0)
     sg = int(VML_SEG.get(rep, 0)) if sc else 0
-    return _vml_call(_VML["mods"].get(var, _VML["mod"]), st, _VML["sc"], x, data["topk_ids"].to(torch.int32).contiguous(),
+    scx = _VML["scb"] if var in ("b", "bd") else _VML["sc"]
+    return _vml_call(_VML["mods"].get(var, _VML["mod"]), st, scx, x, data["topk_ids"].to(torch.int32).contiguous(),
                      data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]),
                      flags=fl, cost=VML_COST.get(rep), pool=tuple(VML_POOL.get(rep, (0, 0))) if dp else (0, 0), seg=(sg, sg))
 '''),
@@ -93,7 +100,8 @@ def _m32e_vartest(st, w, dev):
     cases = {128: ((100, 41, "normal"), (128, 42, "skewed"), (160, 43, "skewed")),
              256: ((200, 44, "skewed"), (256, 45, "normal"), (257, 46, "skewed"), (320, 47, "normal")),
              32: ((25, 48, "normal"), (32, 49, "skewed"), (48, 50, "skewed"))}
-    for rep, var in VML_BVAR.items():
+    pairs = [(rep, v) for rep in VML_BVAR for v in dict.fromkeys((VML_BVAR[rep],) + tuple(VML_ABVARS))]
+    for rep, var in pairs:
         if var == VML_VAR or not _VML["ok"].get(rep) or var not in _VML["mods"]:
             continue
         good = True
@@ -134,7 +142,7 @@ K2A36_ENABLE = True
 def main():
     GM.check("--dry" in sys.argv or (not LAB.exists() and (LAB_ONLY or not OUT.exists())),
              f"{OUT.name} or its lab copy exists; pick another --n")
-    GM.check(all(v in ("d", "d2", "s", "c") for v in BVAR.values()) and set(POOL) <= set(BVAR) and set(SEGC) <= set(BVAR),
+    GM.check(all(v in ("d", "d2", "s", "c", "b", "bd", "e") for v in BVAR.values()) and set(POOL) <= set(BVAR) and set(SEGC) <= set(BVAR),
              "bad --bvar / --pool / --seg")
     rep = []
     _, chk_base, _ = GM.G37.generate()
@@ -149,10 +157,11 @@ def main():
     t = P.sub1(t, "\n\n_vml_FLAGS_DEFAULT = 1", P.COST_EXT.replace("@P@", "_vml_") + "\n\n_vml_FLAGS_DEFAULT = 1", "layer cost_ext")
     for i, (old, new) in enumerate(GLUE):
         t = P.sub1(t, old, new.replace("@BVAR@", repr(BVAR)).replace("@POOL@", repr(POOL)).replace("@SEG@", repr(SEGC))
-                   .replace("@SCF@", str(SCF)), f"glue {i}")
+                   .replace("@SCF@", str(SCF)).replace("@ABV@", repr(ABV)), f"glue {i}")
     t = P.sub1(t, "VML_VAR = 's'\n", f"VML_VAR = {VAR!r}\n", "VML_VAR")
     rep.append(f"glue: VML_VAR {VAR!r}, VML_BVAR {BVAR}, VML_POOL {POOL}, per-pair self-test (_m32e_vartest)")
-    nonce = (f"# nonce {TAG} ({BASE.stem} + m32e VML variants: VML_BVAR {BVAR}, VML_POOL {POOL}, VML_SEG {SEGC}, snap "
+    nonce = (f"# nonce {TAG} ({BASE.stem} + m32e VML: VML_VAR {VAR!r} (b = VM_BRED B split shares red.add into y), VML_BVAR {BVAR}, "
+             f"VML_ABVARS {ABV}, VML_POOL {POOL}, VML_SEG {SEGC}, snap "
              f"{bool(SCF)}; tools/gen_k3_m32e.py)")
     t = t.replace(bn, nonce)
     s = GM.finish(t, nonce, TAG, chk_base, rep)

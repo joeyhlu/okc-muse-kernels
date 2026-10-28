@@ -413,7 +413,67 @@ accB += 256u * (uint32_t)__shfl_sync(0xffffffffu, sd + cb, 31);
      "a.segA = (int)V[6 + 2 * VM_NTM]; a.segB = (int)V[7 + 2 * VM_NTM];\n#endif\n"),
     ("(int64_t)vm::SMEM, VM_DP}; }", "(int64_t)vm::SMEM, VM_DP, VM_SC}; }"),
 ]
-CUDA_PATCHES = CUDA_PATCHES + DP_PATCHES + SC_PATCHES
+# ---- cheaper segments (R-m32e-4). VM_BRED: a phase-B split share red.adds its partial (x gs2) straight into the y rows
+# (no fixup slot, no count atomic, no bar_sync wait, no read-back); vm_fin zeroes every y row it read, so y is all-zero
+# between calls. VM_DEFER2: a whole phase-A unit's proxy fence + WG barrier + doneA release are deferred to the WG's NEXT
+# segment end (after its wgmma drain, before its own stores, so the fence finds nothing outstanding) and to the phase end.
+_BRED_FN = r"""#if VM_BRED
+template <int N>
+__device__ __forceinline__ void bred(const Args& A, const Tab& T, int j, int ub, int q, int wp, int lane, const float* d) {
+const int g = lane >> 2, t = lane & 3;
+const int e = T.jE[j], cn = T.jC[j];
+const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;
+const float gs = __ldg(A.gsc2 + e);
+const int h0 = 16 * tg + g;
+float* yb = A.y + (size_t)T.jS[j] * KDIM;
+#pragma unroll
+for (int nt = 0; nt < N / 8; ++nt)
+#pragma unroll
+for (int hh = 0; hh < 2; ++hh) {
+const int n = 8 * nt + 2 * t + hh;
+if (n < cn) {
+asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0), "f"(d[4 * nt + hh] * gs) : "memory");
+asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0 + 8), "f"(d[4 * nt + 2 + hh] * gs) : "memory");
+}
+}
+}
+#endif
+"""
+CS_PATCHES = [
+    ("constexpr int DPMAX = 384, SLOTSD = SLOTS + (VM_DP ? DPMAX : 0);\n",
+     "constexpr int DPMAX = 384, SLOTSD = SLOTS + (VM_DP ? DPMAX : 0);\n#ifndef VM_BRED\n#define VM_BRED 0\n#endif\n"
+     "#ifndef VM_DEFER2\n#define VM_DEFER2 0\n#endif\n"
+     "static_assert(!(VM_BRED && VM_DP), \"m32e: VM_BRED and VM_DP use different split paths\");\n"),
+    ("if constexpr (VM_DEFER) {\npd.i = j * 16 + (ub >> 1);\n", "if constexpr (VM_DEFER || VM_DEFER2) {\npd.i = j * 16 + (ub >> 1);\n"),
+    ("if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));\n}\nconstexpr int UBL = PB ? 4 : 5;\n"
+     "const int j = u >> UBL, ub = u & ((1 << UBL) - 1);\nif (!(s0 == 0 && s1 == 16)) {\n",
+     "if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));\n}\n"
+     "if constexpr (VM_DEFER2) pend_flush(A, pd, q, wp, lane);\n"
+     "constexpr int UBL = PB ? 4 : 5;\nconst int j = u >> UBL, ub = u & ((1 << UBL) - 1);\nif (!(s0 == 0 && s1 == 16)) {\n"
+     "#if VM_BRED\nif constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); return; }\n#endif\n"),
+    ("if constexpr (VM_DEFER && !PB) pend_flush(A, pd, q, wp, lane);",
+     "if constexpr ((VM_DEFER || VM_DEFER2) && !PB) pend_flush(A, pd, q, wp, lane);"),
+    ("template <bool PB, int N>\n__device__ __forceinline__ void seg(",
+     _BRED_FN + "template <bool PB, int N>\n__device__ __forceinline__ void seg("),
+    ("a[m][2] += bf16r(v[jj][m].z) * w4[m].z * fr; a[m][3] += bf16r(v[jj][m].w) * w4[m].w * fr;\n}\n}\n}\n",
+     r"""a[m][2] += bf16r(v[jj][m].z) * w4[m].z * fr; a[m][3] += bf16r(v[jj][m].w) * w4[m].w * fr;
+}
+}
+}
+#if VM_BRED
+#pragma unroll
+for (int jj = 0; jj < 4; ++jj) {
+const int r = (c0 + jj < nloc) ? s_r[c0 + jj] : -1;
+if (r >= 0) {
+#pragma unroll
+for (int m = 0; m < 4; ++m) __stcg(reinterpret_cast<float4*>(A.y + (size_t)r * KDIM + 1024 * m + 4 * tid), z4);
+}
+}
+#endif
+"""),
+    ("(int64_t)vm::SMEM, VM_DP, VM_SC}; }", "(int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2}; }"),
+]
+CUDA_PATCHES = CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES
 
 # Python-level patches; @P@ = "" (lab) or "_vml_" (layer). Lab and layer spell some lines differently (indent, names).
 PY_PATCHES = [
