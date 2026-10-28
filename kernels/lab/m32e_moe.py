@@ -1470,6 +1470,7 @@ asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(reinterpret_c
 "r"(min(S, tot - off)) : "memory");
 }
 if (A.flags & 256) asm volatile("griddepcontrol.wait;\n" ::: "memory");   // PDL: ids / x come from the previous kernel
+SEGMK(if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * MKW + 8] = gtime();)
 uint8_t* scr = smem + NS * US + (NX - 1) * XS;
 int* hist = reinterpret_cast<int*>(scr);
 uint16_t* ent = reinterpret_cast<uint16_t*>(scr + 4096);

@@ -734,8 +734,11 @@ W5T_PATCHES = [
 # (span start, span end, old, new, count): replacements inside one function only
 SPAN_PATCHES = [("__device__ void route(", "__device__ void gather(", "__syncthreads();", "VM_RSYNC();", 6),
                 ("__device__ void route(", "__device__ void gather(", "i += NTH)", "i += VM_RNT)", 1)]
+# R-m32e-17 (marks only, VM_MKW 64): col 8 = globaltimer at the griddepcontrol.wait return (PDL wait vs route() split)
+_PDLW = 'if (A.flags & 256) asm volatile("griddepcontrol.wait;\\n" ::: "memory");   // PDL: ids / x come from the previous kernel\n'
+MK8_PATCHES = [(_PDLW, _PDLW + "SEGMK(if (tid == 0 && A.marks) A.marks[(size_t)blockIdx.x * MKW + 8] = gtime();)\n")]
 CUDA_PATCHES = (CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES + PS_PATCHES + AD_PATCHES + GF_PATCHES + UD_PATCHES
-                + UD2_PATCHES + W5T_PATCHES)
+                + UD2_PATCHES + W5T_PATCHES + MK8_PATCHES)
 CUDA_REPLACE_ALL = [("(A.flags & 512)", "VM_F9(A)")]   # every bit-9 test (compile-time 0 under VM_NOB9)
 
 # wgmma specializations with the B descriptor as one 64-bit operand (VM_UD); same formatting as the 32-bit-pair specs
