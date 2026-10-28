@@ -6,7 +6,7 @@ more variants in prepare for an in-layer A/B (box copy only). Base must be a fin
 gen_k3_m32.finish. Refuses to overwrite.
 
     python -I tools/gen_k3_vml9.py --lab-only --abvars=o,s        # kernels/lab/k3_vml_9_ab.py (A/B copy)
-    python -I tools/gen_k3_vml9.py --var=s                        # kernels/muse_decode_layer/k3_vml_9.py (+ its box copy)
+    python -I tools/gen_k3_vml9.py --var=s --lab=k3_vml_9s_ab     # kernels/muse_decode_layer/k3_vml_9.py (+ its box copy)
 """
 import hashlib
 import json
@@ -27,7 +27,7 @@ BASE = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_vf_10')}.py"
 VAR = ARGS.get("var", "")
 ABV = tuple(a for a in ARGS.get("abvars", "").split(",") if a)
 OUT = ROOT / f"kernels/muse_decode_layer/k3_vml_{N}.py"
-LAB = ROOT / f"kernels/lab/k3_vml_{N}_ab.py"
+LAB = ROOT / f"kernels/lab/{ARGS.get('lab', f'k3_vml_{N}_ab')}.py"   # --lab=<name>: another box-copy name
 TAG = f"k3-vml-{N}"
 NL = chr(10)
 FLAGS = {128: 193, 256: 193, 32: 193}
