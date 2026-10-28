@@ -30,7 +30,8 @@ VARS.update({"w1g8": W5(1, 56, 112, 8), "w1": W5(1, 32, 112, 2), "w2": W5(2, 32,
              "w2j72g1": W5(2, 32, 112, 1) + ("-DVM_JN=72", "-DVM_XSN=72"),
              "w2j96": W5(2, 32, 112, 2) + ("-DVM_JN=96", "-DVM_NX=2", "-DVM_XSN=96"),
              "w2j112": W5(2, 32, 112, 2) + ("-DVM_JN=112", "-DVM_NX=2", "-DVM_XSN=112"),
-             "j72": BASE + ("-DVM_JN=72", "-DVM_XSN=72"), "j72n2": BASE + ("-DVM_JN=72", "-DVM_NX=2", "-DVM_XSN=72")})
+             "j72": BASE + ("-DVM_JN=72", "-DVM_XSN=72"), "j72n2": BASE + ("-DVM_JN=72", "-DVM_NX=2", "-DVM_XSN=72"),
+             "w2c104": W5(2, 64, 104, 2), "w2j72c104": W5(2, 64, 104, 2) + ("-DVM_JN=72", "-DVM_XSN=72")})
 KEYS = ["R2UR", "IMAD.MOV", "UIADD3", "UMOV", "VIADD", "HGMMA", "REDUX", "SHFL", "STL", "LDL"]
 OBJ = "/root/cudaenv/lib/python3.14/site-packages/triton/backends/nvidia/bin/cuobjdump"
 
