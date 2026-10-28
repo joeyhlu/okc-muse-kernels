@@ -850,7 +850,7 @@ def _vfa_self_test(dev):
             clean = not (int(ws[2].abs().sum()) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
             print(f"[vfa] self-test B={B} ctx={ctx} L={L} page={page} kvs={kvs:g} #{rep}: rel {tot:.2e} row {row:.2e} vs K1 {vk:.2e} "
                   f"vs P206 {vp:.2e} ws {'clean' if clean else 'DIRTY'}", flush=True)
-            if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < 6e-2 and vp < 2e-2):
+            if not (bool(torch.isfinite(out.float()).all()) and clean and tot < 2e-2 and row < 6e-2 and vk < (6e-2 if L == 8 else 1.2e-1) and vp < 2e-2):   # K1 q_len 1 keeps f16 queries: wider gap
                 raise RuntimeError(f"self-test mismatch B={B} ctx={ctx} L={L} page={page}")
     # graph replay: identical output, and correct after new inputs are copied in
     d = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 411)
