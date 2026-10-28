@@ -231,7 +231,7 @@ __device__ __forceinline__ void producer(const Params& p, uint8_t* smem, const i
 
 // ---- consumer warpgroups (104 registers): warpgroup h = KV head h, warp w = tokens 2w, 2w + 1 (rows 16 w .. 16 w + 15) ----
 // DIAG (lab builds only): 1 = skeleton (wait / arrive only), 2 = no V^T + PV, 3 = no QK, 4 = exact per-tile row max,
-// 5 = valid variant: PV wait deferred to the next tile
+// 5 = valid variant: PV wait deferred to the next tile, 6 = valid variant: offset at the row max + P > 256 threshold
 template <int ST, int DIAG>
 __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const int* seg, const int* sN, int nseg, uint64_t* full,
                                          uint64_t* empt, int* misc, int tid, int pair, int pairs) {
@@ -240,6 +240,8 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
   const int g = lane >> 2, tig = lane & 3;
   const int hq = p.Hq;
   constexpr bool DEFER = (DIAG == 5);   // PV(i) waited at tile i + 1 (with QK(i + 1)) instead of at the end of tile i
+  constexpr float POF = (DIAG == 6) ? 0.f : POFF;              // DIAG 6: offset at the row max, move when P > 256 (lab)
+  constexpr uint32_t PBK = (DIAG == 6) ? 0x07070707u : PCHK;
   const float vs = __ldg(p.v_scale);
   const float ssc = p.qk_sm * __ldg(p.k_scale) * LOG2E;   // raw e4m3 x e4m3 score -> log2 units
   // wgmma descriptors: low word = (addr >> 4) | LBO 1; high word = SBO | layout (1: 128B swizzle, 2: 64B swizzle)
@@ -343,10 +345,10 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
           m0 = quad_max(m0) * ssc;
           m1 = quad_max(m1) * ssc;
           if (first) {
-            cr0 = (m0 == neg_inf()) ? 0.f : m0 - POFF;
-            cr1 = (m1 == neg_inf()) ? 0.f : m1 - POFF;
+            cr0 = (m0 == neg_inf()) ? 0.f : m0 - POF;
+            cr1 = (m1 == neg_inf()) ? 0.f : m1 - POF;
           } else {
-            const float n0 = fmaxf(m0 - POFF, cr0), n1 = fmaxf(m1 - POFF, cr1);
+            const float n0 = fmaxf(m0 - POF, cr0), n1 = fmaxf(m1 - POF, cr1);
             const float a0 = ex2(cr0 - n0), a1 = ex2(cr1 - n1);
 #pragma unroll
             for (int t = 0; t < 9; ++t) { acc[4 * t] *= a0; acc[4 * t + 1] *= a0; acc[4 * t + 2] *= a1; acc[4 * t + 3] *= a1; }
@@ -365,7 +367,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
         };
         pack();
         if (!first && DIAG != 4) {   // lazy offset: an e4m3 byte >= 0x7E (P >= 448, saturation) sets bit 7 of (byte + 2)
-          constexpr uint32_t PB = PCHK;
+          constexpr uint32_t PB = PBK;
           const uint32_t ov = ((pa[0][0] + PB) | (pa[0][1] + PB) | (pa[0][2] + PB) | (pa[0][3] + PB) |
                                (pa[1][0] + PB) | (pa[1][1] + PB) | (pa[1][2] + PB) | (pa[1][3] + PB)) & 0x80808080u;
           if (__any_sync(FULL, ov != 0u)) {   // rare: offsets up to this tile's row maxima - POFF, state rescaled, repacked (P <= 256 after)
@@ -377,7 +379,7 @@ __device__ __forceinline__ void consumer(const Params& p, uint8_t* smem, const i
             }
             m0 = quad_max(m0) * ssc;
             m1 = quad_max(m1) * ssc;
-            const float n0 = fmaxf(m0 - POFF, cr0), n1 = fmaxf(m1 - POFF, cr1);
+            const float n0 = fmaxf(m0 - POF, cr0), n1 = fmaxf(m1 - POF, cr1);
             const float a0 = ex2(cr0 - n0), a1 = ex2(cr1 - n1);
 #pragma unroll
             for (int t = 0; t < 9; ++t) { acc[4 * t] *= a0; acc[4 * t + 1] *= a0; acc[4 * t + 2] *= a1; acc[4 * t + 3] *= a1; }
@@ -599,6 +601,7 @@ static void vfa_diag(const Params& p, dim3 grid, cudaStream_t stream, bool pdl, 
       case 3: vfa_go<ST, 3, true>(p, grid, stream, pdl); return;
       case 4: vfa_go<ST, 4, true>(p, grid, stream, pdl); return;
       case 5: vfa_go<ST, 5, true>(p, grid, stream, pdl); return;
+      case 6: vfa_go<ST, 6, true>(p, grid, stream, pdl); return;
       default: break;
     }
   }
@@ -800,9 +803,13 @@ def _vfa_self_test(dev):
     gph.replay()
     torch.cuda.synchronize(dev)
     same = bool(torch.equal(og, o1))
-    f = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 412)
+    f = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 411)   # same seed = same shapes; fresh values
+    gen = torch.Generator(device=dev).manual_seed(412)
+    f["qkv"] = (torch.randn(f["qkv"].shape, generator=gen, device=dev) * 1.5).to(torch.bfloat16)
+    for c in ("k_cache", "v_cache"):
+        f[c] = torch.randn(f[c].shape, generator=gen, device=dev).to(FP8)
+    f2 = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in f.items()}
     o2 = _vfa_run(f["qkv"].view(128, -1), f, f["config"]).clone()
-    f2 = _k1_mk_case(dev, 16, 1200, 8, False, 1, 1.0, 412)
     for k, v in f2.items():
         if isinstance(v, torch.Tensor):
             d[k].copy_(v)
