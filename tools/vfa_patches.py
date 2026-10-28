@@ -8,7 +8,7 @@ packed P bytes, PV = FP8 wgmma RS, absolute-frame red.add merge + key-count tick
 Ours: new tokens by the FA4 prologue (all keys cached, causal mask), continuous ring across request segments, ticket finalize
 (no grid barrier), separate module built in the PT1 pool, self-test vs the reference / K1 L=8 / PR206 with a loud fallback.
 
-    python -I tools/vfa_patches.py [--n=1] [--base=k3_vf_10] [--lab-only] [--set=NAME=VALUE,...]
+    python -I tools/vfa_patches.py [--n=1] [--base=k3_vf_10] [--lab-only] [--slim-p206] [--set=NAME=VALUE,...]
         -> kernels/muse_decode_layer/k3_vfa_<n>.py + kernels/lab/vfa_k3_vfa_<n>_ab.py (byte-identical)
     python -I tools/vfa_patches.py --cuda > /tmp/vfa.cu       (the CUDA source alone, for kernels/lab/vfa_compile.py)
 """
@@ -783,10 +783,11 @@ def _vfa_self_test(dev):
             if kvs == 1.0 and _K1_MOD is not None:
                 d2 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
                 vk = _k1_rel_rows(out, _k1_run(d2["qkv"].view(B * 8, -1), d2, d2["config"]))[0]
-            if kvs == 1.0 and B >= P206_MIN_BATCH and page == 1:   # same prologue, different attention core: must agree closely
+            pr = globals().get("p206_run")   # absent when the bundle strips PR206 (VFA routes every verify-full B >= 2)
+            if pr is not None and kvs == 1.0 and B >= 16 and page == 1:   # same prologue, different attention core
                 try:
                     d3 = _k1_mk_case(dev, B, ctx, 8, False, page, kvs, seed)
-                    vp = _k1_rel_rows(out, p206_run(dict(d3, qkv=d3["qkv"].view(B * 8, -1)), pdl=False))[0]
+                    vp = _k1_rel_rows(out, pr(dict(d3, qkv=d3["qkv"].view(B * 8, -1)), pdl=False))[0]
                 except Exception as ex:
                     print(f"[vfa] (P206 comparison unavailable: {ex!r}"[:200] + ")", flush=True)
             clean = not (int(ws[2].abs().sum()) or float(ws[0].abs().sum()) or float(ws[1].abs().sum()))
@@ -845,7 +846,7 @@ def _vfa_prepare(state, t0):
         print(f"[vfa] LIVE: verify full {VFA_MIN_B} <= B <= {VFA_MAX_B}, stages {VFA_STAGES} (occupancy {_VFA['occ']}), segk {VFA_SEGK}, "
               f"pdl {VFA_PDL}, enable {VFA_ENABLE}, build {_K3_BUILD_S.get('vfa', 0):.0f}s, prepare so far {time.time() - t0:.1f}s", flush=True)
     except Exception as ex:
-        print(f"[vfa] FAILED, PR206 / FA4 route stays: {ex!r}"[:1500], flush=True)
+        print(f"[vfa] FAILED, the FA4 / K1 verify-full routes stay: {ex!r}"[:1500], flush=True)
         state["vfa_ok"] = False
 '''
 
@@ -872,6 +873,69 @@ def apply(text, sets=()):
     text = text.replace(KFN, block + KFN)
     text = text.replace(ROUTE_OLD, ROUTE_NEW).replace(JOBS_OLD, JOBS_NEW).replace(PREP_OLD, PREP_NEW)
     return text
+
+
+P206_HEAD = NL + "# " + "=" * 115 + NL + "# PR206 vendored (team joeyhlu): flash-attention PR #206"
+P206_TAIL = NL + NL + NL + "def _r1_attention(qkv, data, state):" + NL
+FA4_CORE_OLD = ("def _v18_fa4_core(qkv, data, pdl=True):" + NL +
+                "    if P206_ENABLE and P206_STATE[\"ready\"] and _p206_route(data):" + NL +
+                "        try:" + NL +
+                "            return p206_run(dict(data, qkv=qkv), pdl=pdl)" + NL +
+                "        except Exception as ex:" + NL +
+                "            P206_STATE[\"ready\"] = False" + NL +
+                "            print(f\"[p206] raised at call time, FA4 v8 from now on: {ex!r}\", flush=True)" + NL +
+                "    return k1fa4_run(dict(data, qkv=qkv), pdl=pdl)" + NL)
+FA4_CORE_NEW = "def _v18_fa4_core(qkv, data, pdl=True):" + NL + "    return k1fa4_run(dict(data, qkv=qkv), pdl=pdl)" + NL
+P206_PREP = "    _p206_prepare(state, t0)" + NL
+
+
+def strip_p206(text):
+    """Remove the vendored PR206 route (source, glue, prepare, dispatch): VFA routes every verify-full B >= 2 and FA4 v8 / K1
+    remain the fallbacks. Returns (text, removed_block). Every top-level name defined in the removed block must be unreferenced
+    afterwards (AST scan: ast.Name ids and attribute bases; plus a plain-text scan of the identifiers), as KL1 did for K2A v3.7."""
+    import ast
+    import re
+    a = text.index(P206_HEAD)
+    b = text.index(P206_TAIL, a)
+    removed = text[a:b]
+    text = text[:a] + text[b:]
+    assert text.count(FA4_CORE_OLD) == 1, "fa4 core"
+    text = text.replace(FA4_CORE_OLD, FA4_CORE_NEW)
+    assert text.count(P206_PREP) == 1, "p206 prepare call"
+    text = text.replace(P206_PREP, "")
+    defined = set()
+    for node in ast.parse(removed).body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tg in node.targets:
+                for n in ast.walk(tg):
+                    if isinstance(n, ast.Name):
+                        defined.add(n.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                defined.add((al.asname or al.name).split(".")[0])
+    tree = ast.parse(text)
+    still = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+            still.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tg in node.targets:
+                for n in ast.walk(tg):
+                    if isinstance(n, ast.Name):
+                        still.add(n.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                still.add((al.asname or al.name).split(".")[0])
+    gone = defined - still
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    dangling = sorted(gone & used)
+    assert not dangling, f"removed names still referenced: {dangling}"
+    words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
+    textual = sorted(n for n in gone if n in words and n not in ("p206_run",))   # p206_run: globals().get() in the VFA self-test
+    assert not textual, f"removed names still named in the text: {textual}"
+    return text, removed, sorted(gone)
 
 
 def cuda_source(lab=True):
@@ -1042,8 +1106,12 @@ def main():
     GM.check(GM.finish(b, bn, tag0, chk_base, []) == b, f"{base.name} is not a fixed point of finish()")
     rep.append(f"base {base.name} {len(b.encode())} B is a finish() fixed point")
     nonce = (f"# nonce {tag} ({base.stem} + VFA: flat warp-specialized FP8-wgmma verify-full attention, q_len 8, B >= 2, "
-             f"self-tested vs the reference / K1 with fallback{'; ' + ' '.join(f'{k}={v}' for k, v in sets) if sets else ''})")
+             f"self-tested vs the reference / K1 with fallback{'; PR206 route removed (VFA -> FA4 v8 / K1 -> r1)' if '--slim-p206' in sys.argv else ''}"
+             f"{'; ' + ' '.join(f'{k}={v}' for k, v in sets) if sets else ''})")
     t = apply(b.replace(bn, nonce), sets)
+    if "--slim-p206" in sys.argv:
+        t, removed, gone = strip_p206(t)
+        rep.append(f"PR206 removed: {len(removed.encode())} B, {len(gone)} top-level names, none referenced afterwards")
     if "--lab-only" in sys.argv:
         chk0 = GM.check
         GM.check = lambda ok, msg: chk0(ok or "file >= 1 MB" in msg, msg)
