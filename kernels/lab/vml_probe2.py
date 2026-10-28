@@ -6,6 +6,16 @@ weight stage + one x stage, 2 producer warps), with compile-time arms:
   PG_RES 0 stream from HBM, 1 resident (weights + x slot 0 loaded once, no ring waits: consumer-only time),
          2 resident + tensor only (constant A fragments, no LDS / dequant: wgmma time alone)
   PG_PP  1: WGs 2 / 3 start half a stage after WGs 0 / 1 (named-barrier handshake on the first stage)
+  R-vml-14 (notes/study/fable_review.md s2: is the N-growing stage excess F - C the x path?):
+  PG_XR  1: x resident (the CTA's first unit's stage-0 x loaded once into slot 0, never refilled; weights streamed as F;
+         results wrong by design, timing only)
+  PG_XL  1: x slices by cp.async (LDGSTS, 16 B per lane, all 32 lanes of the x-producer warp, completion through
+         cp.async.mbarrier.arrive.noinc) instead of the bulk-copy (TMA) unit; consumers fence.proxy.async after the wait
+  PG_XSW 1: x in the 128-byte-swizzled K-major wgmma B layout ([i 4][n][128 B], 16-B chunk q at q ^ (n & 7)) with a
+         SWIZZLE_128B descriptor (SBO 1024) instead of the no-swizzle core-matrix layout (SBO 4096, LBO 128)
+  PG_WS  1: lockstep break (papers_oct28 #1): every weight stage split into 4 per-WG sub-stages (9 KB: the WG's 8 KB of codes
+         + 1 KB of scales) with their own full / empty barriers, filled by lanes 0-3 of the weight-producer warp (one per WG),
+         so a WG waits only for its own 9 KB; the x ring stays shared (NX slots of slack between WGs)
 Stage time = kernel time x G / (units x 16).
 """
 import hashlib
@@ -46,6 +56,64 @@ BODY = r"""
 #ifndef PG_W2NP
 #define PG_W2NP 2
 #endif
+#ifndef PG_XR
+#define PG_XR 0
+#endif
+#ifndef PG_XL
+#define PG_XL 0
+#endif
+#ifndef PG_XSW
+#define PG_XSW 0
+#endif
+#ifndef PG_WS
+#define PG_WS 0
+#endif
+constexpr bool XFIX = PG_RES || PG_XR;   // x slot 0 for every stage, no x ring
+constexpr int WSB = 2 * (NS + NX);       // PG_WS barriers after the shared ones: full [q][slot], then empty [q][slot]
+constexpr int SMEM2 = SMEM + (PG_WS ? 8 * 8 * NS : 0);
+__device__ __forceinline__ void prod_w_ws(const Args& A, uint32_t ring, uint32_t bars, int u0, int u1, int q) {
+  const uint64_t pol = policy_evict_first();
+  int it = 0;
+  for (int u = u0; u < u1; ++u) {
+    const int2 un = A.unit[u];
+    const int e = A.job[un.x].x;
+    const uint8_t* wb = A.ws13 + ((size_t)e * 64 + 2 * un.y) * 16 * SW;
+    for (int s = 0; s < 16; ++s, ++it) {
+      const int sl = it % NS;
+      if (it >= NS) mbar_wait(bars + 8 * (WSB + 4 * NS + q * NS + sl), ((it / NS) & 1) ^ 1, A.err);
+      const uint32_t fb = bars + 8 * (WSB + q * NS + sl), dst = ring + sl * US + q * 9216;
+      const uint8_t* blk = wb + (size_t)((q >> 1) * 16 + s) * SW;
+      mbar_expect_tx(fb, 9216);
+      bulk_g2s_ef(dst, blk + (q & 1) * 8192, 8192, fb, pol);
+      bulk_g2s_ef(dst + 8192, blk + 16384 + (q & 1) * 1024, 1024, fb, pol);
+    }
+  }
+}
+__device__ __forceinline__ uint64_t wg_desc_sw(uint32_t a) {   // K-major SWIZZLE_128B: LBO 16 B (unused), SBO 1024 B
+  return (uint64_t)((a & 0x3FFFF) >> 4) | ((uint64_t)1 << 16) | ((uint64_t)(1024u >> 4) << 32) | ((uint64_t)1 << 62);
+}
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_mbar_arrive(uint32_t b) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(b) : "memory");
+}
+__device__ __forceinline__ void prod_x_l(const Args& A, uint32_t xring, uint32_t bars, int u0, int u1, int lane) {
+  int it = 0;
+  for (int u = u0; u < u1; ++u) {
+    const int4 jb = A.job[A.unit[u].x];
+    const uint32_t bytes = (uint32_t)jb.z * 512u;
+    const uint8_t* xs = A.xp + (size_t)jb.w;
+    for (int s = 0; s < 16; ++s, ++it) {
+      const int sl = it % NX;
+      if (it >= NX) mbar_wait(bars + 8 * (2 * NS + NX + sl), ((it / NX) & 1) ^ 1, A.err);
+      const uint8_t* src = xs + (size_t)s * bytes;
+      const uint32_t dst = xring + sl * XS;
+      for (uint32_t c = lane; c < bytes / 16; c += 32) cp_async16(dst + 16 * c, src + 16 * c);
+      cp_async_mbar_arrive(bars + 8 * (2 * NS + sl));
+    }
+  }
+}
 constexpr int NCW2 = PG_W2 ? 8 : NCW;   // W2: 2 consumer WGs x 128 rows (two m64 accumulator chains per WG)
 constexpr int NTH2 = PG_W2 ? 32 * 8 + 64 : (PG_RG ? 32 * NCW + 128 : NTH);
 constexpr int GS = PG_GS, NPD = PG_NP, NB = PG_NP + 1, GPS = 16 / PG_GS, RES = PG_RES;
@@ -59,35 +127,36 @@ __device__ __forceinline__ void dec_half(uint32_t w0, uint32_t w8, uint32_t Sg, 
   for (int j = 0; j < 4; ++j) { hh[j] = bmul2(hh[j], Sg); hh[4 + j] = bmul2(hh[4 + j], S8); }
 }
 template <int N, bool Z>
-__device__ __forceinline__ void mma2(float* d, const uint32_t* hh, uint32_t dlo, uint32_t dhi) {
+__device__ __forceinline__ void mma2(float* d, const uint32_t* hh, uint32_t dlo, uint32_t dhi, uint32_t step2 = 16) {
   if constexpr (Z) wgmma_zero<N>(d, hh[0], hh[4], hh[1], hh[5], dlo, dhi);
   else wgmma_acc<N>(d, hh[0], hh[4], hh[1], hh[5], dlo, dhi);
-  wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + 16, dhi);
+  wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + step2, dhi);
 }
 
 template <int N>
 __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bars, int& it, int& prevx, float* d,
                                       uint32_t (&hb)[NB][4 * GS], int q, int wp, int lane, bool first, bool pp_arrive) {
-  const int ws = RES ? 0 : it % NS, xs = RES ? 0 : it % NX;
-  if constexpr (!RES) mbar_wait(bars + 8 * ws, (it / NS) & 1, A.err);
-  const uint8_t* st = smem + ws * US + (q >> 1) * SW;
+  const int ws = RES ? 0 : it % NS, xs = XFIX ? 0 : it % NX;
+  if constexpr (!RES) mbar_wait(bars + 8 * (PG_WS ? WSB + q * NS + ws : ws), (it / NS) & 1, A.err);
+  const uint8_t* st = PG_WS ? smem + ws * US + q * 9216 : smem + ws * US + (q >> 1) * SW;
   const int tile = (q & 1) * 4 + wp;
   uint4 c[4];
   uint32_t sw0 = 0, sw1 = 0;
   if constexpr (RES < 2) {
-    const uint4* cp = reinterpret_cast<const uint4*>(st + tile * 2048) + lane;
-    const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + 16384 + tile * 256) + lane;
+    const uint4* cp = reinterpret_cast<const uint4*>(st + (PG_WS ? wp : tile) * 2048) + lane;
+    const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + (PG_WS ? 8192 + wp * 256 : 16384 + tile * 256)) + lane;
 #pragma unroll
     for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
     sw0 = sp[0]; sw1 = sp[32];
   }
   if constexpr (!RES) {
     __syncwarp();
-    if (lane == 0) mbar_arrive(bars + 8 * (NS + ws));
-    mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
+    if (lane == 0) mbar_arrive(bars + 8 * (PG_WS ? WSB + 4 * NS + q * NS + ws : NS + ws));
+    if constexpr (!PG_XR) mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
+    if constexpr (PG_XL) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncwarp();
   }
-  const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);
+  const uint64_t d0 = PG_XSW ? wg_desc_sw(sa(smem + NS * US + xs * XS)) : wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);
   const uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
 #pragma unroll
   for (int gi = 0; gi < GPS; ++gi) {
@@ -111,13 +180,15 @@ __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bar
     wg_fence();
 #pragma unroll
     for (int h2 = 0; h2 < GS / 2; ++h2) {
-      const uint32_t off = 16u * (uint32_t)(gi * GS + 2 * h2);
-      if (first && gi == 0 && h2 == 0) mma2<N, true>(d, hh + 8 * h2, dlo + off, dhi);
-      else mma2<N, false>(d, hh + 8 * h2, dlo + off, dhi);
+      const uint32_t kk = (uint32_t)(gi * GS + 2 * h2);   // k16 step (even); SW128: k64 block kk >> 2, 32 B per step inside
+      const uint32_t off = PG_XSW ? (kk >> 2) * (uint32_t)N * 8u + (kk & 3u) * 2u : 16u * kk;
+      const uint32_t st2 = PG_XSW ? 2u : 16u;
+      if (first && gi == 0 && h2 == 0) mma2<N, true>(d, hh + 8 * h2, dlo + off, dhi, st2);
+      else mma2<N, false>(d, hh + 8 * h2, dlo + off, dhi, st2);
     }
     wg_commit();
     wg_wait<NPD>();
-    if constexpr (!RES) {
+    if constexpr (!XFIX) {
       if (gi == NPD - 1 && prevx >= 0) {   // the previous stage's last group retired: its x slot is free
         if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
         prevx = -1;
@@ -127,7 +198,7 @@ __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bar
       if (pp_arrive && gi == GPS / 2 - 1) bar_arrive_n(9, 512);
     }
   }
-  if constexpr (!RES) prevx = xs;
+  if constexpr (!XFIX) prevx = xs;
   ++it;
 }
 
@@ -145,7 +216,7 @@ __device__ __forceinline__ void unit_run(const Args& A, uint8_t* smem, uint32_t 
   for (int s = 1; s < 16; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false, false);
   wg_wait<0>();
   if constexpr (!RES) {
-    if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
+    if (!XFIX && lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
     const int2 un = A.unit[u];
     const int4 jb = A.job[un.x];
     const float gs = __ldg(A.gsc13 + jb.x);
@@ -340,8 +411,12 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
   const uint32_t bars = sa(smem + BAR_OFF);
   if (tid == 0) {
     for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW2); }
-    for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW2); }
+    for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), PG_XL ? 32 : 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW2); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    if constexpr (PG_WS) {
+      for (int i = 0; i < 4 * NS; ++i) { mbar_init(bars + 8 * (WSB + i), 1); mbar_init(bars + 8 * (WSB + 4 * NS + i), 4); }
+      asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
     if (A.marks) A.marks[(size_t)blockIdx.x * 8] = gtime();
   }
   __syncthreads();
@@ -365,16 +440,33 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
           mbar_expect_tx(bars + 8 * (2 * NS), bytes);
           bulk_g2s(sa(smem + NS * US), A.xp + (size_t)jb.w, bytes, bars + 8 * (2 * NS));
         }
+      } else if constexpr (PG_XR) {   // weights streamed, x stage 0 of the first unit once into slot 0
+        if (warp == NCW2) { if constexpr (!PG_WS) prod_w(A, sa(smem), bars, rg.x, rg.y); }
+        else {
+          const int4 jb = A.job[A.unit[rg.x].x];
+          const uint32_t bytes = (uint32_t)jb.z * 512u;
+          mbar_expect_tx(bars + 8 * (2 * NS), bytes);
+          bulk_g2s(sa(smem + NS * US), A.xp + (size_t)jb.w, bytes, bars + 8 * (2 * NS));
+        }
       } else {
-        if (warp == NCW2) prod_w(A, sa(smem), bars, rg.x, rg.y);
-        else prod_x(A, sa(smem + NS * US), bars, rg.x, rg.y);
+        if (warp == NCW2) { if constexpr (!PG_WS) prod_w(A, sa(smem), bars, rg.x, rg.y); }
+        else if constexpr (!PG_XL) prod_x(A, sa(smem + NS * US), bars, rg.x, rg.y);
       }
+    }
+    if constexpr (PG_WS && !RES) {
+      if (warp == NCW2 && lane < 4) prod_w_ws(A, sa(smem), bars, rg.x, rg.y, lane);
+    }
+    if constexpr (PG_XL && !RES) {
+      if (warp == NCW2 + 1) prod_x_l(A, sa(smem + NS * US), bars, rg.x, rg.y, lane);
     }
     return;
   }
   if constexpr (PG_RG && !PG_W2) asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(PG_RC) : "memory");
   if constexpr (RES) {
     mbar_wait(bars, 0, A.err);
+    mbar_wait(bars + 8 * (2 * NS), 0, A.err);
+    __syncwarp();
+  } else if constexpr (PG_XR) {
     mbar_wait(bars + 8 * (2 * NS), 0, A.err);
     __syncwarp();
   }
@@ -415,12 +507,12 @@ __global__ void __launch_bounds__(NTH2, 1) vp2_kernel(const Args A) {
 }  // namespace vp
 
 std::vector<int64_t> vp2_attrs() {
-  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM);
+  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
   cudaFuncAttributes fa;
   cudaFuncGetAttributes(&fa, vp::vp2_kernel);
   int occ = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, vp::vp2_kernel, vp::NTH2, vp::SMEM);
-  return {fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)vp::SMEM, occ};
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, vp::vp2_kernel, vp::NTH2, vp::SMEM2);
+  return {fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)vp::SMEM2, occ};
 }
 
 void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::Tensor jbase, torch::Tensor unit,
@@ -436,8 +528,8 @@ void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::
   a.inter = reinterpret_cast<__nv_bfloat16*>(inter.data_ptr());
   a.err = err.data_ptr<int>();
   a.marks = marks.numel() >= G * 8 ? reinterpret_cast<long long*>(marks.data_ptr()) : nullptr;
-  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM);
-  vp::vp2_kernel<<<(int)G, vp::NTH2, vp::SMEM, at::cuda::getCurrentCUDAStream()>>>(a);
+  cudaFuncSetAttribute(vp::vp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, vp::SMEM2);
+  vp::vp2_kernel<<<(int)G, vp::NTH2, vp::SMEM2, at::cuda::getCurrentCUDAStream()>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
@@ -450,7 +542,20 @@ void vp2_run(torch::Tensor ws13, torch::Tensor gsc13, torch::Tensor job, torch::
              torch::Tensor cta, torch::Tensor xp, torch::Tensor inter, torch::Tensor err, torch::Tensor marks, int64_t G);
 """
 ARMS = {"F": {}, "PP": {"PG_PP": 1}, "C": {"PG_RES": 1},
-        "W2": {"PG_W2": 1, "PG_W2NP": 2}, "W2a": {"PG_W2": 1, "PG_W2NP": 1}, "M": {"PG_MMA": 1}}
+        "W2": {"PG_W2": 1, "PG_W2NP": 2}, "W2a": {"PG_W2": 1, "PG_W2NP": 1}, "M": {"PG_MMA": 1},
+        "XR": {"PG_XR": 1}, "XL": {"PG_XL": 1}, "XSW": {"PG_XSW": 1}, "XLSW": {"PG_XL": 1, "PG_XSW": 1},
+        "WS": {"PG_WS": 1}, "WSXR": {"PG_WS": 1, "PG_XR": 1}}
+NOCHECK = ("PG_RES", "PG_XR")   # timing-only arms (results wrong by design)
+
+
+def to_sw128(xp, npad):
+    """K2A core-matrix x stages ([s][n8][i 4][q 8][r 8][16 B]) -> the SW128 K-major layout of PG_XSW per stage:
+    [s][i 4][n = 8 n8 + r][chunk p 8][16 B] with chunk p holding core matrix q = p ^ r (bytes only, lossless)."""
+    X = xp.view(-1, 16, npad // 8, 4, 8, 8, 16).permute(0, 1, 3, 2, 5, 4, 6)   # [e][s][i][n8][r][q][16]
+    r = torch.arange(8, device=xp.device)
+    qidx = (torch.arange(8, device=xp.device)[None, :] ^ r[:, None])           # [r][p] -> q
+    Y = X[:, :, :, :, r[:, None], qidx, :]                                       # [e][s][i][n8][r][p][16]
+    return Y.contiguous().view(torch.uint8).reshape(-1)
 
 
 def flags_of(arm):

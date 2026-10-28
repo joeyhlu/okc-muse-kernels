@@ -17,6 +17,7 @@ vm_main: grid = SMs, 576 threads (16 consumer warps = 4 WGs, weight producer war
 vm_fin: grid = M, 256 threads: K2A K3 numerics (bf16r(y) * nw, ss, rsqrt(ss / 4096 + 1e-8) * wt, slot order), and block 0
   resets xready / doneA / fixup counters for the next call. Bounded waits only (error flag, no trap).
 Lab v9: marks cols 24..28 from the x producer (B doneA wait ns / count, A xready wait ns, first / last B acquire); only with marks.
+Lab v11: marks cols 29..31 = %smid and two L2 latency probes (cycles per dependent ld.cg, addresses 4 KB apart); marks only.
 Lab v10: flags bit 9 = each job's 16 phase-B stages in order of predicted A-unit readiness (afin / bperm_lanes, computed by the
 x-producer warp's idle lanes during phase A; consumers unchanged: only the K order of the B sums changes).
 """
@@ -189,6 +190,16 @@ __device__ __forceinline__ long long gtime() {
   long long t;
   asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
   return t;
+}
+__device__ __noinline__ long long lat_probe(const uint8_t* p, int flags) {   // marks only: cycles per dependent L2 load
+  const unsigned z = (unsigned)flags >> 30;   // 0, opaque to the compiler
+  unsigned v;
+  asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  const long long t0 = clock64();
+#pragma unroll 1
+  for (int k = 0; k < 8; ++k) asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(v) : "l"(p + (v & z)) : "memory");
+  asm volatile("add.u32 %0, %0, 0;\n" : "+r"(v));
+  return (clock64() - t0 + (long long)(v & z)) / 7;
 }
 __device__ __forceinline__ uint64_t wg_desc_sa(uint32_t a, uint32_t sbo) {
   return (uint64_t)((a & 0x3FFFF) >> 4) | ((uint64_t)(128u >> 4) << 16) | ((uint64_t)(sbo >> 4) << 32);
@@ -780,7 +791,15 @@ __global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {
     for (int i = 0; i < NS; ++i) { mbar_init(bars + 8 * i, 1); mbar_init(bars + 8 * (NS + i), NCW); }
     for (int i = 0; i < NX; ++i) { mbar_init(bars + 8 * (2 * NS + i), 1); mbar_init(bars + 8 * (2 * NS + NX + i), NCW); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-    if (A.marks) A.marks[(size_t)blockIdx.x * 32] = gtime();
+    if (A.marks) {   // v11: SM id + two L2 latency probes (4 KB apart: H200 partition class), then the start mark
+      long long* m = A.marks + (size_t)blockIdx.x * 32;
+      unsigned smid;
+      asm volatile("mov.u32 %0, %%smid;\n" : "=r"(smid));
+      m[29] = smid;
+      m[30] = lat_probe(A.ws13, A.flags);
+      m[31] = lat_probe(A.ws13 + 4096, A.flags);
+      m[0] = gtime();
+    }
   } else if (tid == 32 && (A.flags & 2)) {
     const uint32_t tot = (uint32_t)A.M * (KDIM * 2), S = (mdiv(tot + gridDim.x - 1, A.magG) + 15u) & ~15u, off = blockIdx.x * S;
     if (off < tot)
