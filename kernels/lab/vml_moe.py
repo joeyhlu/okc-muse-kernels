@@ -17,6 +17,10 @@ vm_main: grid = SMs, 576 threads (16 consumer warps = 4 WGs, weight producer war
 vm_fin: grid = M, 256 threads: K2A K3 numerics (bf16r(y) * nw, ss, rsqrt(ss / 4096 + 1e-8) * wt, slot order), and block 0
   resets xready / doneA / fixup counters for the next call. Bounded waits only (error flag, no trap).
 Lab v9: marks cols 24..28 from the x producer (B doneA wait ns / count, A xready wait ns, first / last B acquire); only with marks.
+Lab v13: compile-time VM_TRICKS (default 1; build(defines=["-DVM_TRICKS=0"]) = the v12 consumer) on the RS-wgmma stage
+(nt >= 3 with bit 7): codes one 4-step group ahead (weight slot freed after the last group's load), deq4's two left shifts as
+multiplies by opaque constants (FMA pipe), one PRMT + IMAD for both rows' scales with half-broadcast multiplies, x
+descriptor = slot-0 descriptor + slot offset (R-vml-15 probe ALL: -1.1..-3.4 % per stage; bitwise-identical products).
 Lab v12: compile-time VM_DEFER = 1 (build(defines=["-DVM_DEFER=1"])): a phase-A whole unit's proxy fence + WG barrier +
 doneA red.release are not issued after its SwiGLU stores but kept in a per-WG pending record and flushed behind commit
 group 3 of the WG's next segment's first stage (mma.sync path: after its first stage), and at the end of phase A (never
@@ -586,6 +590,39 @@ __device__ __forceinline__ void mma2(float* d, const uint32_t* hh, uint32_t dlo,
 #ifndef VM_DEFER
 #define VM_DEFER 0
 #endif
+#ifndef VM_TRICKS
+#define VM_TRICKS 1
+#endif
+#ifndef VM_TRICKS_DQ
+#define VM_TRICKS_DQ 1   // 0: VM_TRICKS without the opaque-multiply dequant (2 registers fewer)
+#endif
+__device__ __forceinline__ void deq4_dq(uint32_t w, uint32_t* o, uint32_t k64, uint32_t k4) {   // == deq4 (same bits)
+  o[0] = w & 0x81C081C0u;
+  o[1] = (w * k64) & 0x81C081C0u;                                  // rotl 6: the mask keeps no wrapped bit
+  o[2] = __funnelshift_l(w, w, 12) & 0x81C081C0u;
+  o[3] = ((w >> 6) & 0x01000100u) | ((w * k4) & 0x80C080C0u);
+}
+__device__ __forceinline__ uint32_t bmul2l(uint32_t a, uint32_t b) {   // a x (b.lo, b.lo): HMUL2 .H0_H0
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __low2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+__device__ __forceinline__ uint32_t bmul2h(uint32_t a, uint32_t b) {   // a x (b.hi, b.hi): HMUL2 .H1_H1
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __high2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+// w0 = row g, w8 = row g + 8 (2 k16 steps each); sgp = (row g scale, row g + 8 scale) as one bf16x2
+__device__ __forceinline__ void dec_half2(uint32_t w0, uint32_t w8, uint32_t sw2, uint32_t par, uint32_t* hh, uint32_t k16,
+                                          uint32_t k64, uint32_t k4) {
+#if VM_TRICKS_DQ
+  deq4_dq(w0, hh, k64, k4); deq4_dq(w8, hh + 4, k64, k4);
+#else
+  deq4(w0, hh); deq4(w8, hh + 4);
+#endif
+  const uint32_t sb = 2u * par;
+  const uint32_t sgp = __byte_perm(sw2, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16 + 0x75807580u;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) { hh[j] = bmul2l(hh[j], sgp); hh[4 + j] = bmul2h(hh[4 + j], sgp); }
+}
 struct Pend { int i; };   // doneA index (job x 16 + unit / 2) whose release is still pending (< 0: none); WG-uniform
 __device__ __forceinline__ void pend_flush(const Args& A, Pend& pd, int q, int wp, int lane) {
   if (pd.i >= 0) {
@@ -605,24 +642,45 @@ __device__ __forceinline__ void stage(const Args& A, uint8_t* smem, uint32_t bar
   const uint4* cp = reinterpret_cast<const uint4*>(st + tile * 2048) + lane;
   const uint32_t* sp = reinterpret_cast<const uint32_t*>(st + 16384 + tile * 256) + lane;
   uint4 c[4];
+#if VM_TRICKS
+  c[0] = cp[0];
+  const uint32_t sw0 = sp[0], sw1 = sp[32];
+#else
 #pragma unroll
   for (int i = 0; i < 4; ++i) c[i] = cp[32 * i];
   const uint32_t sw0 = sp[0], sw1 = sp[32];
   __syncwarp();
   if (lane == 0) mbar_arrive(bars + 8 * (NS + ws));
+#endif
   mbar_wait(bars + 8 * (2 * NS + xs), (it / NX) & 1, A.err);
   __syncwarp();
+#if VM_TRICKS
+  const uint32_t zo = (uint32_t)A.flags >> 30;   // 0 (flags < 2^30), opaque to the compiler
+  const uint32_t k16 = 16u + zo, k64 = VM_TRICKS_DQ ? 64u + zo : 64u, k4 = VM_TRICKS_DQ ? 4u + zo : 4u;
+  const uint64_t d0 = wg_desc_sa(sa(smem + NS * US), 4096u);
+  const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);
+#else
   const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);
   const uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
+#endif
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const uint32_t sw2 = (i < 2) ? sw0 : sw1, par = i & 1;
+#if VM_TRICKS
+    if (i < 3) c[i + 1] = cp[32 * (i + 1)];   // the next 4-step group's codes, one group ahead
+#else
     const uint32_t Sg = __byte_perm(sw2, 0u, 0x4040u + 0x0202u * par) * 16u + 0x75807580u;
     const uint32_t S8 = __byte_perm(sw2, 0u, 0x4141u + 0x0202u * par) * 16u + 0x75807580u;
+#endif
 #pragma unroll
     for (int hf = 0; hf < 2; ++hf) {
       uint32_t* hh = hb[hf];
+#if VM_TRICKS
+      dec_half2(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, sw2, par, hh, k16, k64, k4);
+      if (i == 3 && hf == 0) { __syncwarp(); if (lane == 0) mbar_arrive(bars + 8 * (NS + ws)); }   // all codes in registers
+#else
       dec_half(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, Sg, S8, hh);
+#endif
       wg_fence();
       if (first && i == 0 && hf == 0) mma2<N, true>(d, hh, dlo + 64 * i + 32 * hf, dhi);
       else mma2<N, false>(d, hh, dlo + 64 * i + 32 * hf, dhi);

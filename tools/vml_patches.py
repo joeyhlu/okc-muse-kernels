@@ -57,17 +57,22 @@ VML_ENABLE = True
 VML_BUCKETS = {128: True, 256: True, 32: @VML32@}
 VML_FLAGS = @VMLFLAGS@
 VML_COST = @VMLCOST@
-_VML = {"mod": None, "sc": None, "ok": {}, "err": None}
+VML_VAR = @VMLVAR@        # compile-time variant of the lab kernel this file runs (key of _VML_DEFS; read at call time)
+VML_ABVARS = @VMLABVARS@  # extra variants built in prepare for an in-layer A/B only (empty in a ship file)
+_VML_DEFS = {"": (), "o": ("-DVM_TRICKS=0",), "s": ("-DVM_TRICKS_DQ=0",)}
+_VML = {"mod": None, "mods": {}, "sc": None, "ok": {}, "err": None}
 
 
 def _vml_build_job():
-    _VML["mod"], _ = _vml_build()
+    for v in (VML_VAR,) + tuple(a for a in VML_ABVARS if a != VML_VAR):
+        _VML["mods"][v], _ = _vml_build(defines=_VML_DEFS[v])
+    _VML["mod"] = _VML["mods"][VML_VAR]
 
 
 def _vml_route(st, data):
     x = data["hidden_states"].contiguous()
     rep = _k2a_bucket_of(x.shape[0])
-    return _vml_call(_VML["mod"], st, _VML["sc"], x, data["topk_ids"].to(torch.int32).contiguous(),
+    return _vml_call(_VML["mods"].get(VML_VAR, _VML["mod"]), st, _VML["sc"], x, data["topk_ids"].to(torch.int32).contiguous(),
                      data["topk_weights"].to(torch.float32).contiguous(), int(data["config"]["local_start"]),
                      flags=VML_FLAGS.get(rep), cost=VML_COST.get(rep))
 
@@ -153,6 +158,12 @@ CALL_NEW = """    rep = _k2a_bucket_of(x.shape[0])
 ANCHOR = "\nK2A36_ENABLE = True\n"
 
 
+def _glue(t32, flags, cost, var="", abvars=()):
+    return (GLUE.replace("@VML32@", "True" if t32 else "False").replace("@VMLFLAGS@", repr(dict(flags or {})))
+            .replace("@VMLCOST@", repr({k: list(v) for k, v in (cost or {}).items()}))
+            .replace("@VMLVAR@", repr(var)).replace("@VMLABVARS@", repr(tuple(abvars))))
+
+
 def apply(text, t32=False, flags=None, cost=None):
     """flags / cost: per-bucket dicts {rep: int} / {rep: [16 ints]} baked in as VML_FLAGS / VML_COST (None = lab defaults)."""
     for old in (PT1_OLD, PREP_OLD, CALL_OLD, ANCHOR):
@@ -161,14 +172,13 @@ def apply(text, t32=False, flags=None, cost=None):
     for nm in names:
         assert ("_vml_" + nm.lstrip("_")) not in text, nm
     text = text.replace(PT1_OLD, PT1_NEW).replace(PREP_OLD, PREP_NEW).replace(CALL_OLD, CALL_NEW)
-    glue = (GLUE.replace("@VML32@", "True" if t32 else "False").replace("@VMLFLAGS@", repr(dict(flags or {})))
-            .replace("@VMLCOST@", repr({k: list(v) for k, v in (cost or {}).items()})))
+    glue = _glue(t32, flags, cost)
     text = text.replace(ANCHOR, "\n" + block + glue + ANCHOR)
     ast.parse(text)
     return text
 
 
-def replace(text, t32=False, flags=None, cost=None):
+def replace(text, t32=False, flags=None, cost=None, var="", abvars=()):
     """For a base that already carries a VML block (e.g. k3_va_3): swap the block + glue for the current lab source; the
     PT1 job, prepare call and route hook stay as they are (same names). Asserts exactly one old block."""
     START_OLD = "_vml_E_LOC, _vml_TOPK, _vml_KDIM = 32, 8, 4096\n"
@@ -178,8 +188,7 @@ def replace(text, t32=False, flags=None, cost=None):
         assert text.count(new) == 1, new[:80]
     a, b = text.index(START_OLD), text.index(ANCHOR)
     block, _ = lab_block()
-    glue = (GLUE.replace("@VML32@", "True" if t32 else "False").replace("@VMLFLAGS@", repr(dict(flags or {})))
-            .replace("@VMLCOST@", repr({k: list(v) for k, v in (cost or {}).items()})))
+    glue = _glue(t32, flags, cost, var, abvars)
     text = text[:a] + block + glue + text[b:]
     ast.parse(text)
     return text
