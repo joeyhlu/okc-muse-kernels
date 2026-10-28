@@ -63,7 +63,7 @@ __device__ __forceinline__ bool va2_softmax_lazy(float (&S)[32], const float (&m
 // Registers: 2 CTAs/SM put 5-6 warps on an SM sub-partition (16 K regs each). PW 1: 288 threads, ptxas caps at 96 regs.
 // PW 4: 384 threads (launch 80 regs), the producer warpgroup drops to 32 and the consumers rise to 104 (setmaxnreg;
 // the pool must balance per sub-partition: 4 x (80 - 32) >= 8 x (104 - 80), else setmaxnreg.inc never returns).
-template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0>
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #if K1_ARCH_OK
   constexpr int L = 8;
@@ -277,7 +277,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         }
       }
     }
-    if (nt > 0) {
+    if (!PF && nt > 0) {
       va_wait(full + n % ST, (n / ST) & 1);
       if (DG != 1 && DG != 5) transpose_v(n);
     }
@@ -290,9 +290,17 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     uint32_t pa[2][4];
     for (int i = 0; i < nt; ++i, ++n) {
       const int ts = k0 + i * TILE;
+      if (PF) {
+        va_wait(full + n % ST, (n / ST) & 1);
+        fence_async_smem();                          // the producers' cp.async K rows -> the wgmma (async proxy)
+      }
       if (DG != 4 && DG != 5) qk_issue(S, dq, desc_il(smem + (n % ST) * STAGE_BYTES + h * 4096, 128, 512));
-      if (NVT == 2) wg_wait<1>();                    // PV(i-1) done: V^T buffer (n + 1) % 2 is free (QK(i) may run)
-      if (i + 1 < nt) {
+      if (PF) {
+        if (DG != 1 && DG != 5) transpose_v(n);
+        fence_async_smem();
+      }
+      if (!PF && NVT == 2) wg_wait<1>();             // PV(i-1) done: V^T buffer (n + 1) % 2 is free (QK(i) may run)
+      if (!PF && i + 1 < nt) {
         va_wait(full + (n + 1) % ST, ((n + 1) / ST) & 1);
         if (DG != 1 && DG != 5) transpose_v(n + 1);
         fence_async_smem();
@@ -401,11 +409,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 '''
 
 VA2_HOST = r'''
-template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0>
 static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
   static bool attr = false;
   if (!attr) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV, NB, DG, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT, NB>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT, NB>()));
     attr = true;
   }
   int nb = 0;
@@ -416,8 +424,8 @@ static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT, NB>(); cfg.stream = s;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP>, *p));
-  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP>, 256 + 32 * PW, k1::va2_smem<ST, NVT, NB>()));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, *p));
+  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, 256 + 32 * PW, k1::va2_smem<ST, NVT, NB>()));
   return nb;
 }'''
 
@@ -452,14 +460,14 @@ def _va2_run(qkv, data, cfg, segk=None, pdl=None):
 def _va2_probes(qkv, data, cfg):
     B, hq, hkv = cfg["batch"], cfg["num_q_heads"], cfg["num_kv_heads"]
     dev = qkv.device
-    G = max(B + 1, _k1_sms(dev) * max(1, min(2, _K1_OCC.get((8, 348, str(dev)), 1))) // (hkv // 2))
+    G = max(B + 1, _k1_sms(dev) * max(1, min(2, _K1_OCC.get((8, 351, str(dev)), 1))) // (hkv // 2))
     ws = _VA1_WS[str(dev)]
     for dg in VA2_PROBES:
         scratch = torch.empty((B, 8, hq * 64), dtype=torch.bfloat16, device=dev)
         _K1_MOD.k1_forward(qkv, data["seq_lens"], data["cache_loc"], data["page_table"], data["k_cache"].view(torch.uint8),
                            data["v_cache"].view(torch.uint8), data["k_scale"], data["v_scale"], ws[2], ws[0], ws[1], scratch,
                            ws[3], B, 8, hq, hkv, 1, cfg["page_size"].bit_length() - 1, G, max(1, int(VA2_SEGK)), 0,
-                           float(cfg["qk_scale_factor"] * cfg["sm_scale"]), 1, 4, 1000 * int(dg) + 348)
+                           float(cfg["qk_scale_factor"] * cfg["sm_scale"]), 1, 4, 1000 * int(dg) + 351)
 
 
 def _va2_try(qkv, data, cfg, state):
@@ -496,7 +504,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 345, 347, 348, 349):
+        for code in (303, 345, 347, 348, 349, 350, 351):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -517,7 +525,7 @@ def _va2_prepare(state):
             print(f"[va2] probes {VA2_PROBES}: workspace {'clean' if state['va2_probes_ok'] else 'DIRTY (probes off)'}", flush=True)
             for t_ in ws:
                 t_.zero_()
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349)]} (variant {VA2_VAR}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349, 350, 351)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
@@ -531,20 +539,24 @@ def va2_patches(text):
     K1_MAIN = "template <int L, int ST>\n__global__ void __launch_bounds__(NTHR, (L == 1) ? 2 : K1_L8_MINB) k1_main(const Params p) {"
     steps = (
         ("VA2 kernel", K1_MAIN, VA2_CUDA + K1_MAIN),
-        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 1000 && ST % 1000 == 348 && ST < 6000) || ST == 303 || ST == 313 || ST == 345 || ST == 355 || "
-         "ST == 347 || ST == 357 || ST == 348 || ST == 358 || ST == 349 || ST == 359); }"),
+        ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 1000 && ST % 1000 == 351 && ST < 6000) || ST == 303 || ST == 313 || ST == 345 || ST == 355 || "
+         "ST == 347 || ST == 357 || ST == 348 || ST == 358 || ST == 349 || ST == 359 || ST == 350 || ST == 360 || ST == 351 || ST == 361); }"),
         ("VA2 host", "int64_t k1_occupancy(int64_t L, int64_t ST) {", VA2_HOST + "\n\nint64_t k1_occupancy(int64_t L, int64_t ST) {"),
         ("occupancy", "  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>",
-         "  if (ST > 300) return (int64_t)(ST % 10 == 9 ? va2_go<4, 4, 3, 2, 1>(nullptr, dim3(1), 0, false) : "
+         "  if (ST > 300) return (int64_t)(ST == 350 ? va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
+         "ST == 351 ? va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
+         "ST % 10 == 9 ? va2_go<4, 4, 3, 2, 1>(nullptr, dim3(1), 0, false) : "
          "ST % 10 == 8 ? va2_go<4, 4, 3, 1, 1, VA2_DIAG, 48>(nullptr, dim3(1), 0, false) : ST % 10 == 7 ? "
          "va2_go<4, 4, 3, 1, 1>(nullptr, dim3(1), 0, false) : ST % 10 == 5 ? va2_go<4, 4, 2, 1>(nullptr, dim3(1), 0, false) : "
          "va2_go<3, 1, 3>(nullptr, dim3(1), 0, false));\n  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>"),
         ("launch", "  if (stages > 200) {",
          "  if (stages > 300) {\n    TORCH_CHECK(L == 8 && fold == 1 && B <= 128, \"va2: L 8, fold, B <= 128\");\n"
          "    if (stages > 1000) {\n      const int dg = (int)(stages / 1000);\n"
-         "      if (dg == 1) va2_go<4, 4, 3, 1, 1, 1, 48>(&p, grid, st, false);\n      else if (dg == 2) va2_go<4, 4, 3, 1, 1, 2, 48>(&p, grid, st, false);\n"
-         "      else if (dg == 3) va2_go<4, 4, 3, 1, 1, 3, 48>(&p, grid, st, false);\n"
-         "      else va2_go<4, 4, 3, 1, 1, 5, 48>(&p, grid, st, false);\n    }\n"
+         "      if (dg == 1) va2_go<5, 4, 2, 1, 1, 1, 32, 1>(&p, grid, st, false);\n      else if (dg == 2) va2_go<5, 4, 2, 1, 1, 2, 32, 1>(&p, grid, st, false);\n"
+         "      else if (dg == 3) va2_go<5, 4, 2, 1, 1, 3, 32, 1>(&p, grid, st, false);\n"
+         "      else va2_go<5, 4, 2, 1, 1, 5, 32, 1>(&p, grid, st, false);\n    }\n"
+         "    else if (stages == 350 || stages == 360) va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
+         "    else if (stages == 351 || stages == 361) va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages % 10 == 9) va2_go<4, 4, 3, 2, 1>(&p, grid, st, stages > 350);\n"
          "    else if (stages % 10 == 8) va2_go<4, 4, 3, 1, 1, VA2_DIAG, 48>(&p, grid, st, stages > 350);\n"
          "    else if (stages % 10 == 7) va2_go<4, 4, 3, 1, 1>(&p, grid, st, stages > 350);\n"
