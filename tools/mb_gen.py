@@ -129,6 +129,20 @@ CONFIGS = {
               128: ["ls:193:L", "ls:8385:L"],
               256: ["ls:193:L", "ls:8385:L"]},
     ),
+    # mb_8: is X2S's 1-tile slowdown register allocation? the same X2S + WT 6 build capped at 149 / 152 registers (s3 uses
+    # 149); bs1 / 8 measure the 1-tile path alone, bs16 the T=16 lever (port gate: layer-like r <= 0.94)
+    8: dict(
+        builds={"s3": ("vms", 3, 16, 0), "xw6": ("vms", 3, 16, 1152, 0, 6),
+                "xr149": ("vms", 3, 16, 1152, 0, 6, ("-DVMS_LB=0", "-maxrregcount=149")),
+                "xr144": ("vms", 3, 16, 1152, 0, 6, ("-DVMS_LB=0", "-maxrregcount=144")),
+                "ls": ("vml", ("-DVM_FININ=0", "-DVM_TRICKS_DQ=0"))},
+        arms={1: ["s3", "xw6", "xr149", "xr144"],
+              8: ["s3", "xw6", "xr149", "xr144"],
+              16: ["s3", "xw6", "xr149", "xr144"],
+              32: ["ls:8385:L"],
+              128: ["ls:8385:L"],
+              256: ["ls:8385:L"]},
+    ),
 }
 CFG = CONFIGS[N]
 
@@ -221,7 +235,9 @@ X2S_PATCHES = (
      "  int jW[MAXJ + 1];   // mb VMS_WT: per-job weight prefix (quarter units per unit)\n"
      "  int rng[4];   // mb VMS_WT: this CTA's a0, a1, b0, b1\n#endif\n};\n"),
     ("__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {\n",
-     X2S_CONSUME + WT_INV + "__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {\n"),
+     X2S_CONSUME + WT_INV + "#ifndef VMS_LB\n#define VMS_LB 1\n#endif\n#if VMS_LB\n"
+     "__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {\n#else\n"
+     "__global__ void vms_kernel(Params p) {   // mb VMS_LB 0: no launch bounds, so -maxrregcount caps the registers\n#endif\n"),
     # VMS_WT routing: each lane's (expert's) job weights summed in closed form and scanned with the job counts (one shuffle
     # more per round), per-job prefix written in the lane's own job loop; lanes 0-3 of warp 0 then compute the CTA's four
     # range boundaries in parallel into S.rng before the existing __syncthreads (mb_6's version: +1.2 us of routing)
@@ -505,9 +521,9 @@ def _mb_bucket(m):
 
 
 # ---------------------------------------------------------------- builds (threads: nvcc runs in parallel)
-def _mb_build_vms(ns, maxt, fl, G, pad=0, wt=0):
+def _mb_build_vms(ns, maxt, fl, G, pad=0, wt=0, extra=()):
     from torch.utils.cpp_extension import load_inline
-    flags = ["-O3", f"-DVMS_G={G}", f"-DVMS_NS={ns}", f"-DVMS_MAXT={maxt}", f"-DVMS_FL={fl}", f"-DVMS_PAD={pad}", f"-DVMS_WT={wt}",
+    flags = ["-O3", f"-DVMS_G={G}", f"-DVMS_NS={ns}", f"-DVMS_MAXT={maxt}", f"-DVMS_FL={fl}", f"-DVMS_PAD={pad}", f"-DVMS_WT={wt}"] + list(extra) + [
              "-Xptxas=-warn-spills",
              "-gencode=arch=compute_90a,code=sm_90a"]
     tag = hashlib.sha1((MB_VMS_CUDA + " ".join(flags)).encode()).hexdigest()[:10]
@@ -521,7 +537,8 @@ def _mb_build_one(name, G):
     try:
         b = MB_BUILDS[name]
         if b[0] == "vms":
-            _MB["mods"][name] = _mb_build_vms(b[1], b[2], b[3], G, b[4] if len(b) > 4 else 0, b[5] if len(b) > 5 else 0)
+            _MB["mods"][name] = _mb_build_vms(b[1], b[2], b[3], G, b[4] if len(b) > 4 else 0, b[5] if len(b) > 5 else 0,
+                                              b[6] if len(b) > 6 else ())
         else:
             _MB["mods"][name], _ = _vml_build(defines=b[1])
     except Exception as ex:  # noqa: BLE001

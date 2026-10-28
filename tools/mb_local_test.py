@@ -74,7 +74,7 @@ def main():
         b = ns["MB_BUILDS"][nm]
         if b[0] == "vms":
             flags = ["-O3", "-DVMS_G=132", f"-DVMS_NS={b[1]}", f"-DVMS_MAXT={b[2]}", f"-DVMS_FL={b[3]}",
-                     f"-DVMS_PAD={b[4] if len(b) > 4 else 0}", f"-DVMS_WT={b[5] if len(b) > 5 else 0}",
+                     f"-DVMS_PAD={b[4] if len(b) > 4 else 0}", f"-DVMS_WT={b[5] if len(b) > 5 else 0}"] + list(b[6] if len(b) > 6 else ()) + [
                      "-gencode=arch=compute_90a,code=sm_90a"]
             src = ns["MB_VMS_CUDA"]
         else:
