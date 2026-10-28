@@ -70,7 +70,7 @@ VDS_PY = r'''
 VDS_ENABLE = True
 VDS_BUILD = True
 VDS_PREPARE_BY_S = 240.0
-VDS_ESC_CAP = 32
+VDS_ESC_CAP = 64
 VDS_INSTS = @INSTS@
 VDS_ROUTE = @ROUTE@
 VDS_PDL = {"qkv": False, "o": True, "cat": True, "unpooler": True}
@@ -111,8 +111,8 @@ def _vds_weight(state, proj):
 
 
 def _vds_launch(r, x, out, pdl, pf):
-    r["mod"].vds_run(r["kid"], r["pk"]["w"], r["pk"]["esc"], x, out, r["ws"], r["cnt"], r["err"], r["err"], out.stride(0),
-                     r["pk"]["nrg"], r["S"], r["pk"]["tbs"], pf, 1 if VDS_TRIG else 0, 0, 1 if pdl else 0)
+    r["mod"].vds_run(r["kid"], r["pk"]["w"], r["pk"]["esc"], x, out, r["err"], r["err"], out.stride(0), r["pk"]["nrg"],
+                     r["pk"]["tbs"], pf, 1 if VDS_TRIG else 0, 0, 1 if pdl else 0)
 
 
 def _vds_selftest(r, w, b, proj):
@@ -135,8 +135,8 @@ def _vds_selftest(r, w, b, proj):
             got = outs[0].double()
             if not bool(torch.isfinite(got).all()):
                 return False, f"T={T} outl={outl}: non-finite"
-            if int(r["err"][0]) != 0 or bool(r["ws"].ne(0).any()) or bool(r["cnt"].ne(0).any()):
-                return False, f"T={T} outl={outl}: err {int(r['err'][0])} / workspace not clean"
+            if int(r["err"][0]) != 0:
+                return False, f"T={T} outl={outl}: bounded wait expired (err {int(r['err'][0])})"
             rf = ref if f32 else ref.to(torch.bfloat16).double()
             dd = got - rf
             rn = rf.norm(dim=-1)
@@ -168,16 +168,17 @@ def _vds_prepare(state, t0):
     for (proj, b), (kid, S, pf) in sorted(VDS_ROUTE.items(), key=str):
         why = None
         w = _vds_weight(state, proj)
-        nn, nwg, nst, nstgm, outf = VDS_INSTS[kid]
+        nn, nwg, nst, nstgm, outf, cl = VDS_INSTS[kid]
         if w is None or w.dtype != torch.bfloat16 or w.dim() != 2:
             why = "no bf16 weight"
-        elif nn < b or (proj == "cat") != (outf == 1) or w.shape[0] % (64 * nwg) or w.shape[1] % 64:
+        elif nn < b or (proj == "cat") != (outf == 1) or S != cl or w.shape[0] % (64 * nwg) or w.shape[1] % 64:
             why = f"instance {VDS_INSTS[kid]} does not fit {proj}/{b} {tuple(w.shape)}"
         else:
             info = [int(v) for v in mod.vds_info(kid)]
-            ncta = (w.shape[0] // (64 * nwg)) * S
-            if info[2] > 0 or info[3] < 1 or ncta > torch.cuda.get_device_properties(w.device).multi_processor_count:
-                why = f"regs {info[1]} local {info[2]} occupancy {info[3]} for {ncta} CTAs (> one wave or spills)"
+            nrg = w.shape[0] // (64 * nwg)
+            sms = torch.cuda.get_device_properties(w.device).multi_processor_count
+            if info[2] > 0 or info[3] < 1 or nrg * S > sms or (S > 1 and info[7] < nrg):
+                why = f"regs {info[1]} local {info[2]} occupancy {info[3]} clusters {info[7]} for {nrg} x {S} CTAs (> one wave)"
         if why is None:
             key = (proj, nwg, S, nstgm)
             if key not in packs:
@@ -198,9 +199,7 @@ def _vds_prepare(state, t0):
             pk = packs[key]
             dev = w.device
             r = {"mod": mod, "kid": kid, "S": S, "pf": pf, "pk": pk, "N": w.shape[0], "K": w.shape[1], "T": nn,
-                 "f32": outf == 1, "ws": torch.zeros((pk["nrg"] * nwg * 128 * (nn // 2),), dtype=torch.float32, device=dev),
-                 "cnt": torch.zeros((pk["nrg"] * nwg,), dtype=torch.int32, device=dev),
-                 "err": torch.zeros((4,), dtype=torch.int32, device=dev),
+                 "f32": outf == 1, "err": torch.zeros((4,), dtype=torch.int32, device=dev),
                  "desc": f"i{kid}{VDS_INSTS[kid]}s{S}pf{pf}"}
             try:
                 ok, msg = _vds_selftest(r, w, b, proj)
@@ -332,7 +331,9 @@ def main():
     for r in rep:
         print(f"[vds_patches] OK  {r}")
     if dry:
-        print(f"[vds_patches] --dry: nothing written ({len(s.encode())} B)")
+        if args.get("dryout"):
+            pathlib.Path(args["dryout"]).write_text(s, encoding="utf-8", newline=NL)
+        print(f"[vds_patches] --dry: no repo output written ({len(s.encode())} B){' -> ' + args['dryout'] if args.get('dryout') else ''}")
         return 0
     if not lab_only:
         out.write_text(s, encoding="utf-8", newline=NL)

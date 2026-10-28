@@ -33,37 +33,40 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-ESC_CAP = 32
+ESC_CAP = 64   # per warp chain (two entries per lane); the cat's router-lo rows reach ~38 at CL 3
 
 # (N, NWG, NST, NSTGM, OUT): N tokens (wgmma N), NWG consumer warpgroups = 64 NWG rows per CTA, NST ring stages, NSTGM =
 # most 64-k units per CTA (x slice size), OUT 0 bf16 / 1 f32
+# (N, NWG, NST, NSTGM, OUT, CL): N tokens (wgmma N), NWG consumer warpgroups = 64 NWG rows per CTA, NST ring stages (one 64-k
+# unit of weights for every consumer warp + the matching N x 64 x slice), NSTGM = most units per CTA, OUT 0 bf16 / 1 f32,
+# CL = cluster size along K (DSMEM reduce-scatter by 8-token blocks); VD / DG1's one-wave geometries (max clusters at 1 CTA / SM:
+# 15 of 8, 30 of 4 on the box H200, R-vds-1)
 VDS_INSTS = [
-    (32, 4, 6, 16, 0),    # 0  pooler S8 / unpooler S4, T32 (128 CTAs)
-    (16, 4, 7, 16, 0),    # 1  pooler / unpooler T16
-    (32, 4, 6, 19, 1),    # 2  cat T32: 18 rg x S7 = 126 CTAs (18 / 19 units), f32 out
-    (16, 4, 7, 19, 1),    # 3  cat T16
-    (32, 4, 6, 10, 0),    # 4  qkv T32: 9 rg x S14 = 126 CTAs (9 / 10 units)
-    (16, 4, 7, 10, 0),    # 5  qkv T16
-    (32, 4, 4, 4, 0),     # 6  o T32: 32 rg x S4 = 128
-    (16, 4, 4, 4, 0),     # 7  o T16
-    (32, 4, 4, 16, 0),    # 8  pooler / unpooler T32, NST 4
-    (32, 3, 7, 12, 0),    # 9  qkv T32: 12 rg x S11 = 132 CTAs (11 / 12 units)
+    (32, 2, 10, 43, 1, 3),   # 0  cat T32: 36 rg x CL 3 = 108 CTAs (42 / 43 units), f32 out
+    (16, 2, 12, 43, 1, 3),   # 1  cat T16
+    (32, 1, 12, 43, 0, 3),   # 2  qkv T32: 36 rg x CL 3 = 108
+    (16, 1, 14, 43, 0, 3),   # 3  qkv T16
+    (32, 2, 10, 32, 0, 2),   # 4  unpooler T32: 64 rg x CL 2 = 128
+    (16, 2, 12, 32, 0, 2),   # 5  unpooler T16
+    (32, 1, 8, 16, 0, 1),    # 6  o T32: 128 rg = 128
+    (16, 1, 8, 16, 0, 1),    # 7  o T16
+    (32, 2, 10, 43, 0, 3),   # 8  pooler T32: 32 rg x CL 3 = 96 (reference vs GD)
+    (32, 2, 8, 43, 1, 3),    # 9  cat T32, NST 8
 ]
 
 PROJ = {"qkv": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096), "cat": (4608, 8192)}
 WNAME = {"qkv": "qkv_gate", "o": "o", "pooler": "pooler", "unpooler": "unpooler"}
 # (proj, T) -> [(kid, S, label)], first = primary (gets the diagnostic arms)
 CONFIGS = {
-    ("pooler", 32): [(0, 8, "s8_nst6"), (8, 8, "s8_nst4")],
-    ("pooler", 16): [(1, 8, "s8_nst7")],
-    ("cat", 32): [(2, 7, "s7_nst6")],
-    ("cat", 16): [(3, 7, "s7_nst7")],
-    ("unpooler", 32): [(0, 4, "s4_nst6"), (8, 4, "s4_nst4")],
-    ("unpooler", 16): [(1, 4, "s4_nst7")],
-    ("qkv", 32): [(4, 14, "s14"), (9, 11, "nwg3_s11")],
-    ("qkv", 16): [(5, 14, "s14")],
-    ("o", 32): [(6, 4, "s4")],
-    ("o", 16): [(7, 4, "s4")],
+    ("cat", 32): [(0, 3, "bm128_cl3"), (9, 3, "bm128_cl3_nst8")],
+    ("cat", 16): [(1, 3, "bm128_cl3")],
+    ("pooler", 32): [(8, 3, "bm128_cl3")],
+    ("unpooler", 32): [(4, 2, "bm128_cl2")],
+    ("unpooler", 16): [(5, 2, "bm128_cl2")],
+    ("qkv", 32): [(2, 3, "bm64_cl3")],
+    ("qkv", 16): [(3, 3, "bm64_cl3")],
+    ("o", 32): [(6, 1, "bm64")],
+    ("o", 16): [(7, 1, "bm64")],
 }
 # shipped GD routes at buckets 16 / 32 (k3_slim_3 GD_ROUTE) + pooler stand-ins (the layer runs P1M / DG1 cat there)
 GD_LAB_ROUTE = {("qkv", 16): (2, 1, 4, 8, 1, 4, 0), ("qkv", 32): (4, 1, 4, 8, 1, 4, 0),
@@ -74,9 +77,9 @@ GD_LAB_ROUTE = {("qkv", 16): (2, 1, 4, 8, 1, 4, 0), ("qkv", 32): (4, 1, 4, 8, 1,
 VDS_CPP_SRC = r"""
 #include <torch/extension.h>
 #include <vector>
-int64_t vds_run(int64_t kid, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, torch::Tensor ws,
-                torch::Tensor cnt, torch::Tensor err, torch::Tensor stamps, int64_t ldo, int64_t nrg, int64_t S,
-                std::vector<int64_t> tbs, int64_t pf, int64_t trig, int64_t flags, int64_t pdl);
+int64_t vds_run(int64_t kid, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, torch::Tensor err,
+                torch::Tensor stamps, int64_t ldo, int64_t nrg, std::vector<int64_t> tbs, int64_t pf, int64_t trig, int64_t flags,
+                int64_t pdl);
 std::vector<int64_t> vds_info(int64_t kid);
 """
 
@@ -95,34 +98,35 @@ constexpr long long WAIT_BUDGET = 2000000000LL;   // ~1 s of clock64: a hang bec
 enum : int { F_EXIT = 1, F_NOMMA = 2, F_WONLY = 4, F_STAMP = 8 };
 
 struct Args {
-  const uint8_t* w;            // P12 stream: stage s of CTA c at (s * ncta + c) * SB bytes; [warp][plane][lane][16 B]
-  const uint32_t* esc;         // [ncta * NW][32] escape entries (step << 20 | lane << 15 | reg << 11 | half << 10 | xor7)
+  const uint8_t* w;            // P12 stream: stage s of CTA c at (s * ncta + c) * SBW bytes; [warp][plane][lane][16 B]
+  const uint32_t* esc;         // [ncta * NW][64] escape entries (step << 20 | lane << 15 | reg << 11 | half << 10 | xor7)
   const uint16_t* x;           // [T, K] bf16 bits (the predecessor's output: read after griddepcontrol.wait)
   void* out;                   // [T, ldo] bf16 (OUT 0) / f32 (OUT 1)
-  float* ws;                   // [tiles][128][N / 2] f32 split-K workspace (zero between calls)
-  int* cnt;                    // [tiles] arrival counters (zero between calls)
   int* err;
   unsigned long long* stamps;  // lab: [ncta][5] globaltimer + [ncta * NW][2] (full-wait clocks, loop clocks)
   int T, K, ldo, ncta, S, NU, pf, trig, flags, rgb1, rgb2;
   uint32_t tb, tb2, tb3;       // P12 window base x 0x01010101 per row-group range
 };
 
-template <int N, int NWG, int NST, int NSTGM, int OUT>
+template <int N, int NWG, int NST, int NSTGM, int OUT, int CL>
 struct Cfg {
   static constexpr int NW = NWG * 4;               // consumer warps (one 16-row tile each)
   static constexpr int NTH = NW * 32;
   static constexpr int THREADS = NTH + 32;         // + one producer warp
   static constexpr int UB = 1536;                  // 16 rows x 64 k x 12 bit per warp-unit
-  static constexpr int SB = NW * UB;               // stage = one unit for every consumer warp
+  static constexpr int SBW = NW * UB;              // stage weights: one unit for every consumer warp
+  static constexpr int SBX = N * 128;              // stage x: N tokens x 64 k bf16, core-matrix layout (SBO 1024)
+  static constexpr int SB = SBW + SBX;
   static constexpr int NACC = N / 2;               // fp32 accumulators per consumer thread
-  static constexpr int XB = N * NSTGM * 128;       // x slice bytes (most units per CTA)
-  static constexpr int X_OFF = NST * SB;
-  static constexpr int BAR_OFF = X_OFF + XB;
-  static constexpr int FLAG_OFF = BAR_OFF + 8 * (2 * NST + 1);
-  static constexpr int SMEM = FLAG_OFF + 4 * NWG + 16;
-  static_assert(N % 16 == 0 && NACC % 4 == 0, "N");
-  static_assert(SMEM <= 232448, "smem");
-  static_assert(NSTGM * 1024 / 16 < 16384, "SBO field");
+  static constexpr int NB = N / 8;                 // 8-token blocks (DSMEM reduce-scatter unit)
+  static constexpr int JMAX = (NB + CL - 1) / CL;
+  static constexpr int RB_OFF = NST * SB;
+  static constexpr int RB_BYTES = CL > 1 ? (CL - 1) * JMAX * NTH * 16 : 0;
+  static constexpr int BAR_OFF = RB_OFF + RB_BYTES;
+  static constexpr int SMEM = BAR_OFF + 8 * (2 * NST + 1) + 16;
+  static constexpr int XPL = N / 4;                // 16-B x chunks per producer lane per stage
+  static_assert(N % 16 == 0 && NACC % 4 == 0 && CL >= 1, "N / CL");   // a rank may own no 8-token block (N 16, CL 3)
+  static_assert(SB % 16 == 0 && SMEM <= 232448, "smem");
 };
 
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -155,14 +159,28 @@ __device__ __forceinline__ void mbar_wait(uint32_t b, uint32_t par, int* err, bo
     if (clock64() - t0 > WAIT_BUDGET) { atomicExch(err, 1); dead = true; return; }
   }
 }
+__device__ __forceinline__ bool mbar_try_cl(uint32_t b, uint32_t par) {
+  uint32_t ok;
+  asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n"
+               : "=r"(ok) : "r"(b), "r"(par) : "memory");
+  return ok != 0;
+}
+__device__ __forceinline__ void mbar_wait_cl(uint32_t b, uint32_t par, int* err, bool& dead) {
+  if (dead || mbar_try_cl(b, par)) return;
+  const long long t0 = clock64();
+  while (!mbar_try_cl(b, par)) {
+    if (clock64() - t0 > WAIT_BUDGET) { atomicExch(err, 2); dead = true; return; }
+  }
+}
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
                :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
 }
-__device__ __forceinline__ uint4 ldx(const uint4* p) {
-  uint4 r;
-  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
-  return r;
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, uint32_t src_bytes) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes) : "memory");
+}
+__device__ __forceinline__ void cp_async_arrive_noinc(uint32_t bar) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(bar) : "memory");
 }
 __device__ __forceinline__ uint32_t lde(const uint32_t* p) {
   uint32_t r;
@@ -174,20 +192,25 @@ __device__ __forceinline__ uint4 lds128(uint32_t a) {
   asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(a) : "memory");
   return r;
 }
-__device__ __forceinline__ void red_add_v4(float* p, float a, float b, float c, float d) {
-  asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};\n" :: "l"(p), "f"(a), "f"(b), "f"(c), "f"(d) : "memory");
-}
-__device__ __forceinline__ float4 ld_cg4(const float* p) {
-  float4 r;
-  asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];\n" : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w) : "l"(p) : "memory");
-  return r;
-}
-__device__ __forceinline__ void st_cg4z(float* p) {
-  asm volatile("st.global.cg.v4.f32 [%0], {%1, %1, %1, %1};\n" :: "l"(p), "f"(0.f) : "memory");
-}
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
-__device__ __forceinline__ void named_sync(int id, int n) { asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void cluster_arrive_relaxed() { asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ uint32_t cluster_rank() {
+  uint32_t r;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(r));
+  return r;
+}
+__device__ __forceinline__ uint32_t mapa(uint32_t a, uint32_t rank) {
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(rank));
+  return r;
+}
+__device__ __forceinline__ void st_async4(uint32_t a, float v0, float v1, float v2, float v3, uint32_t mb) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];\n"
+               :: "r"(a), "r"(__float_as_uint(v0)), "r"(__float_as_uint(v1)), "r"(__float_as_uint(v2)),
+                  "r"(__float_as_uint(v3)), "r"(mb) : "memory");
+}
 // SM90 smem matrix descriptor, no swizzle (core matrices 8 rows x 16 B contiguous): LBO = K-adjacent core matrices,
 // SBO = 8-row-group stride
 __device__ __forceinline__ uint64_t desc_ns(uint32_t saddr, uint32_t lbo, uint32_t sbo) {
@@ -224,9 +247,9 @@ __device__ __forceinline__ void patch(uint32_t (&a)[16], uint32_t e, int lane) {
   }
 }
 
-template <int N, int NWG, int NST, int NSTGM, int OUT>
+template <int N, int NWG, int NST, int NSTGM, int OUT, int CL>
 __global__ void __launch_bounds__(NWG * 128 + 32, 1) vds_kernel(const __grid_constant__ Args A) {
-  using C = Cfg<N, NWG, NST, NSTGM, OUT>;
+  using C = Cfg<N, NWG, NST, NSTGM, OUT, CL>;
   extern __shared__ __align__(1024) uint8_t smem[];
   const int tid = (int)threadIdx.x, warp = tid >> 5, lane = tid & 31;
   // @lab{
@@ -238,72 +261,69 @@ __global__ void __launch_bounds__(NWG * 128 + 32, 1) vds_kernel(const __grid_con
   // @lab}
   if (A.trig) pdl_trigger();
   const uint32_t s0 = sa(smem);
-  const uint32_t full0 = s0 + C::BAR_OFF, empty0 = full0 + 8 * NST, xrdy = full0 + 16 * NST;
-  const int rg = (int)blockIdx.x, ks = (int)blockIdx.y;
+  const uint32_t full0 = s0 + C::BAR_OFF, empty0 = full0 + 8 * NST, rbar = full0 + 16 * NST;
+  const int rg = (int)blockIdx.x, ks = CL > 1 ? (int)blockIdx.y : 0;
   const int cta = ks * (int)gridDim.x + rg;
-  const int u0 = (ks * A.NU) / A.S, nst = ((ks + 1) * A.NU) / A.S - u0;   // this CTA's 64-k units [u0, u0 + nst)
+  const int u0 = (ks * A.NU) / CL, nst = ((ks + 1) * A.NU) / CL - u0;   // this CTA's 64-k units [u0, u0 + nst)
+  const int NB = C::NB;
+  const int jlo = (ks * NB) / CL, jhi = ((ks + 1) * NB) / CL;              // 8-token blocks this rank finishes
   bool dead = false;
   if (tid == 0) {
 #pragma unroll 1
-    for (int i = 0; i < NST; ++i) { mbar_init(full0 + 8 * i, 1); mbar_init(empty0 + 8 * i, C::NW); }
-    mbar_init(xrdy, 1);
+    for (int i = 0; i < NST; ++i) { mbar_init(full0 + 8 * i, 33); mbar_init(empty0 + 8 * i, C::NW); }
+    if constexpr (CL > 1) { mbar_init(rbar, 1); mbar_expect_tx(rbar, (uint32_t)((CL - 1) * (jhi - jlo) * C::NTH * 16)); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
   }
   __syncthreads();
+  if constexpr (CL > 1) cluster_arrive_relaxed();   // "my barriers are initialized" (waited before the first push)
 
   if (warp == C::NW) {
-    // ------------------------------------------------------------------ producer (one lane): weights only, no PDL wait
-    if (lane == 0) {
-      const uint8_t* wb = A.w + (size_t)cta * C::SB;
-      const size_t wstep = (size_t)A.ncta * C::SB;
-      const int npro = nst < NST ? nst : NST;
-      const int pf = A.pf < npro ? A.pf : npro;
-      auto issue = [&](int i, int slot) {
-        mbar_expect_tx(full0 + 8 * slot, (uint32_t)C::SB);
-        bulk_g2s(s0 + (uint32_t)(slot * C::SB), wb + (size_t)i * wstep, (uint32_t)C::SB, full0 + 8 * slot);
-      };
-#pragma unroll 1
-      for (int i = 0; i < pf; ++i) issue(i, i);
-      mbar_wait(xrdy, 0u, A.err, dead);          // x first: the rest of the ring waits until x is in smem
-#pragma unroll 1
-      for (int i = pf; i < npro; ++i) issue(i, i);
-#pragma unroll 1
-      for (int i = NST; i < nst; ++i) {
-        const int slot = i % NST;
-        mbar_wait(empty0 + 8 * slot, (uint32_t)(((i / NST) - 1) & 1), A.err, dead);
-        issue(i, slot);
+    // ------------------------------------------------ producer warp: lane 0 bulk-copies the weights, every lane cp.asyncs
+    // its 16-B x chunks of the stage (zero fill past T) and arrives (noinc) on the stage's full barrier (count 1 + 32)
+    const uint8_t* wb = A.w + (size_t)cta * C::SBW;
+    const size_t wstep = (size_t)A.ncta * C::SBW;
+    const uint16_t* xg = A.x;
+    auto issue_w = [&](int i, int slot) {
+      if (lane == 0) {
+        mbar_expect_tx(full0 + 8 * slot, (uint32_t)C::SBW);
+        bulk_g2s(s0 + (uint32_t)(slot * C::SB), wb + (size_t)i * wstep, (uint32_t)C::SBW, full0 + 8 * slot);
       }
+    };
+    auto issue_x = [&](int i, int slot) {
+      const uint32_t xs = s0 + (uint32_t)(slot * C::SB + C::SBW);
+#pragma unroll
+      for (int j = 0; j < C::XPL; ++j) {
+        const int idx = lane + 32 * j, n = idx >> 3, c = idx & 7;
+        const bool live = n < A.T;
+        const uint16_t* src = xg + (live ? (size_t)n * A.K + (size_t)(u0 + i) * 64 + c * 8 : 0);
+        cp_async16(xs + (uint32_t)((n >> 3) * 1024 + c * 128 + (n & 7) * 16), src, live ? 16u : 0u);
+      }
+      cp_async_arrive_noinc(full0 + 8 * slot);
+    };
+    const int npro = nst < NST ? nst : NST;
+    const int pf = A.pf < npro ? A.pf : npro;
+#pragma unroll 1
+    for (int i = 0; i < pf; ++i) issue_w(i, i);     // weights do not depend on the predecessor (PDL)
+    pdl_wait();
+#pragma unroll 1
+    for (int i = 0; i < pf; ++i) issue_x(i, i);
+#pragma unroll 1
+    for (int i = pf; i < npro; ++i) { issue_x(i, i); issue_w(i, i); }
+#pragma unroll 1
+    for (int i = NST; i < nst; ++i) {
+      const int slot = i % NST;
+      mbar_wait(empty0 + 8 * slot, (uint32_t)(((i / NST) - 1) & 1), A.err, dead);
+      issue_x(i, slot);
+      issue_w(i, slot);
     }
     return;
   }
 
   // -------------------------------------------------------------------- consumers
-  const uint32_t em = lde(A.esc + (size_t)(cta * C::NW + warp) * 32 + lane);
+  const uint32_t em = lde(A.esc + (size_t)(cta * C::NW + warp) * 64 + lane);
+  const uint32_t em1 = lde(A.esc + (size_t)(cta * C::NW + warp) * 64 + 32 + lane);
   const uint32_t tb = rg < A.rgb1 ? A.tb : (rg < A.rgb2 ? A.tb2 : A.tb3);
-  const uint32_t sbo = (uint32_t)nst * 1024u;     // 8-token group stride of the x slice
   pdl_wait();
-  {
-    // x[:, 64 u0 .. 64 (u0 + nst)) -> smem: (n, k) at (n / 8) sbo + (k / 8) 128 + (n % 8) 16 + (k % 8) 2; zeros for n >= T
-    constexpr int XPT = (N * NSTGM * 8 + C::NTH - 1) / C::NTH;
-    const int tot = N * nst * 8;
-    const uint4* xg = reinterpret_cast<const uint4*>(A.x) + (size_t)u0 * 8;
-    const int rowc = A.K >> 3;
-    uint4 v[XPT];
-#pragma unroll
-    for (int j = 0; j < XPT; ++j) {
-      const int i = tid + j * C::NTH, n = i & (N - 1), c = i / N;
-      v[j] = make_uint4(0u, 0u, 0u, 0u);
-      if (i < tot && n < A.T) v[j] = ldx(xg + (size_t)n * rowc + c);
-    }
-#pragma unroll
-    for (int j = 0; j < XPT; ++j) {
-      const int i = tid + j * C::NTH, n = i & (N - 1), c = i / N;
-      if (i < tot) *reinterpret_cast<uint4*>(smem + C::X_OFF + (n >> 3) * sbo + c * 128 + (n & 7) * 16) = v[j];
-    }
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");   // generic-proxy writes -> wgmma (async proxy) reads
-    named_sync(1, C::NTH);
-    if (tid == 0) mbar_arrive(xrdy);
-  }
   // @lab{
   if (stamp && tid == 0) t_x = gtime();
   if (stamp) w_t0 = clock64();
@@ -315,59 +335,61 @@ __global__ void __launch_bounds__(NWG * 128 + 32, 1) vds_kernel(const __grid_con
   uint32_t a0[16], a1[16];
   int ecur = 0;
   uint32_t enx = __shfl_sync(0xffffffffu, em, 0);
-  const uint64_t dx = desc_ns(s0 + C::X_OFF, 128u, sbo);
+  const uint64_t dx = desc_ns(s0 + C::SBW, 128u, 1024u);   // x slot of ring slot 0
   const uint32_t dlo = (uint32_t)dx, dhi = (uint32_t)(dx >> 32);
   const uint32_t rp = s0 + (uint32_t)((warp * 96 + lane) * 16);
-  // an odd unit count runs its last pair with a zero A fragment (no wait / load): no conditional wgmma after the loop
-  // (a tail `if (s < nst) unit(..)` made ptxas serialize every wgmma: C7515)
+  // unit s: wait for slot s % NST, decode, 4 wgmma on that slot's x, then release slot (s - 1) % NST: its group (weights
+  // in registers, x read by the async proxy) is complete after this unit's wait_group 1. An odd count runs a zero-A tail
+  // unit (a conditional wgmma after the loop made ptxas serialize every wgmma: C7515).
   auto unit = [&](int s, uint32_t (&a)[16], bool live) {
-    if (!live) {
+    const int slot = s % NST;
+    if (live) {
+      // @lab{
+      long long tw0 = 0;
+      if (stamp) tw0 = clock64();
+      // @lab}
+      mbar_wait(full0 + 8 * slot, (uint32_t)((s / NST) & 1), A.err, dead);
+      // @lab{
+      if (stamp) w_wait += clock64() - tw0;
+      if (stamp && s == 0 && tid == 0) t_first = gtime();
+      // @lab}
+      uint4 p[3];
+      const uint32_t ra = rp + (uint32_t)(slot * C::SB);
+      p[0] = lds128(ra);
+      p[1] = lds128(ra + 512u);
+      p[2] = lds128(ra + 1024u);
+      decode(p, tb, a);
+      while ((int)(enx >> 20) == s) {
+        patch(a, enx, lane);
+        ++ecur;
+        enx = ecur < 32 ? __shfl_sync(0xffffffffu, em, ecur & 31)
+                        : ecur < 64 ? __shfl_sync(0xffffffffu, em1, ecur & 31) : 0xFFFFFFFFu;
+      }
+    } else {
 #pragma unroll
       for (int i = 0; i < 16; ++i) a[i] = 0u;
-      wg_fence();
-#pragma unroll
-      for (int q = 0; q < 4; ++q) wgmma_rs<N>(acc, a[4 * q], a[4 * q + 1], a[4 * q + 2], a[4 * q + 3], dlo, dhi);
-      wg_commit();
-      wg_wait<1>();
-      return;
-    }
-    const int slot = s % NST;
-    // @lab{
-    long long tw0 = 0;
-    if (stamp) tw0 = clock64();
-    // @lab}
-    mbar_wait(full0 + 8 * slot, (uint32_t)((s / NST) & 1), A.err, dead);
-    // @lab{
-    if (stamp) w_wait += clock64() - tw0;
-    if (stamp && s == 0 && tid == 0) t_first = gtime();
-    if (wonly) { __syncwarp(); if (lane == 0) mbar_arrive(empty0 + 8 * slot); return; }
-    // @lab}
-    uint4 p[3];
-    const uint32_t ra = rp + (uint32_t)(slot * C::SB);
-    p[0] = lds128(ra);
-    p[1] = lds128(ra + 512u);
-    p[2] = lds128(ra + 1024u);
-    __syncwarp();
-    if (lane == 0) mbar_arrive(empty0 + 8 * slot);
-    decode(p, tb, a);
-    while ((int)(enx >> 20) == s) {
-      patch(a, enx, lane);
-      ++ecur;
-      enx = ecur < 32 ? __shfl_sync(0xffffffffu, em, ecur & 31) : 0xFFFFFFFFu;
     }
     // @lab{
-    if (nomma) {
-      asm volatile("" :: "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
-                   "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]), "r"(a[12]), "r"(a[13]), "r"(a[14]), "r"(a[15]));
+    if (wonly || nomma) {
+      if (nomma && live)
+        asm volatile("" :: "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
+                     "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]), "r"(a[12]), "r"(a[13]), "r"(a[14]), "r"(a[15]));
+      __syncwarp();
+      if (live && lane == 0) mbar_arrive(empty0 + 8 * slot);
       return;
     }
     // @lab}
+    const uint32_t xd = dlo + (uint32_t)((live ? slot : (s - 1) % NST) * (C::SB >> 4));   // tail: the last live x
     wg_fence();
 #pragma unroll
     for (int q = 0; q < 4; ++q)
-      wgmma_rs<N>(acc, a[4 * q], a[4 * q + 1], a[4 * q + 2], a[4 * q + 3], dlo + (uint32_t)((8 * s + 2 * q) * 8), dhi);
+      wgmma_rs<N>(acc, a[4 * q], a[4 * q + 1], a[4 * q + 2], a[4 * q + 3], xd + (uint32_t)(16 * q), dhi);
     wg_commit();
     wg_wait<1>();
+    if (s >= 1) {
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty0 + 8 * ((s - 1) % NST));
+    }
   };
 #pragma unroll 1
   for (int s = 0; s < nst; s += 2) {
@@ -385,48 +407,44 @@ __global__ void __launch_bounds__(NWG * 128 + 32, 1) vds_kernel(const __grid_con
   }
   // @lab}
 
-  // -------------------------------------------------------------------- epilogue: split-K over S CTAs, last arriver stores
-  const int wg = warp >> 2, tw = tid & 127;
-  const int tile = rg * NWG + wg;
-  if (A.S > 1) {
-    float* wsp = A.ws + ((size_t)tile * 128 + tw) * C::NACC;
-#pragma unroll
-    for (int i = 0; i < C::NACC; i += 4) red_add_v4(wsp + i, acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
-    __threadfence();
-    named_sync(2 + wg, 128);
-    volatile int* flag = reinterpret_cast<volatile int*>(smem + C::FLAG_OFF) + wg;
-    if (tw == 0) *flag = atomicAdd(A.cnt + tile, 1);
-    named_sync(2 + wg, 128);
-    if (*flag != A.S - 1) {
-      // @lab{
-      if (stamp && tid == 0) {
-        unsigned long long* sp = A.stamps + 5 * (size_t)cta;
-        sp[0] = t_entry; sp[1] = t_x; sp[2] = t_first; sp[3] = t_loop; sp[4] = gtime();
-      }
-      // @lab}
-      return;
-    }
-  }
-  float v[C::NACC];   // the final sums (never written into acc: ptxas C7515 serializes wgmma if acc is redefined)
-  if (A.S > 1) {
-    const float* wsp = A.ws + ((size_t)tile * 128 + tw) * C::NACC;
-    __threadfence();
-#pragma unroll
-    for (int i = 0; i < C::NACC; i += 4) {
-      const float4 q = ld_cg4(wsp + i);
-      v[i] = q.x; v[i + 1] = q.y; v[i + 2] = q.z; v[i + 3] = q.w;
-      st_cg4z(const_cast<float*>(wsp) + i);
-    }
-    if (tw == 0) A.cnt[tile] = 0;
-  } else {
-#pragma unroll
-    for (int i = 0; i < C::NACC; ++i) v[i] = acc[i];
-  }
+  // -------------------------------------------------------------------- epilogue: DSMEM reduce-scatter by 8-token blocks
   const int g = lane >> 2, t4 = lane & 3;
   const int row0 = (rg * C::NW + warp) * 16 + g;   // this thread's rows: row0, row0 + 8
+  float v[C::NACC];
+#pragma unroll
+  for (int i = 0; i < C::NACC; ++i) v[i] = acc[i];
+  if constexpr (CL > 1) {
+    cluster_wait();                                  // every rank's receive mbarrier is initialized
+    const uint32_t rb0 = s0 + C::RB_OFF;
+#pragma unroll
+    for (int p = 0; p < CL; ++p) {
+      if (p == ks) continue;
+      const int plo = (p * NB) / CL, phi = ((p + 1) * NB) / CL;
+      const int slot = ks < p ? ks : ks - 1;
+      const uint32_t rbr = mapa(rbar, (uint32_t)p);
+#pragma unroll
+      for (int j = 0; j < C::NB; ++j) {
+        if (j < plo || j >= phi) continue;
+        st_async4(mapa(rb0 + (uint32_t)(((slot * C::JMAX + (j - plo)) * C::NTH + tid) * 16), (uint32_t)p),
+                  acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3], rbr);
+      }
+    }
+    mbar_wait_cl(rbar, 0, A.err, dead);              // the other ranks' copies of my blocks have landed
+    const float4* RB = reinterpret_cast<const float4*>(smem + C::RB_OFF);
+#pragma unroll
+    for (int j = 0; j < C::NB; ++j) {
+      if (j < jlo || j >= jhi) continue;
+#pragma unroll
+      for (int sl = 0; sl < CL - 1; ++sl) {
+        const float4 q = RB[(sl * C::JMAX + (j - jlo)) * C::NTH + tid];
+        v[4 * j] += q.x; v[4 * j + 1] += q.y; v[4 * j + 2] += q.z; v[4 * j + 3] += q.w;
+      }
+    }
+  }
 #pragma unroll
   for (int i = 0; i < C::NACC; ++i) {
     const int j = i >> 2, c = i & 3;
+    if (j < jlo || j >= jhi) continue;
     const int row = row0 + 8 * (c >> 1), tok = 8 * j + 2 * t4 + (c & 1);
     if (tok < A.T) {
       if constexpr (OUT == 1) reinterpret_cast<float*>(A.out)[(size_t)tok * A.ldo + row] = v[i];
@@ -447,13 +465,12 @@ __global__ void null_kernel(int* e) { if (threadIdx.x == 1023) e[3] = 0; }
 
 }  // namespace vds
 
-template <int N, int NWG, int NST, int NSTGM, int OUT>
+template <int N, int NWG, int NST, int NSTGM, int OUT, int CL>
 static int64_t vds_launch_t(const torch::Tensor& w, const torch::Tensor& esc, const torch::Tensor& x, const torch::Tensor& out,
-                            const torch::Tensor& ws, const torch::Tensor& cnt, const torch::Tensor& err,
-                            const torch::Tensor& stamps, int64_t ldo, int64_t nrg, int64_t S, const std::vector<int64_t>& tbs,
-                            int64_t pf, int64_t trig, int64_t flags, int64_t pdl) {
-  using C = vds::Cfg<N, NWG, NST, NSTGM, OUT>;
-  auto kern = vds::vds_kernel<N, NWG, NST, NSTGM, OUT>;
+                            const torch::Tensor& err, const torch::Tensor& stamps, int64_t ldo, int64_t nrg,
+                            const std::vector<int64_t>& tbs, int64_t pf, int64_t trig, int64_t flags, int64_t pdl) {
+  using C = vds::Cfg<N, NWG, NST, NSTGM, OUT, CL>;
+  auto kern = vds::vds_kernel<N, NWG, NST, NSTGM, OUT, CL>;
   static bool attr = false;
   if (!attr) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
@@ -462,36 +479,38 @@ static int64_t vds_launch_t(const torch::Tensor& w, const torch::Tensor& esc, co
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "vds: x bf16 [T, K]");
   const int64_t T = x.size(0), K = x.size(1), NU = K / 64;
   TORCH_CHECK(T >= 1 && T <= N && K % 64 == 0 && ((uintptr_t)x.data_ptr() % 16) == 0, "vds: x shape");
-  TORCH_CHECK(S >= 1 && (NU + S - 1) / S <= NSTGM, "vds: K split exceeds NSTGM units per CTA");
+  TORCH_CHECK((NU + CL - 1) / CL <= NSTGM, "vds: K split exceeds NSTGM units per CTA");
   TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.stride(1) == 1 && out.size(0) >= T && out.size(1) >= nrg * 64 * NWG
               && ldo == out.stride(0), "vds: out");
   TORCH_CHECK(out.scalar_type() == (OUT ? at::kFloat : at::kBFloat16), "vds: out dtype");
-  const int64_t ncta = nrg * S;
-  TORCH_CHECK(w.is_cuda() && w.numel() * w.element_size() == ncta * (int64_t)C::SB * NSTGM && ((uintptr_t)w.data_ptr() % 16) == 0,
+  const int64_t ncta = nrg * CL;
+  TORCH_CHECK(w.is_cuda() && w.numel() * w.element_size() == ncta * (int64_t)C::SBW * NSTGM && ((uintptr_t)w.data_ptr() % 16) == 0,
               "vds: packed weights size");
-  TORCH_CHECK(esc.is_cuda() && esc.numel() == ncta * C::NW * 32, "vds: escapes");
-  TORCH_CHECK(S == 1 || (ws.is_cuda() && ws.scalar_type() == at::kFloat && ws.numel() >= nrg * NWG * 128 * C::NACC
-                         && cnt.is_cuda() && cnt.numel() >= nrg * NWG), "vds: workspace");
+  TORCH_CHECK(esc.is_cuda() && esc.numel() == ncta * C::NW * 64, "vds: escapes");
+  TORCH_CHECK(err.is_cuda() && err.scalar_type() == at::kInt, "vds: err");
   TORCH_CHECK(tbs.size() == 5, "vds: tbs = (tb, tb2, tb3, rgb1, rgb2)");
   vds::Args A;
   A.w = reinterpret_cast<const uint8_t*>(w.data_ptr());
   A.esc = reinterpret_cast<const uint32_t*>(esc.data_ptr());
   A.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
   A.out = out.data_ptr();
-  A.ws = reinterpret_cast<float*>(ws.data_ptr());
-  A.cnt = reinterpret_cast<int*>(cnt.data_ptr());
   A.err = err.data_ptr<int>();
   A.stamps = reinterpret_cast<unsigned long long*>(stamps.data_ptr());   // lab stamps (unused in the layer copy)
-  A.T = (int)T; A.K = (int)K; A.ldo = (int)ldo; A.ncta = (int)ncta; A.S = (int)S; A.NU = (int)NU; A.pf = (int)pf;
+  A.T = (int)T; A.K = (int)K; A.ldo = (int)ldo; A.ncta = (int)ncta; A.S = CL; A.NU = (int)NU; A.pf = (int)pf;
   A.trig = (int)trig; A.flags = (int)flags;
   A.tb = (uint32_t)tbs[0]; A.tb2 = (uint32_t)tbs[1]; A.tb3 = (uint32_t)tbs[2]; A.rgb1 = (int)tbs[3]; A.rgb2 = (int)tbs[4];
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3((unsigned)nrg, (unsigned)S, 1);
+  cfg.gridDim = dim3((unsigned)nrg, (unsigned)CL, 1);
   cfg.blockDim = dim3(C::THREADS, 1, 1);
   cfg.dynamicSmemBytes = C::SMEM;
   cfg.stream = at::cuda::getCurrentCUDAStream().stream();
-  cudaLaunchAttribute at_[1];
+  cudaLaunchAttribute at_[2];
   int na = 0;
+  if (CL > 1) {
+    at_[na].id = cudaLaunchAttributeClusterDimension;
+    at_[na].val.clusterDim.x = 1; at_[na].val.clusterDim.y = CL; at_[na].val.clusterDim.z = 1;
+    ++na;
+  }
   if (pdl) {
     at_[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at_[na].val.programmaticStreamSerializationAllowed = 1;
@@ -503,22 +522,34 @@ static int64_t vds_launch_t(const torch::Tensor& w, const torch::Tensor& esc, co
   return 0;
 }
 
-template <int N, int NWG, int NST, int NSTGM, int OUT>
+template <int N, int NWG, int NST, int NSTGM, int OUT, int CL>
 static std::vector<int64_t> vds_info_t() {
-  using C = vds::Cfg<N, NWG, NST, NSTGM, OUT>;
-  auto kern = vds::vds_kernel<N, NWG, NST, NSTGM, OUT>;
+  using C = vds::Cfg<N, NWG, NST, NSTGM, OUT, CL>;
+  auto kern = vds::vds_kernel<N, NWG, NST, NSTGM, OUT, CL>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
   cudaFuncAttributes fa;
   C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, kern));
   int occ = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, C::THREADS, C::SMEM));
-  return {(int64_t)C::SMEM, (int64_t)fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)occ, (int64_t)C::SB, (int64_t)NSTGM,
-          (int64_t)C::NW};
+  int ncl = -1;
+  if (CL > 1) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(1, CL, 1);
+    cfg.blockDim = dim3(C::THREADS, 1, 1);
+    cfg.dynamicSmemBytes = C::SMEM;
+    cudaLaunchAttribute a;
+    a.id = cudaLaunchAttributeClusterDimension;
+    a.val.clusterDim.x = 1; a.val.clusterDim.y = CL; a.val.clusterDim.z = 1;
+    cfg.attrs = &a; cfg.numAttrs = 1;
+    if (cudaOccupancyMaxActiveClusters(&ncl, kern, &cfg) != cudaSuccess) { cudaGetLastError(); ncl = -1; }
+  }
+  return {(int64_t)C::SMEM, (int64_t)fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)occ, (int64_t)C::SBW, (int64_t)NSTGM,
+          (int64_t)C::NW, (int64_t)ncl};
 }
 
-int64_t vds_run(int64_t kid, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, torch::Tensor ws,
-                torch::Tensor cnt, torch::Tensor err, torch::Tensor stamps, int64_t ldo, int64_t nrg, int64_t S,
-                std::vector<int64_t> tbs, int64_t pf, int64_t trig, int64_t flags, int64_t pdl) {
+int64_t vds_run(int64_t kid, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, torch::Tensor err,
+                torch::Tensor stamps, int64_t ldo, int64_t nrg, std::vector<int64_t> tbs, int64_t pf, int64_t trig, int64_t flags,
+                int64_t pdl) {
   // @lab{
   if (kid < 0) {
     vds::null_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream().stream()>>>(err.data_ptr<int>());
@@ -560,9 +591,9 @@ def vds_wg_specs(ns):
 
 
 def vds_cuda_src(insts=VDS_INSTS):
-    run = "\n".join(f"    case {i}: return vds_launch_t<{a}, {b}, {c}, {d}, {e}>(w, esc, x, out, ws, cnt, err, stamps, ldo, nrg, S, tbs, "
-                    f"pf, trig, flags, pdl);" for i, (a, b, c, d, e) in enumerate(insts))
-    info = "\n".join(f"    case {i}: return vds_info_t<{a}, {b}, {c}, {d}, {e}>();" for i, (a, b, c, d, e) in enumerate(insts))
+    run = "\n".join(f"    case {i}: return vds_launch_t<{', '.join(map(str, t))}>(w, esc, x, out, err, stamps, ldo, nrg, tbs, pf, trig, "
+                    f"flags, pdl);" for i, t in enumerate(insts))
+    info = "\n".join(f"    case {i}: return vds_info_t<{', '.join(map(str, t))}>();" for i, t in enumerate(insts))
     ns = sorted({ins[0] for ins in insts})
     return VDS_CUDA_SRC.replace("@RUNCASES@", run).replace("@INFOCASES@", info).replace("@WGSPECS@", vds_wg_specs(ns))
 
@@ -678,7 +709,7 @@ def vds_pack(wv, nwg, s, nstgm, bases=None):
     pos = isesc.nonzero()
     nesc = int(pos.shape[0])
     G = ncta * nw
-    esc = torch.full((G * 32,), -1, dtype=torch.int32, device=dev)
+    esc = torch.full((G * ESC_CAP,), -1, dtype=torch.int32, device=dev)
     if nesc:
         rt, u, ln, qq, jv = (pos[:, i] for i in range(5))
         rg, wi = rt // nw, rt % nw
@@ -694,7 +725,7 @@ def vds_pack(wv, nwg, s, nstgm, bases=None):
         if int(cnt.max()) > ESC_CAP:
             raise ValueError(f"escape cap: a warp has {int(cnt.max())} > {ESC_CAP} escapes")
         rank = torch.arange(nesc, device=dev) - (torch.cumsum(cnt, 0) - cnt)[gws]
-        esc[gws * 32 + rank] = _i32(ents)
+        esc[gws * ESC_CAP + rank] = _i32(ents)
     return {"w": v, "esc": esc, "tbs": vds_tbs(bases), "bases": bases, "nrg": nrg, "ncta": ncta, "nesc": nesc, "nw": nw,
             "nstgm": nstgm, "s": s, "spl": spl}
 
@@ -726,7 +757,7 @@ def vds_decode_check(wv, pk):
     e = pk["esc"].to(torch.int64) & 0xFFFFFFFF
     ok = e != 0xFFFFFFFF
     if bool(ok.any()):
-        gw = torch.arange(e.numel(), device=e.device)[ok] // 32
+        gw = torch.arange(e.numel(), device=e.device)[ok] // ESC_CAP
         ev = e[ok]
         st, ln, r, hf, x7 = ev >> 20, (ev >> 15) & 31, (ev >> 11) & 15, (ev >> 10) & 1, ev & 127
         c, wi = gw // nw, gw % nw
@@ -773,7 +804,7 @@ def selfcheck():
     for (proj, t_), cfgs in CONFIGS.items():
         w = proj_weight(W, proj)
         for kid, s, label in cfgs:
-            nn, nwg, nst, nstgm, out = VDS_INSTS[kid]
+            nn, nwg, nst, nstgm, out, cl_ = VDS_INSTS[kid]
             t0 = time.time()
             pk = vds_pack(w, nwg, s, nstgm, proj_bases(w, proj, nwg))
             ok = vds_decode_check(w, pk)
@@ -891,12 +922,12 @@ def main():
     rounds = int(arg("rounds", "6"))
     xhot = int(arg("xhot", "1"))
     layer = arg("layer", str(ROOT / "kernels" / "lab" / "k3_slim_3_ab.py"))
-    out_path = Path(arg("out", str(ROOT / "box_out" / "vds2" / "lab.json")))
+    out_path = Path(arg("out", str(ROOT / "box_out" / "vds3" / "lab.json")))
     mod = vds_build(VDS_INSTS, verbose=bool(int(arg("verbose", "0"))))
     infos = {i: list(mod.vds_info(i)) for i in range(len(VDS_INSTS))}
     for i, v in infos.items():
-        print(f"[vds] inst {i} {VDS_INSTS[i]}: smem {v[0]} regs {v[1]} local {v[2]} B occupancy {v[3]} SB {v[4]} "
-              f"nstgm {v[5]}", flush=True)
+        print(f"[vds] inst {i} {VDS_INSTS[i]}: smem {v[0]} regs {v[1]} local {v[2]} B occupancy {v[3]} SBW {v[4]} "
+              f"nstgm {v[5]} max-clusters {v[7]}", flush=True)
     if int(arg("build-only", "0")):
         return
     dev = torch.device("cuda")
@@ -922,7 +953,7 @@ def main():
         except Exception as ex:
             print(f"[vds] DG1 reference unavailable: {ex!r}", flush=True)
     results = {"insts": {str(i): infos[i] for i in infos}, "rows": []}
-    gnull = graph_of(lambda: mod.vds_run(-1, err, err, err, err, err, err, err, stamps, 0, 0, 1, [0] * 5, 0, 0, 0, 0))
+    gnull = graph_of(lambda: mod.vds_run(-1, err, err, err, err, err, stamps, 0, 0, [0] * 5, 0, 0, 0, 0))
     for proj in projs:
         n, k = PROJ[proj]
         w = proj_weight(W, proj)
@@ -931,7 +962,7 @@ def main():
         packs = {}
         for t_ in ts_:
             for kid, s, _ in CONFIGS.get((proj, t_), []):
-                nn, nwg, nst, nstgm, o_ = VDS_INSTS[kid]
+                nn, nwg, nst, nstgm, o_, cl_ = VDS_INSTS[kid]
                 key = (nwg, s, nstgm)
                 if key not in packs:
                     t0 = time.time()
@@ -973,7 +1004,7 @@ def main():
                 arms["dg1_cat"] = run_dg
                 ys["dg1_cat"] = (y_dg, 0)
             for ci, (kid, s, label) in enumerate(cfgs):
-                nn, nwg, nst, nstgm, o_ = VDS_INSTS[kid]
+                nn, nwg, nst, nstgm, o_, cl_ = VDS_INSTS[kid]
                 pk = packs[(nwg, s, nstgm)]
                 if pk is None:
                     continue
@@ -984,8 +1015,7 @@ def main():
                     name = f"vds{kid}_{label}{tag}"
 
                     def run(kid=kid, x=x, y=y, pk=pk, fl=fl, pf=pf, s=s):
-                        mod.vds_run(kid, pk["w"], pk["esc"], x, y, ws, cnt, err, stamps, y.stride(0), pk["nrg"], s, pk["tbs"],
-                                    pf, 1, fl, 0)
+                        mod.vds_run(kid, pk["w"], pk["esc"], x, y, err, stamps, y.stride(0), pk["nrg"], pk["tbs"], pf, 1, fl, 0)
                     arms[name] = run
                     ys[name] = (y, fl)
                     meta[name] = (kid, pk, fl, pf, s)
@@ -1009,8 +1039,8 @@ def main():
                     continue
                 for tp in ((17, 31) if m == 32 else (9, 13)):
                     yp = torch.full((tp, n), 7.0, dtype=odt, device=dev)
-                    mod.vds_run(kid, pk["w"], pk["esc"], x[:tp].contiguous(), yp, ws, cnt, err, stamps, yp.stride(0), pk["nrg"], s,
-                                pk["tbs"], 0, 0, 0, 0)
+                    mod.vds_run(kid, pk["w"], pk["esc"], x[:tp].contiguous(), yp, err, stamps, yp.stride(0), pk["nrg"], pk["tbs"],
+                                0, 0, 0, 0)
                     torch.cuda.synchronize()
                     c2 = check(yp, ref, tp, n)
                     print(f"[vds] {proj} T{m} {name}: partial T={tp}: rel {c2[0]:.1e} row {c2[1]:.1e} err {int(err[0].item())}",
@@ -1034,8 +1064,8 @@ def main():
                 torch.sum(flush, dim=0, out=sink)
                 if warm is not None:
                     warm()
-                mod.vds_run(kid, pk["w"], pk["esc"], x, ys[nm][0], ws, cnt, err, stamps, ys[nm][0].stride(0), pk["nrg"], s,
-                            pk["tbs"], pf, 0, fl | 8, 0)
+                mod.vds_run(kid, pk["w"], pk["esc"], x, ys[nm][0], err, stamps, ys[nm][0].stride(0), pk["nrg"], pk["tbs"], pf, 0,
+                            fl | 8, 0)
                 torch.cuda.synchronize()
                 nc, nw = pk["ncta"], pk["nw"]
                 sp = stamps[:5 * nc].view(-1, 5).double()
