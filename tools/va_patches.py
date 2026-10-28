@@ -464,7 +464,7 @@ def main_va2():
     GM.check(GM.finish(b, bn, bn.split()[2], chk_base, []) == b, f"{base.name} is not a finish() fixed point")
     tag = f"k3-va-{N}"
     nonce = f"# nonce {tag} ({base.stem} + VA2: flat warp-specialized FP8-wgmma verify-full attention, B >= 2; VA2_ENABLE)"
-    t = va2_src.va2_patches(b.replace(bn, nonce))
+    t = va2_src.p206_patches(va2_src.va2_patches(b.replace(bn, nonce)))
     rep = [f"base {base.name} {len(b.encode())} B is a finish() fixed point"]
     lab_only = "--lab-only" in sys.argv
     if lab_only:

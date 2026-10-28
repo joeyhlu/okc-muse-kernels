@@ -574,3 +574,18 @@ def va2_patches(text):
             raise ValueError(f"va2 anchor {what!r} found {text.count(old)} times")
         text = text.replace(old, new, 1)
     return text
+
+
+P206_NS_ANCHOR = '    ns, _ = p206_plan(batch, hkv, hq // hkv, length, data["page_table"].shape[1], d, _p206_num_sms(device))\n'
+
+
+def p206_patches(text):
+    """PR206 tuning hooks (A/B arms via module globals): P206_NS = {batch: num_splits} overrides p206_plan's split count
+    in p206_run (the route test still uses the plan)."""
+    if text.count(P206_NS_ANCHOR) != 1:
+        raise ValueError(f"p206 anchor found {text.count(P206_NS_ANCHOR)} times")
+    text = text.replace(P206_NS_ANCHOR, P206_NS_ANCHOR + "    ns = int(P206_NS.get(batch, ns))\n")
+    a = "def p206_run(data, pdl=True):\n"
+    if text.count(a) != 1:
+        raise ValueError("p206_run anchor")
+    return text.replace(a, "P206_NS = {}   # PR206 split count per batch (tools/va2_src.py p206_patches; {} = p206_plan)\n\n\n" + a)
