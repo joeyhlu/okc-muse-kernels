@@ -31,6 +31,10 @@ VARS = {"base": ("-DVM_TRICKS_DQ=0",), "wide": ("-DVM_TRICKS_DQ=0",) + P.WIDE_DE
         "sc": ("-DVM_TRICKS_DQ=0", "-DVM_SC=1"), "scm": ("-DVM_TRICKS_DQ=0", "-DVM_SC=1", "-DVM_MKW=64"),
         "cb": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1"), "cd": ("-DVM_TRICKS_DQ=0", "-DVM_DEFER2=1"),
         "cbd": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_DEFER2=1"),
+        "ps": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_PS=1"), "psm": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_PS=1", "-DVM_MKW=64"),
+        "ad": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_AD=1"), "adm": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_AD=1", "-DVM_MKW=64"),
+        "gf": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_GSM=1", "-DVM_FSW=1"),
+        "gfm": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", "-DVM_GSM=1", "-DVM_FSW=1", "-DVM_MKW=64"),
         "y4": ("-DVM_TRICKS_DQ=0", "-DVM_WG5=1", "-DVM_PREG=32", "-DVM_CREG=120", "-DVM_GV=4", "-DVM_JN=80", "-DVM_NX=2", "-DVM_XSN=80")}
 
 

@@ -473,19 +473,245 @@ for (int m = 0; m < 4; ++m) __stcg(reinterpret_cast<float4*>(A.y + (size_t)r * K
 """),
     ("(int64_t)vm::SMEM, VM_DP, VM_SC}; }", "(int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2}; }"),
 ]
-CUDA_PATCHES = CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES
+# ---- R-m32e-6: VM_PS (staggered first weight copies: the producer issues ring slot it < NS at tps + A.pdel x it ns, so
+# every CTA's first stage lands before the whole 14 MB start burst; marks showed the first slot landing 3.3-3.6 us after the
+# consumers are ready at T = 32 / 128) and, in VM_MKW=64 builds, per-segment timing marks: cols 56..61 = sum over WG 0's
+# segments of first-stage time / rest of the k-loop / wgmma drain / fixup + epilogue, segment count, stages after the first.
+_SEGMK = r"""#if VM_MKW == 64
+struct SegMk { long long t0, t1, t2, t3; bool on; };
+__device__ __forceinline__ void segmk_done(const Args& A, SegMk& m, int s0, int s1) {
+if (m.on) {
+const long long t4 = gtime();
+long long* mk = A.marks + (size_t)blockIdx.x * MKW;
+mk[56] += m.t1 - m.t0; mk[57] += m.t2 - m.t1; mk[58] += m.t3 - m.t2; mk[59] += t4 - m.t3; mk[60] += 1; mk[61] += s1 - s0 - 1;
+}
+}
+#endif
+"""
+PS_PATCHES = [
+    ("#ifndef VM_DEFER2\n#define VM_DEFER2 0\n#endif\n",
+     "#ifndef VM_DEFER2\n#define VM_DEFER2 0\n#endif\n#ifndef VM_PS\n#define VM_PS 0\n#endif\n"),
+    ("#if VM_SC\nint segA, segB;\n#endif\n", "#if VM_SC\nint segA, segB;\n#endif\n#if VM_PS\nint pdel;\n#endif\n"),
+    ("__device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars) {\nconst uint64_t pol = policy_evict_first();\n",
+     "__device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars) {\nconst uint64_t pol = policy_evict_first();\n"
+     "#if VM_PS\nconst long long tps = gtime();\n#endif\n"),
+    ("const int s = pb ? bstage(A, T, j, gs & 15) : (gs & 15);\nconst int e = T.jE[j];\n"
+     "const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW\n: A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;\n"
+     "const int sl = it % NS;\nif (it >= NS) mbar_wait(bars + 8 * (NS + sl), ((it / NS) & 1) ^ 1, A.err);\n",
+     "const int s = pb ? bstage(A, T, j, gs & 15) : (gs & 15);\nconst int e = T.jE[j];\n"
+     "const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW\n: A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;\n"
+     "const int sl = it % NS;\nif (it >= NS) mbar_wait(bars + 8 * (NS + sl), ((it / NS) & 1) ^ 1, A.err);\n"
+     "#if VM_PS\nelse if (it > 0 && A.pdel > 0) { const long long tw = tps + (long long)A.pdel * it; while (gtime() < tw) __nanosleep(32); }\n#endif\n"),
+    ("a.segA = (int)V[6 + 2 * VM_NTM]; a.segB = (int)V[7 + 2 * VM_NTM];\n#endif\n",
+     "a.segA = (int)V[6 + 2 * VM_NTM]; a.segB = (int)V[7 + 2 * VM_NTM];\n#endif\n#if VM_PS\n"
+     "TORCH_CHECK((int64_t)V.size() >= 7 + 2 * VM_NTM, \"vml_run: producer delay missing\");\na.pdel = (int)V[6 + 2 * VM_NTM];\n#endif\n"),
+    ("(int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2}; }", "(int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2, VM_PS}; }"),
+    ("template <bool PB, int N>\n__device__ __forceinline__ void seg(", _SEGMK + "template <bool PB, int N>\n__device__ __forceinline__ void seg("),
+    ("int q, int wp, int lane, Pend& pd) {\nfloat d[N / 2];\n",
+     "int q, int wp, int lane, Pend& pd) {\nfloat d[N / 2];\n"
+     "SEGMK(SegMk smk{0, 0, 0, 0, A.marks != nullptr && q == 0 && wp == 0 && lane == 0}; if (smk.on) smk.t0 = gtime();)\n"),
+    ("stage_m<N>(A, smem, bars, it, d2, q, wp, lane);\nif constexpr (VM_DEFER) pend_flush(A, pd, q, wp, lane);\n",
+     "stage_m<N>(A, smem, bars, it, d2, q, wp, lane);\nSEGMK(if (smk.on) smk.t1 = gtime();)\nif constexpr (VM_DEFER) pend_flush(A, pd, q, wp, lane);\n"),
+    ("for (int s = s0 + 1; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);\n",
+     "for (int s = s0 + 1; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);\nSEGMK(if (smk.on) smk.t2 = smk.t3 = gtime();)\n"),
+    ("stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true, pd);\n",
+     "stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true, pd);\nSEGMK(if (smk.on) smk.t1 = gtime();)\n"),
+    ("for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false, pd);\nwg_wait<0>();\n",
+     "for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false, pd);\n"
+     "SEGMK(if (smk.on) smk.t2 = gtime();)\nwg_wait<0>();\nSEGMK(if (smk.on) smk.t3 = gtime();)\n"),
+    ("if constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); return; }",
+     "if constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); SEGMK(segmk_done(A, smk, s0, s1);) return; }"),
+    ("if (!T.wlast[q]) return;\n", "if (!T.wlast[q]) { SEGMK(segmk_done(A, smk, s0, s1);) return; }\n"),
+    ("epilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);\n}\ntemplate <bool PB>\n",
+     "epilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);\nSEGMK(segmk_done(A, smk, s0, s1);)\n}\ntemplate <bool PB>\n"),
+]
+# ---- R-m32e-7: VM_AD (runtime flags bit 15): a phase-A split share red.adds its partial and returns; its count atomic,
+# last-arriver read-back and epilogue run one segment later (m32e_resolve, after the next segment, or at the next split /
+# the phase end), when its red.adds have long completed (R-m32e-6 marks: ~2 us per split share, wgmma drain ~0). MKW=64
+# builds also time the split-share atomic step (col 62) and the A epilogue's proxy fence + barrier + release (col 63).
+_AD_FN = r"""#if VM_AD
+template <int N>
+__device__ __forceinline__ void m32e_finish(const Args& A, Tab& T, Pend& pd, int q, int wp, int lane) {
+const int wt = (wp << 5) | lane;
+float* fb = A.fix + ((size_t)(pd.sslot * 4 + q)) * FIXW + wt * 4;
+int* fc = A.cnt + pd.sslot * 4 + q;
+float d[N / 2];
+fence_acq_rel();
+#pragma unroll
+for (int nt = 0; nt < N / 8; ++nt) {
+const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
+*reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
+}
+if (wt == 0) *fc = 0;
+epilogue<false, N>(A, T, pd.su >> 5, pd.su & 31, q, wp, lane, d, pd);
+}
+__device__ __noinline__ void m32e_resolve(const Args& A, Tab& T, Pend& pd, int q, int wp, int lane) {
+const int wt = (wp << 5) | lane;
+int* fc = A.cnt + pd.sslot * 4 + q;
+bar_sync(1 + q, 128);
+if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, pd.scnt) + pd.scnt == 16);
+bar_sync(1 + q, 128);
+pd.son = 0;
+if (!T.wlast[q]) return;
+switch (pd.snt) {
+case 1: m32e_finish<8>(A, T, pd, q, wp, lane); break;
+case 2: m32e_finish<16>(A, T, pd, q, wp, lane); break;
+case 3: m32e_finish<24>(A, T, pd, q, wp, lane); break;
+case 4: m32e_finish<32>(A, T, pd, q, wp, lane); break;
+case 5: m32e_finish<40>(A, T, pd, q, wp, lane); break;
+case 6: m32e_finish<48>(A, T, pd, q, wp, lane); break;
+case 7: m32e_finish<56>(A, T, pd, q, wp, lane); break;
+default: m32e_finish<64>(A, T, pd, q, wp, lane); break;
+}
+}
+#endif
+"""
+AD_PATCHES = [
+    ("#ifndef VM_PS\n#define VM_PS 0\n#endif\n", "#ifndef VM_PS\n#define VM_PS 0\n#endif\n#ifndef VM_AD\n#define VM_AD 0\n#endif\n"
+     "#if VM_MKW == 64\n#define SEGMK(...) __VA_ARGS__\n#else\n#define SEGMK(...)\n#endif\n"),
+    ("struct Pend { int i; };", "#if VM_AD\nstruct Pend { int i; int su, sslot, snt, scnt, son, stag; };\n#else\nstruct Pend { int i; };\n#endif\n//"),
+    ("template <bool PB, int N>\n__device__ __forceinline__ void seg(", _AD_FN + "template <bool PB, int N>\n__device__ __forceinline__ void seg("),
+    ("for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);\n"
+     "bar_sync(1 + q, 128);\nif (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);\nbar_sync(1 + q, 128);\n",
+     r"""for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);
+#if VM_AD
+if constexpr (!PB) {
+if (A.flags & 32768) {
+if (pd.son) m32e_resolve(A, T, pd, q, wp, lane);
+pd.son = 1; pd.su = u; pd.sslot = slot; pd.snt = N / 8; pd.scnt = s1 - s0; ++pd.stag;
+SEGMK(segmk_done(A, smk, s0, s1);)
+return;
+}
+}
+#endif
+SEGMK(long long t_at = smk.on ? gtime() : 0;)
+bar_sync(1 + q, 128);
+if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);
+bar_sync(1 + q, 128);
+SEGMK(if (smk.on) A.marks[(size_t)blockIdx.x * MKW + 62] += gtime() - t_at;)
+"""),
+    ("} else {\nfence_proxy_async();\nbar_sync(1 + q, 128);\nif (wt == 0) red_release_add(A.doneA + j * 16 + (ub >> 1), 1);\n}\n",
+     "} else {\nSEGMK(const long long t_f = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)\nfence_proxy_async();\nbar_sync(1 + q, 128);\n"
+     "if (wt == 0) red_release_add(A.doneA + j * 16 + (ub >> 1), 1);\n"
+     "SEGMK(if (A.marks && wt == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 63] += gtime() - t_f;)\n}\n"),
+    ("switch ((T.jC[j] + 7) >> 3) {\ncase 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;\n",
+     "#if VM_AD\nconst int tag0 = pd.stag;\n#endif\n"
+     "switch ((T.jC[j] + 7) >> 3) {\ncase 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;\n"),
+    ("default: seg<PB, VM_NTM * 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;\n}\ngs += s1 - s0;\n",
+     "default: seg<PB, VM_NTM * 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;\n}\n"
+     "#if VM_AD\nif constexpr (!PB) { if (pd.son && pd.stag == tag0) m32e_resolve(A, T, pd, q, wp, lane); }\n#endif\ngs += s1 - s0;\n"),
+    ("if constexpr ((VM_DEFER || VM_DEFER2) && !PB) pend_flush(A, pd, q, wp, lane);",
+     "#if VM_AD\nif constexpr (!PB) { if (pd.son) m32e_resolve(A, T, pd, q, wp, lane); }\n#endif\n"
+     "if constexpr ((VM_DEFER || VM_DEFER2) && !PB) pend_flush(A, pd, q, wp, lane);"),
+]
+# ---- R-m32e-8: VM_GSM (per-expert global scales copied to smem in route(); the epilogues read smem instead of a dependent
+# __ldg) and VM_FSW (SwiGLU with __fdividef; FP32 intermediates, same bf16 output rounding). MKW=64 builds add finer
+# epilogue marks: col 52 A epilogues, 53 A gs + SwiGLU + stores, 54 B epilogue (stores or BRED red.adds), 55 A last-arriver
+# read-back (fence_acq_rel + ldcg + zeroing). Compile-time switches only (no runtime branches in the consumer).
+GF_PATCHES = [
+    ("#ifndef VM_AD\n#define VM_AD 0\n#endif\n",
+     "#ifndef VM_AD\n#define VM_AD 0\n#endif\n#ifndef VM_GSM\n#define VM_GSM 0\n#endif\n#ifndef VM_FSW\n#define VM_FSW 0\n#endif\n"),
+    ("int est[E_LOC];\n", "int est[E_LOC];\n#if VM_GSM\nfloat gs13[E_LOC], gs2[E_LOC];\n#endif\n"),
+    ("T.est[lane] = est;\n", "T.est[lane] = est;\n#if VM_GSM\nT.gs13[lane] = __ldg(A.gsc13 + lane); T.gs2[lane] = __ldg(A.gsc2 + lane);\n#endif\n"),
+    ("__device__ __forceinline__ float swiglu(float g, float u) { return g / (1.f + __expf(-g)) * u; }",
+     "#if VM_FSW\n__device__ __forceinline__ float swiglu(float g, float u) { return __fdividef(g, 1.f + __expf(-g)) * u; }\n#else\n"
+     "__device__ __forceinline__ float swiglu(float g, float u) { return g / (1.f + __expf(-g)) * u; }\n#endif"),
+    ("if constexpr (!PB) {\nconst float gs = __ldg(A.gsc13 + e);\nconst int npad = (cn + 7) & ~7;\n",
+     "if constexpr (!PB) {\nSEGMK(const long long t_a0 = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)\n"
+     "#if VM_GSM\nconst float gs = T.gs13[e];\n#else\nconst float gs = __ldg(A.gsc13 + e);\n#endif\nconst int npad = (cn + 7) & ~7;\n"),
+    ("__float2bfloat16_rn(swiglu(d[4 * nt + hh] * gs, d[4 * nt + 2 + hh] * gs));\n}\n",
+     "__float2bfloat16_rn(swiglu(d[4 * nt + hh] * gs, d[4 * nt + 2 + hh] * gs));\n}\n"
+     "SEGMK(if (A.marks && wt == 0 && q == 0) { A.marks[(size_t)blockIdx.x * MKW + 52] += 1; A.marks[(size_t)blockIdx.x * MKW + 53] += gtime() - t_a0; })\n"),
+    ("} else {\nconst float gs = __ldg(A.gsc2 + e);\nconst int h0 = 16 * tg + g;\nfloat* yb = A.y + (size_t)T.jS[j] * KDIM;\n",
+     "} else {\nSEGMK(const long long t_b0 = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)\n"
+     "#if VM_GSM\nconst float gs = T.gs2[e];\n#else\nconst float gs = __ldg(A.gsc2 + e);\n#endif\n"
+     "const int h0 = 16 * tg + g;\nfloat* yb = A.y + (size_t)T.jS[j] * KDIM;\n"),
+    ("yb[(size_t)n * KDIM + h0 + 8] = d[4 * nt + 2 + hh] * gs;\n}\n}\n}\n}\n",
+     "yb[(size_t)n * KDIM + h0 + 8] = d[4 * nt + 2 + hh] * gs;\n}\n}\n"
+     "SEGMK(if (A.marks && wt == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 54] += gtime() - t_b0;)\n}\n}\n"),
+    ("const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;\nconst float gs = __ldg(A.gsc2 + e);\nconst int h0 = 16 * tg + g;\n",
+     "const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;\n"
+     "SEGMK(const long long t_r0 = (A.marks && wp == 0 && lane == 0 && q == 0) ? gtime() : 0;)\n"
+     "#if VM_GSM\nconst float gs = T.gs2[e];\n#else\nconst float gs = __ldg(A.gsc2 + e);\n#endif\nconst int h0 = 16 * tg + g;\n"),
+    ("asm volatile(\"red.global.add.f32 [%0], %1;\\n\" :: \"l\"(yb + (size_t)n * KDIM + h0 + 8), \"f\"(d[4 * nt + 2 + hh] * gs) : \"memory\");\n}\n}\n}\n",
+     "asm volatile(\"red.global.add.f32 [%0], %1;\\n\" :: \"l\"(yb + (size_t)n * KDIM + h0 + 8), \"f\"(d[4 * nt + 2 + hh] * gs) : \"memory\");\n}\n}\n"
+     "SEGMK(if (A.marks && wp == 0 && lane == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 54] += gtime() - t_r0;)\n}\n"),
+    ("if (!T.wlast[q]) { SEGMK(segmk_done(A, smk, s0, s1);) return; }\nfence_acq_rel();\n",
+     "if (!T.wlast[q]) { SEGMK(segmk_done(A, smk, s0, s1);) return; }\nSEGMK(const long long t_rb = smk.on ? gtime() : 0;)\nfence_acq_rel();\n"),
+    ("if (wt == 0) *fc = 0;\n}\nepilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);\n",
+     "if (wt == 0) *fc = 0;\nSEGMK(if (smk.on) A.marks[(size_t)blockIdx.x * MKW + 55] += gtime() - t_rb;)\n}\nepilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);\n"),
+]
+# ---- R-m32e-10 (parent queue after FSW): VM_UD = the wgmma B descriptor as one 64-bit "l" operand, built once per stage
+# (base + slot offset) and advanced by constants, instead of mov.b64 from two 32-bit registers inside every wgmma asm (the
+# R-unp-1 SASS: R2UR / IMAD.MOV / VIADD at every wgmma); VM_SYNC7 = flags bit 7 (mma.sync for nt <= 2) at compile time;
+# VM_NOB9 = flags bit 9 code (B stage order, a 64-bit divide in afin) compiled out; VM_LD = griddepcontrol.launch_dependents
+# at the A -> B boundary, so vm_fin (PDL secondary) launches and loads its norm weights under vm_main's end.
+UD_PATCHES = [
+    ("#ifndef VM_GSM\n#define VM_GSM 0\n#endif\n",
+     "#ifndef VM_GSM\n#define VM_GSM 0\n#endif\n#ifndef VM_UD\n#define VM_UD 0\n#endif\n#ifndef VM_SYNC7\n#define VM_SYNC7 0\n#endif\n"
+     "#ifndef VM_NOB9\n#define VM_NOB9 0\n#endif\n#ifndef VM_LD\n#define VM_LD 0\n#endif\n"
+     "#if VM_NOB9\n#define VM_F9(a) (0)\n#else\n#define VM_F9(a) ((a).flags & 512)\n#endif\n"),
+    ("template <int N> __device__ __forceinline__ void wgmma_zero(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t lo, uint32_t hi);\n",
+     "template <int N> __device__ __forceinline__ void wgmma_zero(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t lo, uint32_t hi);\n"
+     "template <int N> __device__ __forceinline__ void wgmma_acc64(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc);\n"
+     "template <int N> __device__ __forceinline__ void wgmma_zero64(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc);\n"),
+    ("wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + 16, dhi);\n}\n",
+     "wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + 16, dhi);\n}\n#if VM_UD\ntemplate <int N, bool Z>\n"
+     "__device__ __forceinline__ void mma2u(float* d, const uint32_t* hh, uint64_t desc) {\n"
+     "if constexpr (Z) wgmma_zero64<N>(d, hh[0], hh[4], hh[1], hh[5], desc);\nelse wgmma_acc64<N>(d, hh[0], hh[4], hh[1], hh[5], desc);\n"
+     "wgmma_acc64<N>(d, hh[2], hh[6], hh[3], hh[7], desc + 16);\n}\n#endif\n"),
+    ("const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);\n",
+     "const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);\n"
+     "#if VM_UD\nconst uint64_t dsc = d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));\n#endif\n"),
+    ("const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);\nconst uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);\n",
+     "const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);\nconst uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);\n"
+     "#if VM_UD\nconst uint64_t dsc = d0;\n#endif\n"),
+    ("if (first && i == 0 && hf == 0) mma2<N, true>(d, hh, dlo + 64 * i + 32 * hf, dhi);\nelse mma2<N, false>(d, hh, dlo + 64 * i + 32 * hf, dhi);\n",
+     "#if VM_UD\nif (first && i == 0 && hf == 0) mma2u<N, true>(d, hh, dsc + (uint64_t)(64 * i + 32 * hf));\n"
+     "else mma2u<N, false>(d, hh, dsc + (uint64_t)(64 * i + 32 * hf));\n#else\n"
+     "if (first && i == 0 && hf == 0) mma2<N, true>(d, hh, dlo + 64 * i + 32 * hf, dhi);\nelse mma2<N, false>(d, hh, dlo + 64 * i + 32 * hf, dhi);\n#endif\n"),
+    ("if constexpr (N <= 16) sync_path = (A.flags & 128) != 0;\n",
+     "#if VM_SYNC7\nif constexpr (N <= 16) sync_path = true;\n#else\nif constexpr (N <= 16) sync_path = (A.flags & 128) != 0;\n#endif\n"),
+    ("if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * MKW + 6] = gtime();\n",
+     "if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * MKW + 6] = gtime();\n"
+     "#if VM_LD\nif (tid == 0) asm volatile(\"griddepcontrol.launch_dependents;\\n\" ::: \"memory\");\n#endif\n"),
+]
+CUDA_PATCHES = CUDA_PATCHES + DP_PATCHES + SC_PATCHES + CS_PATCHES + PS_PATCHES + AD_PATCHES + GF_PATCHES + UD_PATCHES
+CUDA_REPLACE_ALL = [("(A.flags & 512)", "VM_F9(A)")]   # every bit-9 test (compile-time 0 under VM_NOB9)
+
+# wgmma specializations with the B descriptor as one 64-bit operand (VM_UD); same formatting as the 32-bit-pair specs
+WG64_FN = r'''def @WG@64(n):
+    na = n // 2
+    outs = ",".join(f"%{i}" for i in range(na))
+    a = ",".join(f"%{na + i}" for i in range(4))
+    plus = ", ".join(f'"+f"(d[{i}])' for i in range(na))
+    eq = ", ".join(f'"=f"(d[{i}])' for i in range(na))
+    body = "wgmma.mma_async.sync.aligned.m64n%dk16.f32.bf16.bf16 {%s}, {%s}, %%%d, %d, 1, 1, 0;\\n"
+    s = ""
+    for nm, sd, cons in (("wgmma_acc64", 1, plus), ("wgmma_zero64", 0, eq)):
+        s += ("template <> __device__ __forceinline__ void %s<%d>(float* d, uint32_t a0, uint32_t a1, uint32_t a2, "
+              "uint32_t a3, uint64_t desc) {\n  asm volatile(\"" % (nm, n)
+              + body % (n, outs, a, na + 4, sd)
+              + "\"\n    : %s\n    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"l\"(desc));\n}\n" % cons)
+    return s
+
+
+'''
 
 # Python-level patches; @P@ = "" (lab) or "_vml_" (layer). Lab and layer spell some lines differently (indent, names).
 PY_PATCHES = [
-    ('"".join(@WG@(n) for n in (8, 16, 24, 32, 40, 48, 56, 64))', '"".join(@WG@(n) for n in range(8, 129, 8))'),
+    ('"".join(@WG@(n) for n in (8, 16, 24, 32, 40, 48, 56, 64))', '"".join(@WG@(n) + @WG@64(n) for n in range(8, 129, 8))'),
+    ("def @WG@(n):\n", WG64_FN + "def @WG@(n):\n"),
     ('void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V);\n',
      'void vml_run(std::vector<torch::Tensor> T, std::vector<int64_t> V);\nstd::vector<int64_t> vml_cfg();\n'),
     ('functions=["vml_run"]', 'functions=["vml_run", "vml_cfg"]'),
     ('"fix": z((2 * @P@SLOTS * 4 * @P@FIXW,), torch.float32)', '"fix": z((2 * (@P@SLOTS + 384) * 4 * @P@FIXW,), torch.float32)'),
     ('"cnt": z((2 * @P@SLOTS * 4,))', '"cnt": z((2 * (@P@SLOTS + 384) * 4,))'),
-    ('mask=3, out=None, flags=None, cost=None):', 'mask=3, out=None, flags=None, cost=None, pool=(0, 0), seg=(0, 0)):'),
+    ('mask=3, out=None, flags=None, cost=None):', 'mask=3, out=None, flags=None, cost=None, pool=(0, 0), seg=(0, 0), pdel=0):'),
     ('list(@P@COST + @P@COST if cost is None else cost))',
-     '@P@cost_ext(mod, @P@COST + @P@COST if cost is None else cost) + @P@pool_ext(mod, pool) + @P@seg_ext(mod, seg))'),
+     '@P@cost_ext(mod, @P@COST + @P@COST if cost is None else cost) + @P@pool_ext(mod, pool) + @P@seg_ext(mod, seg)'
+     ' + @P@pdel_ext(mod, pdel))'),
 ]
 
 COST_EXT = '''
@@ -514,6 +740,11 @@ def @P@pool_ext(mod, pool):
 def @P@seg_ext(mod, seg):
     """the per-unit-start costs (A, B; cost units) a VM_SC build reads after the cost table; [] otherwise."""
     return [int(seg[0]), int(seg[1])] if @P@cfg(mod)[7] else []
+
+
+def @P@pdel_ext(mod, pdel):
+    """the staggered-start delay (ns per ring slot) a VM_PS build reads after the cost table; [] otherwise."""
+    return [int(pdel)] if @P@cfg(mod)[10] else []
 
 
 def @P@cfg(mod):
@@ -552,6 +783,9 @@ def patch_cuda(cuda):
             new = new.replace(_LOOP_SPLIT, mb)
             old = mb
         cuda = sub1(cuda, old, new, f"cuda patch {i}")
+    for old, new in CUDA_REPLACE_ALL:
+        assert cuda.count(old) >= 1, old
+        cuda = cuda.replace(old, new)
     return cuda
 
 

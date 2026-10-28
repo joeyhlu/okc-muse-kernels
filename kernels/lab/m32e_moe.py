@@ -50,6 +50,22 @@ def _mag(d):
     return -(-(1 << 40) // d)
 
 
+def _wg_spec64(n):
+    na = n // 2
+    outs = ",".join(f"%{i}" for i in range(na))
+    a = ",".join(f"%{na + i}" for i in range(4))
+    plus = ", ".join(f'"+f"(d[{i}])' for i in range(na))
+    eq = ", ".join(f'"=f"(d[{i}])' for i in range(na))
+    body = "wgmma.mma_async.sync.aligned.m64n%dk16.f32.bf16.bf16 {%s}, {%s}, %%%d, %d, 1, 1, 0;\\n"
+    s = ""
+    for nm, sd, cons in (("wgmma_acc64", 1, plus), ("wgmma_zero64", 0, eq)):
+        s += ("template <> __device__ __forceinline__ void %s<%d>(float* d, uint32_t a0, uint32_t a1, uint32_t a2, "
+              "uint32_t a3, uint64_t desc) {\n  asm volatile(\"" % (nm, n)
+              + body % (n, outs, a, na + 4, sd)
+              + "\"\n    : %s\n    : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"l\"(desc));\n}\n" % cons)
+    return s
+
+
 def _wg_spec(n):
     na = n // 2
     outs = ",".join(f"%{i}" for i in range(na))
@@ -126,6 +142,40 @@ constexpr int DPMAX = 384, SLOTSD = SLOTS + (VM_DP ? DPMAX : 0);
 #ifndef VM_DEFER2
 #define VM_DEFER2 0
 #endif
+#ifndef VM_PS
+#define VM_PS 0
+#endif
+#ifndef VM_AD
+#define VM_AD 0
+#endif
+#ifndef VM_GSM
+#define VM_GSM 0
+#endif
+#ifndef VM_UD
+#define VM_UD 0
+#endif
+#ifndef VM_SYNC7
+#define VM_SYNC7 0
+#endif
+#ifndef VM_NOB9
+#define VM_NOB9 0
+#endif
+#ifndef VM_LD
+#define VM_LD 0
+#endif
+#if VM_NOB9
+#define VM_F9(a) (0)
+#else
+#define VM_F9(a) ((a).flags & 512)
+#endif
+#ifndef VM_FSW
+#define VM_FSW 0
+#endif
+#if VM_MKW == 64
+#define SEGMK(...) __VA_ARGS__
+#else
+#define SEGMK(...)
+#endif
 static_assert(!(VM_BRED && VM_DP), "m32e: VM_BRED and VM_DP use different split paths");
 #ifndef VM_SC
 #define VM_SC 0
@@ -142,6 +192,9 @@ int jE[JMAX], jC[JMAX], jS[JMAX + 1], jrow[JMAX + 1];
 uint32_t cpA[JMAX + 1], cpB[JMAX + 1];
 int bA[GMAX + 1], bB[GMAX + 1];
 int est[E_LOC];
+#if VM_GSM
+float gs13[E_LOC], gs2[E_LOC];
+#endif
 int bready, pad1;                 // bit 9: B stage orders below are written (x-producer lanes 1-31, during phase A)
 uint32_t brd[16];                 // bit 9 scratch: predicted readiness of one job's 16 B stages
 uint8_t bpos[16];                 // bit 9 scratch: order position -> stage
@@ -166,6 +219,9 @@ int poolA, poolB;
 #if VM_SC
 int segA, segB;
 #endif
+#if VM_PS
+int pdel;
+#endif
 #if VM_MKW == 64
 int G0;
 #endif
@@ -186,7 +242,11 @@ uint32_t d;
 asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(0x80008000u));
 return d;
 }
+#if VM_FSW
+__device__ __forceinline__ float swiglu(float g, float u) { return __fdividef(g, 1.f + __expf(-g)) * u; }
+#else
 __device__ __forceinline__ float swiglu(float g, float u) { return g / (1.f + __expf(-g)) * u; }
+#endif
 __device__ __forceinline__ float bf16r(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint32_t b, int n) {
@@ -281,6 +341,8 @@ template <int NPEND>
 __device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(NPEND) : "memory"); }
 template <int N> __device__ __forceinline__ void wgmma_acc(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t lo, uint32_t hi);
 template <int N> __device__ __forceinline__ void wgmma_zero(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t lo, uint32_t hi);
+template <int N> __device__ __forceinline__ void wgmma_acc64(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc);
+template <int N> __device__ __forceinline__ void wgmma_zero64(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc);
 @WGSPECS@
 __device__ __forceinline__ uint32_t mdiv(uint32_t a, unsigned long long m) {
 const unsigned long long lo = (unsigned long long)a * (m & 0xFFFFFFFFull);
@@ -391,6 +453,9 @@ T.jE[j] = lane; T.jC[j] = sz; T.jS[j] = est + k * base; T.jrow[j] = r;
 r += (sz + 7) & ~7;
 }
 T.est[lane] = est;
+#if VM_GSM
+T.gs13[lane] = __ldg(A.gsc13 + lane); T.gs2[lane] = __ldg(A.gsc2 + lane);
+#endif
 #if VM_DP
 {
 const int njT = __reduce_add_sync(0xffffffffu, nj), RT = __reduce_add_sync(0xffffffffu, tot), RpT = __reduce_add_sync(0xffffffffu, prow);
@@ -659,16 +724,19 @@ if (clock64() - t0 > WAIT_BUDGET) { atomicExch(A.err, 3); break; }
 __threadfence_block();
 }
 __device__ __forceinline__ int bstage(const Args& A, const Tab& T, int j, int s) {
-return (A.flags & 512) ? (int)((T.bperm[j] >> (4 * s)) & 15ull) : s;
+return VM_F9(A) ? (int)((T.bperm[j] >> (4 * s)) & 15ull) : s;
 }
 
 __device__ void prod_w(const Args& A, const Tab& T, uint32_t ring, uint32_t bars) {
 const uint64_t pol = policy_evict_first();
+#if VM_PS
+const long long tps = gtime();
+#endif
 const int c = blockIdx.x;
 int it = 0;
 for (int pb = 0; pb < 2; ++pb) {
 const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
-if (pb && (A.flags & 512)) bperm_wait(A, T);
+if (pb && VM_F9(A)) bperm_wait(A, T);
 for (int i = 0; i < g1 - g0; ++i, ++it) {
 const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
 const int u = gs >> 4;
@@ -679,6 +747,9 @@ const uint8_t* src = pb ? A.ws2 + ((size_t)(e * 32 + 2 * ub) * 16 + s) * SW
 : A.ws13 + ((size_t)(e * 64 + 2 * ub) * 16 + s) * SW;
 const int sl = it % NS;
 if (it >= NS) mbar_wait(bars + 8 * (NS + sl), ((it / NS) & 1) ^ 1, A.err);
+#if VM_PS
+else if (it > 0 && A.pdel > 0) { const long long tw = tps + (long long)A.pdel * it; while (gtime() < tw) __nanosleep(32); }
+#endif
 const uint32_t fb = bars + 8 * sl, dst = ring + sl * US;
 mbar_expect_tx(fb, US);
 bulk_g2s_ef(dst, src, SW, fb, pol);
@@ -726,7 +797,7 @@ int kq = 0;
 #endif
 for (int pb = 0; pb < 2; ++pb) {
 const int g0 = pb ? T.bB[c] : T.bA[c], g1 = pb ? T.bB[c + 1] : T.bA[c + 1], sp = split_point(A, pb, g0, g1);
-if (pb && (A.flags & 512)) bperm_wait(A, T);
+if (pb && VM_F9(A)) bperm_wait(A, T);
 int lastj = -1;
 for (int i = 0; i < g1 - g0; ++i, ++it) {
 const int gs = (sp + i < g1) ? sp + i : sp + i - (g1 - g0);
@@ -819,6 +890,14 @@ if constexpr (Z) wgmma_zero<N>(d, hh[0], hh[4], hh[1], hh[5], dlo, dhi);
 else wgmma_acc<N>(d, hh[0], hh[4], hh[1], hh[5], dlo, dhi);
 wgmma_acc<N>(d, hh[2], hh[6], hh[3], hh[7], dlo + 16, dhi);
 }
+#if VM_UD
+template <int N, bool Z>
+__device__ __forceinline__ void mma2u(float* d, const uint32_t* hh, uint64_t desc) {
+if constexpr (Z) wgmma_zero64<N>(d, hh[0], hh[4], hh[1], hh[5], desc);
+else wgmma_acc64<N>(d, hh[0], hh[4], hh[1], hh[5], desc);
+wgmma_acc64<N>(d, hh[2], hh[6], hh[3], hh[7], desc + 16);
+}
+#endif
 #ifndef VM_DEFER
 #define VM_DEFER 0
 #endif
@@ -854,7 +933,12 @@ const uint32_t sgp = __byte_perm(sw2, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16
 #pragma unroll
 for (int j = 0; j < 4; ++j) { hh[j] = bmul2l(hh[j], sgp); hh[4 + j] = bmul2h(hh[4 + j], sgp); }
 }
-struct Pend { int i; };   // doneA index (job x 16 + unit / 2) whose release is still pending (< 0: none); WG-uniform
+#if VM_AD
+struct Pend { int i; int su, sslot, snt, scnt, son, stag; };
+#else
+struct Pend { int i; };
+#endif
+//   // doneA index (job x 16 + unit / 2) whose release is still pending (< 0: none); WG-uniform
 __device__ __forceinline__ void pend_flush(const Args& A, Pend& pd, int q, int wp, int lane) {
 if (pd.i >= 0) {
 fence_proxy_async();
@@ -890,9 +974,15 @@ const uint32_t zo = (uint32_t)A.flags >> 30;   // 0 (flags < 2^30), opaque to th
 const uint32_t k16 = 16u + zo, k64 = VM_TRICKS_DQ ? 64u + zo : 64u, k4 = VM_TRICKS_DQ ? 4u + zo : 4u;
 const uint64_t d0 = wg_desc_sa(sa(smem + NS * US), 4096u);
 const uint32_t dlo = (uint32_t)d0 + (uint32_t)xs * (uint32_t)(XS >> 4), dhi = (uint32_t)(d0 >> 32);
+#if VM_UD
+const uint64_t dsc = d0 + (uint64_t)((uint32_t)xs * (uint32_t)(XS >> 4));
+#endif
 #else
 const uint64_t d0 = wg_desc_sa(sa(smem + NS * US + xs * XS), 4096u);
 const uint32_t dlo = (uint32_t)d0, dhi = (uint32_t)(d0 >> 32);
+#if VM_UD
+const uint64_t dsc = d0;
+#endif
 #endif
 #pragma unroll
 for (int i = 0; i < 4; ++i) {
@@ -913,8 +1003,13 @@ if (i == 3 && hf == 0) { __syncwarp(); if (lane == 0) mbar_arrive(bars + 8 * (NS
 dec_half(hf ? c[i].y : c[i].x, hf ? c[i].w : c[i].z, Sg, S8, hh);
 #endif
 wg_fence();
+#if VM_UD
+if (first && i == 0 && hf == 0) mma2u<N, true>(d, hh, dsc + (uint64_t)(64 * i + 32 * hf));
+else mma2u<N, false>(d, hh, dsc + (uint64_t)(64 * i + 32 * hf));
+#else
 if (first && i == 0 && hf == 0) mma2<N, true>(d, hh, dlo + 64 * i + 32 * hf, dhi);
 else mma2<N, false>(d, hh, dlo + 64 * i + 32 * hf, dhi);
+#endif
 wg_commit();
 wg_wait<1>();
 if (i == 0 && hf == 0 && prevx >= 0) {
@@ -984,7 +1079,12 @@ const int g = lane >> 2, t = lane & 3, wt = (wp << 5) | lane;
 const int e = T.jE[j], cn = T.jC[j];
 const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;
 if constexpr (!PB) {
+SEGMK(const long long t_a0 = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)
+#if VM_GSM
+const float gs = T.gs13[e];
+#else
 const float gs = __ldg(A.gsc13 + e);
+#endif
 const int npad = (cn + 7) & ~7;
 const int col = 8 * tg + g, s2 = col >> 8, kk = col & 255;
 const int i = kk >> 6, tt = (kk >> 4) & 3, qq = (kk >> 1) & 7, b = kk & 1;
@@ -998,15 +1098,23 @@ if (n < cn)
 xb[((((nt * 4 + i) * 8 + qq) * 8 + (2 * t + hh)) * 4 + tt) * 2 + b] =
 __float2bfloat16_rn(swiglu(d[4 * nt + hh] * gs, d[4 * nt + 2 + hh] * gs));
 }
+SEGMK(if (A.marks && wt == 0 && q == 0) { A.marks[(size_t)blockIdx.x * MKW + 52] += 1; A.marks[(size_t)blockIdx.x * MKW + 53] += gtime() - t_a0; })
 if constexpr (VM_DEFER || VM_DEFER2) {
 pd.i = j * 16 + (ub >> 1);
 } else {
+SEGMK(const long long t_f = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)
 fence_proxy_async();
 bar_sync(1 + q, 128);
 if (wt == 0) red_release_add(A.doneA + j * 16 + (ub >> 1), 1);
+SEGMK(if (A.marks && wt == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 63] += gtime() - t_f;)
 }
 } else {
+SEGMK(const long long t_b0 = (A.marks && wt == 0 && q == 0) ? gtime() : 0;)
+#if VM_GSM
+const float gs = T.gs2[e];
+#else
 const float gs = __ldg(A.gsc2 + e);
+#endif
 const int h0 = 16 * tg + g;
 float* yb = A.y + (size_t)T.jS[j] * KDIM;
 #pragma unroll
@@ -1019,6 +1127,7 @@ yb[(size_t)n * KDIM + h0] = d[4 * nt + hh] * gs;
 yb[(size_t)n * KDIM + h0 + 8] = d[4 * nt + 2 + hh] * gs;
 }
 }
+SEGMK(if (A.marks && wt == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 54] += gtime() - t_b0;)
 }
 }
 #if VM_BRED
@@ -1027,7 +1136,12 @@ __device__ __forceinline__ void bred(const Args& A, const Tab& T, int j, int ub,
 const int g = lane >> 2, t = lane & 3;
 const int e = T.jE[j], cn = T.jC[j];
 const int tg = (2 * ub + (q >> 1)) * 8 + (q & 1) * 4 + wp;
+SEGMK(const long long t_r0 = (A.marks && wp == 0 && lane == 0 && q == 0) ? gtime() : 0;)
+#if VM_GSM
+const float gs = T.gs2[e];
+#else
 const float gs = __ldg(A.gsc2 + e);
+#endif
 const int h0 = 16 * tg + g;
 float* yb = A.y + (size_t)T.jS[j] * KDIM;
 #pragma unroll
@@ -1040,31 +1154,89 @@ asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0)
 asm volatile("red.global.add.f32 [%0], %1;\n" :: "l"(yb + (size_t)n * KDIM + h0 + 8), "f"(d[4 * nt + 2 + hh] * gs) : "memory");
 }
 }
+SEGMK(if (A.marks && wp == 0 && lane == 0 && q == 0) A.marks[(size_t)blockIdx.x * MKW + 54] += gtime() - t_r0;)
+}
+#endif
+#if VM_MKW == 64
+struct SegMk { long long t0, t1, t2, t3; bool on; };
+__device__ __forceinline__ void segmk_done(const Args& A, SegMk& m, int s0, int s1) {
+if (m.on) {
+const long long t4 = gtime();
+long long* mk = A.marks + (size_t)blockIdx.x * MKW;
+mk[56] += m.t1 - m.t0; mk[57] += m.t2 - m.t1; mk[58] += m.t3 - m.t2; mk[59] += t4 - m.t3; mk[60] += 1; mk[61] += s1 - s0 - 1;
+}
+}
+#endif
+#if VM_AD
+template <int N>
+__device__ __forceinline__ void m32e_finish(const Args& A, Tab& T, Pend& pd, int q, int wp, int lane) {
+const int wt = (wp << 5) | lane;
+float* fb = A.fix + ((size_t)(pd.sslot * 4 + q)) * FIXW + wt * 4;
+int* fc = A.cnt + pd.sslot * 4 + q;
+float d[N / 2];
+fence_acq_rel();
+#pragma unroll
+for (int nt = 0; nt < N / 8; ++nt) {
+const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
+*reinterpret_cast<float4*>(fb + nt * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
+}
+if (wt == 0) *fc = 0;
+epilogue<false, N>(A, T, pd.su >> 5, pd.su & 31, q, wp, lane, d, pd);
+}
+__device__ __noinline__ void m32e_resolve(const Args& A, Tab& T, Pend& pd, int q, int wp, int lane) {
+const int wt = (wp << 5) | lane;
+int* fc = A.cnt + pd.sslot * 4 + q;
+bar_sync(1 + q, 128);
+if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, pd.scnt) + pd.scnt == 16);
+bar_sync(1 + q, 128);
+pd.son = 0;
+if (!T.wlast[q]) return;
+switch (pd.snt) {
+case 1: m32e_finish<8>(A, T, pd, q, wp, lane); break;
+case 2: m32e_finish<16>(A, T, pd, q, wp, lane); break;
+case 3: m32e_finish<24>(A, T, pd, q, wp, lane); break;
+case 4: m32e_finish<32>(A, T, pd, q, wp, lane); break;
+case 5: m32e_finish<40>(A, T, pd, q, wp, lane); break;
+case 6: m32e_finish<48>(A, T, pd, q, wp, lane); break;
+case 7: m32e_finish<56>(A, T, pd, q, wp, lane); break;
+default: m32e_finish<64>(A, T, pd, q, wp, lane); break;
+}
 }
 #endif
 template <bool PB, int N>
 __device__ __forceinline__ void seg(const Args& A, Tab& T, uint8_t* smem, uint32_t bars, int& it, int u, int s0, int s1,
 int q, int wp, int lane, Pend& pd) {
 float d[N / 2];
+SEGMK(SegMk smk{0, 0, 0, 0, A.marks != nullptr && q == 0 && wp == 0 && lane == 0}; if (smk.on) smk.t0 = gtime();)
 bool sync_path = false;
+#if VM_SYNC7
+if constexpr (N <= 16) sync_path = true;
+#else
 if constexpr (N <= 16) sync_path = (A.flags & 128) != 0;
+#endif
 if (sync_path) {
 float d2[2][N / 2];
 #pragma unroll
 for (int k = 0; k < N / 2; ++k) { d2[0][k] = 0.f; d2[1][k] = 0.f; }
 stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
+SEGMK(if (smk.on) smk.t1 = gtime();)
 if constexpr (VM_DEFER) pend_flush(A, pd, q, wp, lane);
 #pragma unroll 1
 for (int s = s0 + 1; s < s1; ++s) stage_m<N>(A, smem, bars, it, d2, q, wp, lane);
+SEGMK(if (smk.on) smk.t2 = smk.t3 = gtime();)
 #pragma unroll
 for (int k = 0; k < N / 2; ++k) d[k] = d2[0][k] + d2[1][k];
 } else {
 uint32_t hb[2][8];
 int prevx = -1;
 stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, true, pd);
+SEGMK(if (smk.on) smk.t1 = gtime();)
 #pragma unroll 1
 for (int s = s0 + 1; s < s1; ++s) stage<N>(A, smem, bars, it, prevx, d, hb, q, wp, lane, false, pd);
+SEGMK(if (smk.on) smk.t2 = gtime();)
 wg_wait<0>();
+SEGMK(if (smk.on) smk.t3 = gtime();)
 if (lane == 0) mbar_arrive(bars + 8 * (2 * NS + NX + prevx));
 }
 if constexpr (VM_DEFER2) pend_flush(A, pd, q, wp, lane);
@@ -1072,7 +1244,7 @@ constexpr int UBL = PB ? 4 : 5;
 const int j = u >> UBL, ub = u & ((1 << UBL) - 1);
 if (!(s0 == 0 && s1 == 16)) {
 #if VM_BRED
-if constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); return; }
+if constexpr (PB) { bred<N>(A, T, j, ub, q, wp, lane, d); SEGMK(segmk_done(A, smk, s0, s1);) return; }
 #endif
 const int wt = (wp << 5) | lane;
 #if VM_DP
@@ -1087,10 +1259,23 @@ int* fc = A.cnt + (PB * SLOTS + slot) * 4 + q;
 #endif
 #pragma unroll
 for (int nt = 0; nt < N / 8; ++nt) red_add_v4(fb + nt * 512, d[4 * nt], d[4 * nt + 1], d[4 * nt + 2], d[4 * nt + 3]);
+#if VM_AD
+if constexpr (!PB) {
+if (A.flags & 32768) {
+if (pd.son) m32e_resolve(A, T, pd, q, wp, lane);
+pd.son = 1; pd.su = u; pd.sslot = slot; pd.snt = N / 8; pd.scnt = s1 - s0; ++pd.stag;
+SEGMK(segmk_done(A, smk, s0, s1);)
+return;
+}
+}
+#endif
+SEGMK(long long t_at = smk.on ? gtime() : 0;)
 bar_sync(1 + q, 128);
 if (wt == 0) T.wlast[q] = (atom_acqrel_add(fc, s1 - s0) + (s1 - s0) == 16);
 bar_sync(1 + q, 128);
-if (!T.wlast[q]) return;
+SEGMK(if (smk.on) A.marks[(size_t)blockIdx.x * MKW + 62] += gtime() - t_at;)
+if (!T.wlast[q]) { SEGMK(segmk_done(A, smk, s0, s1);) return; }
+SEGMK(const long long t_rb = smk.on ? gtime() : 0;)
 fence_acq_rel();
 #pragma unroll
 for (int nt = 0; nt < N / 8; ++nt) {
@@ -1099,8 +1284,10 @@ const float4 v = __ldcg(reinterpret_cast<const float4*>(fb + nt * 512));
 d[4 * nt] = v.x; d[4 * nt + 1] = v.y; d[4 * nt + 2] = v.z; d[4 * nt + 3] = v.w;
 }
 if (wt == 0) *fc = 0;
+SEGMK(if (smk.on) A.marks[(size_t)blockIdx.x * MKW + 55] += gtime() - t_rb;)
 }
 epilogue<PB, N>(A, T, j, ub, q, wp, lane, d, pd);
+SEGMK(segmk_done(A, smk, s0, s1);)
 }
 template <bool PB>
 #if VM_DP
@@ -1166,6 +1353,9 @@ if (!(s0 == 0 && s1 == 16)) mk[51] += 1;
 #else
 if (A.marks && q == 0 && wp == 0 && lane == 0) A.marks[(size_t)c * 32 + 8 + 8 * PB + ((T.jC[j] + 7) >> 3) - 1] += s1 - s0;
 #endif
+#if VM_AD
+const int tag0 = pd.stag;
+#endif
 switch ((T.jC[j] + 7) >> 3) {
 case 1: seg<PB, 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
 case 2: seg<PB, 16>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
@@ -1200,8 +1390,14 @@ case 15: seg<PB, 120>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
 #endif
 default: seg<PB, VM_NTM * 8>(A, T, smem, bars, it, u, s0, s1, q, wp, lane, pd); break;
 }
+#if VM_AD
+if constexpr (!PB) { if (pd.son && pd.stag == tag0) m32e_resolve(A, T, pd, q, wp, lane); }
+#endif
 gs += s1 - s0;
 }
+#if VM_AD
+if constexpr (!PB) { if (pd.son) m32e_resolve(A, T, pd, q, wp, lane); }
+#endif
 if constexpr ((VM_DEFER || VM_DEFER2) && !PB) pend_flush(A, pd, q, wp, lane);   // before phase B: its x waits on these releases
 }
 
@@ -1251,7 +1447,7 @@ if (A.flags & 64) gather_warp(A, T, ent, lane);
 #endif
 bar_sync(6, 32 * NCW + 32);
 if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
-else if (A.flags & 512) bperm_lanes(A, T, lane);
+else if VM_F9(A) bperm_lanes(A, T, lane);
 }
 return;
 }
@@ -1278,6 +1474,9 @@ phase<false>(A, T, smem, bars, it, q, wp, lane, kq);
 phase<false>(A, T, smem, bars, it, q, wp, lane);
 #endif
 if (wp == 0 && lane == 0 && A.marks && q == 0) A.marks[(size_t)blockIdx.x * MKW + 6] = gtime();
+#if VM_LD
+if (tid == 0) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
 #if VM_DP
 phase<true>(A, T, smem, bars, it, q, wp, lane, kq);
 #else
@@ -1414,6 +1613,10 @@ a.poolA = (int)V[6 + 2 * VM_NTM]; a.poolB = (int)V[7 + 2 * VM_NTM];
 TORCH_CHECK((int64_t)V.size() >= 8 + 2 * VM_NTM, "vml_run: segment costs missing");
 a.segA = (int)V[6 + 2 * VM_NTM]; a.segB = (int)V[7 + 2 * VM_NTM];
 #endif
+#if VM_PS
+TORCH_CHECK((int64_t)V.size() >= 7 + 2 * VM_NTM, "vml_run: producer delay missing");
+a.pdel = (int)V[6 + 2 * VM_NTM];
+#endif
 a.magG = (unsigned long long)V[3]; a.flags = (int)V[5];
 for (int k = 0; k < 2 * VM_NTM; ++k) { a.cost[k] = (uint32_t)V[6 + k]; a.mag[k] = ((1ull << 40) + V[6 + k] - 1) / V[6 + k]; }
 auto stream = at::cuda::getCurrentCUDAStream();
@@ -1437,9 +1640,9 @@ cfg.attrs = at; cfg.numAttrs = 1;
 C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, vm::vm_fin, a));
 }
 }
-std::vector<int64_t> vml_cfg() { return {VM_JN, VM_NTM, VM_NX, VM_XSN, VM_MKW, (int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2}; }
+std::vector<int64_t> vml_cfg() { return {VM_JN, VM_NTM, VM_NX, VM_XSN, VM_MKW, (int64_t)vm::SMEM, VM_DP, VM_SC, VM_BRED, VM_DEFER2, VM_PS}; }
 """
-CUDA = (CUDA_T.replace("@WGSPECS@", "".join(_wg_spec(n) for n in range(8, 129, 8)))
+CUDA = (CUDA_T.replace("@WGSPECS@", "".join(_wg_spec(n) + _wg_spec64(n) for n in range(8, 129, 8)))
         .replace("@JMAX@", str(JMAX)).replace("@SLOTS@", str(SLOTS)).replace("@FIXW@", str(FIXW))
         )
 
@@ -1499,6 +1702,11 @@ def seg_ext(mod, seg):
     return [int(seg[0]), int(seg[1])] if cfg(mod)[7] else []
 
 
+def pdel_ext(mod, pdel):
+    """the staggered-start delay (ns per ring slot) a VM_PS build reads after the cost table; [] otherwise."""
+    return [int(pdel)] if cfg(mod)[10] else []
+
+
 def cfg(mod):
     """(JN, NTM, NX, XSN, MKW, SMEM, DP, SC) of a build (m32e); cached on the module object."""
     c = getattr(mod, "_m32e_cfg", None)
@@ -1516,7 +1724,7 @@ WIDE_DEFS = ('-DVM_JN=112', '-DVM_NX=2', '-DVM_XSN=112')
 FLAGS_DEFAULT = 1   # bit 0: phase A trailing partial unit first, bit 1: x rows -> L2 at kernel start, bit 2: weights after gather, (bits 3 / 4 / 5 killed: R-vml-4 / R-vml-5), bit 6: consumers self-fill the first NX-1 x slots, x producer warp gathers, bit 7: mma.sync for nt <= 2 segments, bit 8: vm_main as a PDL secondary, bit 9: phase-B stage order by predicted A readiness
 
 
-def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None, pool=(0, 0), seg=(0, 0)):
+def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None, cost=None, pool=(0, 0), seg=(0, 0), pdel=0):
     m = x.shape[0]
     assert m <= MMAX
     flags = FLAGS_DEFAULT if flags is None else flags
@@ -1524,5 +1732,5 @@ def call(mod, k, sc, x, ids, wts, ls=0, marks=None, mask=3, out=None, flags=None
         out = torch.empty((m, KDIM), dtype=torch.bfloat16, device=x.device)
     mod.vml_run([x, ids, wts, k["ws13"], k["ws2"], k["gsc13"], k["gsc2"], k["nw"], sc["xA"], sc["xB"], sc["y"], sc["fix"],
                  sc["cnt"], sc["xready"], sc["doneA"], sc["rmap"], out, sc["err"], sc["nomark"] if marks is None else marks, sc["gbar"]],
-                [m, ls, sc["G"], sc["magG"], mask, flags] + cost_ext(mod, COST + COST if cost is None else cost) + pool_ext(mod, pool) + seg_ext(mod, seg))
+                [m, ls, sc["G"], sc["magG"], mask, flags] + cost_ext(mod, COST + COST if cost is None else cost) + pool_ext(mod, pool) + seg_ext(mod, seg) + pdel_ext(mod, pdel))
     return out
