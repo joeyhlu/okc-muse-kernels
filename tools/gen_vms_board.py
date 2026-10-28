@@ -68,8 +68,34 @@ def main():
     block = ('VMS_CUDA_SRC = r"""' + cuda + '"""\nVMS_CPP_SRC = r"""' + cpp + '"""\n'
              + vms_patches.PY_BLOCK.replace("@MAXT@", str(MAXT)).replace("@FL@", str(FL)))
     tail = TAIL
+    if N >= 2:   # board weights hold all 256 experts: prepack 256 + 32 wrapped, kernel_fn slices [lo, lo + 32) views
+        for a, b in (
+            ('        if E != K2A_E_LOC or tuple(w["w13"].shape[1:]) != (2 * K2A_D_EXPERT, K2A_D_HIDDEN // 2):',
+             '        if tuple(w["w13"].shape[1:]) != (2 * K2A_D_EXPERT, K2A_D_HIDDEN // 2):'),
+            ('        wA = torch.empty((E, 512, VMS_UB), dtype=torch.uint8, device=dev)',
+             '        EW = E + 32 if E > 32 else E\n        wA = torch.empty((EW, 512, VMS_UB), dtype=torch.uint8, device=dev)'),
+            ('        wB = torch.empty((E, 256, VMS_UB), dtype=torch.uint8, device=dev)',
+             '        wB = torch.empty((EW, 256, VMS_UB), dtype=torch.uint8, device=dev)'),
+            ('        for e in range(E):\n            wA[e] = _vms_prepack_expert(w["w13"][e], w["w13_sf"][e], True)\n'
+             '            wB[e] = _vms_prepack_expert(w["w2"][e], w["w2_sf"][e], False)',
+             '        for e in range(EW):\n            wA[e] = _vms_prepack_expert(w["w13"][e % E], w["w13_sf"][e % E], True)\n'
+             '            wB[e] = _vms_prepack_expert(w["w2"][e % E], w["w2_sf"][e % E], False)'),
+            ('(w["w13_gs"].float().reshape(E) * two62).contiguous()',
+             '(w["w13_gs"].float().reshape(E)[torch.arange(EW, device=dev) % E] * two62).contiguous()'),
+            ('(w["w2_gs"].float().reshape(E) * two62).contiguous()',
+             '(w["w2_gs"].float().reshape(E)[torch.arange(EW, device=dev) % E] * two62).contiguous()'),
+        ):
+            assert block.count(a) == 1, a[:60]
+            block = block.replace(a, b)
+        a = '''                      vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"], out,
+                      vs["nomarks"], m, K2A_POST_NORM_EPS, 0, int(data["config"]["local_start"]), VMS_FL)'''
+        b = '''                      vs["wA"][lo:lo + 32], vs["wB"][lo:lo + 32], vs["gsA"][lo:lo + 32], vs["gsB"][lo:lo + 32], vs["nw"],
+                      vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"], out, vs["nomarks"], m, K2A_POST_NORM_EPS, 0, lo, VMS_FL)'''
+        assert tail.count(a) == 1
+        tail = tail.replace(a, b).replace('        vs = st["vms"]\n', '        vs = st["vms"]\n        lo = int(data["config"]["local_start"]) % 256\n')
     if N == 1:   # frozen v1 lab revision: run() has no fl argument
         block = block.replace(", K2A_POST_NORM_EPS, 1, 0, VMS_FL)", ", K2A_POST_NORM_EPS, 1, 0)").replace(f"VMS_FL = {FL}\n", "")
+        block = block.replace(' f"-DVMS_FL={VMS_FL}",', '')
         tail = tail.replace(', int(data["config"]["local_start"]), VMS_FL)', ', int(data["config"]["local_start"]))')
     s = t.rstrip("\n") + "\n\n" + block + tail
     names = [getattr(n, "name", None) or (n.targets[0].id if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
