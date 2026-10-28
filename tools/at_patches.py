@@ -302,29 +302,18 @@ def prepare(weights):
 
 
 def _at_table(choice, vs):
-    cur, tab = _at_cur(), {}
+    cur, out = _at_cur(), {}
     for (op, b), name in choice.items():
-        v = next((v for v in vs if v[0] == op and v[1] == name and b in v[2] and v[5]), None)
-        if v is not None:
-            for kind in v[3]:
-                tab.setdefault((b, kind), []).append(v[4])
-    out = {}
-    for key, ovs in tab.items():
-        m = {}
-        for ov in ovs:
-            for k, x in ov.items():
-                if k in m and isinstance(x, dict) and isinstance(m[k], dict) and isinstance(cur.get(k), dict):
-                    y = dict(m[k])
-                    for kk in cur[k]:
-                        if kk not in x:
-                            y.pop(kk, None)
-                    for kk, xx in x.items():
-                        if kk not in cur[k] or cur[k][kk] != xx:
-                            y[kk] = xx
-                    m[k] = y
-                else:
-                    m[k] = x
-        out[key] = m
+        for v in vs:
+            if v[0] == op and v[1] == name and b in v[2] and v[5]:
+                for kind in v[3]:
+                    m = out.setdefault((b, kind), {})
+                    for k, x in v[4].items():
+                        c = cur.get(k)
+                        if k in m and isinstance(x, dict) and isinstance(m[k], dict) and isinstance(c, dict):
+                            x = {**{q: y for q, y in m[k].items() if q in x or q not in c},
+                                 **{q: y for q, y in x.items() if q not in c or c[q] != y}}
+                        m[k] = x
     return out
 
 
@@ -361,32 +350,26 @@ def _at_stream(base, T, L, kap, seed, dev):
 
 def _at_input(B, L, seed, dev):
     g = torch.Generator(device=dev).manual_seed(seed)
-    T = B * L
-    longest = int(AT_CTX * (1 + AT_SPREAD)) + 1 if B > 1 else AT_CTX
-    if B > 1:
-        u = torch.rand((B,), generator=g, device=dev)
-        seq = (AT_CTX * (1 + AT_SPREAD * (2 * u - 1))).long().clamp(1, longest)
-    else:
-        seq = torch.full((B,), AT_CTX, dtype=torch.long, device=dev)
-    maxp = longest + L
-    total = B * maxp
-    perm = torch.randperm(total, generator=g, device=dev).to(torch.int32)
-    pt = torch.full((B, maxp), -1, dtype=torch.int32, device=dev)
-    n, off = (seq + L).tolist(), 0
-    for b in range(B):
-        pt[b, :n[b]] = perm[off:off + n[b]]
-        off += n[b]
-    pos = (seq[:, None] + torch.arange(L, device=dev)).contiguous()
-    kv = [torch.randint(0, 256, (total, 1, 2, 64), generator=g, device=dev, dtype=torch.uint8).bitwise_and_(0xBF).view(FP8)
+    T, I = B * L, torch.int32
+    hi = int(AT_CTX * (1 + AT_SPREAD)) + 1 if B > 1 else AT_CTX
+    seq = ((AT_CTX * (1 + AT_SPREAD * (2 * torch.rand((B,), generator=g, device=dev) - 1))).long().clamp(1, hi) if B > 1
+           else torch.full((B,), AT_CTX, dtype=torch.long, device=dev))
+    mp = hi + L
+    perm = torch.randperm(B * mp, generator=g, device=dev).to(I)
+    pt = torch.full((B, mp), -1, dtype=I, device=dev)
+    off = 0
+    for b, n in enumerate((seq + L).tolist()):
+        pt[b, :n] = perm[off:off + n]
+        off += n
+    pos = seq[:, None] + torch.arange(L, device=dev)
+    kv = [torch.randint(0, 256, (B * mp, 1, 2, 64), generator=g, device=dev, dtype=torch.uint8).bitwise_and_(0xBF).view(FP8)
           for _ in range(2)]
-    one = torch.ones((), dtype=torch.float32, device=dev)
-    return {"stream": torch.zeros((T, HIDDEN), dtype=torch.float32, device=dev),
-            "attn_input": torch.zeros((T, HIDDEN), dtype=torch.bfloat16, device=dev),
-            "positions": pos.reshape(-1).contiguous(), "cache_loc": torch.gather(pt.long(), 1, pos).reshape(-1).contiguous(),
-            "cache_seqlens": (seq + L).to(torch.int32), "scheduler_metadata": None,
-            "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=torch.int32, device=dev),
-            "k_cache": kv[0], "v_cache": kv[1], "k_scale": one, "v_scale": one.clone(), "page_table": pt,
-            "seq_lens": seq.to(torch.int32), "local_start": torch.zeros((1,), dtype=torch.int32, device=dev)}
+    one = torch.ones((), device=dev)
+    return {"stream": torch.zeros((T, HIDDEN), device=dev), "attn_input": torch.zeros((T, HIDDEN), dtype=torch.bfloat16, device=dev),
+            "positions": pos.reshape(-1), "cache_loc": torch.gather(pt.long(), 1, pos).reshape(-1), "cache_seqlens": (seq + L).to(I),
+            "scheduler_metadata": None, "cu_seqlens_q": torch.arange(0, T + 1, L, dtype=I, device=dev), "k_cache": kv[0],
+            "v_cache": kv[1], "k_scale": one, "v_scale": one.clone(), "page_table": pt, "seq_lens": seq.to(I),
+            "local_start": torch.zeros((1,), dtype=I, device=dev)}
 
 
 def _at_cfg(B, L, kind):
@@ -477,28 +460,28 @@ def _at_capture(d, state, ov, st):
 
 def _at_measure(d, state, base, kap, cands, tm, seed, nseeds, dl):
     cfg = d["config"]
-    B, L, T = cfg["batch"], cfg["q_len"], cfg["tokens"]
     gs, ids, bad, tols = [], [], {}, []
     for v in cands:
         try:
-            gs.append(_at_capture(d, state, (v[4] if v is not None else {}), tm[2]))
-            ids.append(None if v is None else (v[0], v[1]))
-            tols.append(AT_TOL if v is None or len(v) < 8 or v[7] is None else v[7])
+            gs.append(_at_capture(d, state, v[4] if v else {}, tm[2]))
+            ids.append(v and (v[0], v[1]))
+            tols.append(v[7] if v and len(v) > 7 and v[7] is not None else AT_TOL)
         except Exception as ex:
             if v is None:
                 raise
             bad[(v[0], v[1])] = f"capture {ex!r}"[:120]
             torch.cuda.synchronize()
-    K, rnd = len(gs), 0
+    K = len(gs)
     ts, rs = [[] for _ in gs], [[] for _ in gs]
     for si in range(nseeds):
-        _at_set_stream(d, _at_stream(base, T, L, kap, seed + 7 * si, d["stream"].device), state)
+        _at_set_stream(d, _at_stream(base, cfg["tokens"], cfg["q_len"], kap, seed + 7 * si, d["stream"].device), state)
         tm[5] = (d["stream"].clone(), d["attn_input"].clone())
         torch.cuda.synchronize()
-        for _ in range(AT_ROUNDS):
-            order = list(range(K))
-            order, rnd = order[rnd % K:] + order[:rnd % K], rnd + 1
-            t = {i: max(_at_replay(gs[i][0], tm, d) - tm[4], 1e-3) for i in order}
+        for r in range(AT_ROUNDS):
+            t = {}
+            for i in range(K):
+                j = (i + si * AT_ROUNDS + r) % K
+                t[j] = max(_at_replay(gs[j][0], tm, d) - tm[4], 1e-3)
             for i in range(K):
                 ts[i].append(t[i])
                 rs[i].append(t[0] / t[i])
@@ -507,16 +490,15 @@ def _at_measure(d, state, base, kap, cands, tm, seed, nseeds, dl):
     outs = []
     for g, out in gs:
         _at_replay(g, tm, d)
-        outs.append(tuple(t.clone() for t in out))
+        outs.append([t.clone() for t in out])
     o0, s0, i0 = outs[0]
     for i in range(1, K):
         o, s, ii = outs[i]
         eo = float((o.float() - o0.float()).norm() / o0.float().norm().clamp(min=1e-30))
         es = float((s - s0).norm() / (s0 - tm[5][0]).norm().clamp(min=1e-30))
-        agree = float((torch.sort(ii, -1).values == torch.sort(i0, -1).values).float().mean())
-        if not (eo < tols[i] and es < tols[i] and agree > 0.9 and bool(torch.isfinite(o.float()).all())):
-            bad[ids[i]] = f"out {eo:.1e} stream {es:.1e} ids {agree:.2f}"
-    del gs, outs
+        ag = float((ii.sort(-1).values == i0.sort(-1).values).float().mean())
+        if not (eo < tols[i] and es < tols[i] and ag > 0.9 and bool(o.float().isfinite().all())):
+            bad[ids[i]] = f"out {eo:.1e} stream {es:.1e} ids {ag:.2f}"
     return {"ids": ids, "t": [_at_med(x) for x in ts], "r": [_at_med(x) for x in rs], "n": len(ts[0]), "bad": bad,
             "w": AT_WEIGHT["sliding" if cfg["window"] else "full"]}
 
@@ -575,16 +557,14 @@ def _at_tune(state, weights, t0, base):
     if t1 - t0 > AT_SKIP_AFTER_S:
         print(f"[at] skipped: prepare already took {t1 - t0:.0f}s: shipped routes", flush=True)
         return
-    res, cal, lines, ng = {}, {}, [], 0
+    res, cal, lines, loads = {}, {}, [], {}
     try:
         dev = weights["qkv_gate"].device
-        vs = _at_variants(state)
-        _AT["vars"] = vs
+        vs = _AT["vars"] = _at_variants(state)
         act = [v for v in vs if v[5] and (v[6] or AT_DIAG)]
         bud = AT_DIAG_BUDGET_S if AT_DIAG else AT_BUDGET_S
         dl, dl2 = t1 + 0.8 * bud, t1 + bud
         tm = _at_timer(dev)
-        loads = {}
         for B, L in AT_LOADS:
             T, b = B * L, _k2a_bucket_of(B * L)
             loads[b] = (B, L)
@@ -600,61 +580,48 @@ def _at_tune(state, weights, t0, base):
                 if (want[kind] or AT_DIAG) and time.time() < dl:
                     d = dict(data, config=_at_cfg(B, L, kind))
                     res[(b, kind)] = _at_measure(d, state, base, cal[T][0], [None] + want[kind], tm, 2000 + T, AT_SEEDS, dl)
-                    ng += 1 + len(want[kind])
 #@D+
                     if AT_DIAG and AT_TIMELINES and kind == "sliding":
                         _at_timelines(d, state, tm, b)
 #@D-
             del data
             torch.cuda.empty_cache()
-        units = {}
+        units, choice, rows = {}, {}, []
         for v in act:
-            if v[6]:
-                for b in v[2]:
-                    units.setdefault((v[0], b), []).append(v)
-        choice, rows = {}, []
+            for b in (v[2] if v[6] else ()):
+                units.setdefault((v[0], b), []).append(v)
         for (op, b), cand in sorted(units.items(), key=str):
             shp = [(b, k) for k in cand[0][3] if (b, k) in res]
-            if not shp:
-                continue
-            gains, best = [], None
-            for v in cand:
-                g = _at_gain(res, shp, (v[0], v[1]))
-                bad = [res[k]["bad"].get((v[0], v[1])) for k in shp]
-                gains.append(f"{v[1]} " + (f"x{g:.3f}" if g is not None else "BAD(" + "; ".join(x for x in bad if x) + ")"))
-                if g is not None and (best is None or g > best[1]):
-                    best = (v[1], g)
-            pick = best[0] if best is not None and best[1] > 1 + AT_MARGIN else None
-            if pick:
-                choice[(op, b)] = pick
-            ts = "/".join(f"{res[k]['t'][0]:.1f}" for k in shp)
-            rows.append([op, b, f"[at] {op}/{b} ({'+'.join(k[1][0] for k in shp)}): ship {ts} us; {', '.join(gains)} -> ", pick])
+            if shp:
+                gs = [(v[1], _at_gain(res, shp, (v[0], v[1]))) for v in cand]
+                best = max(((g, n) for n, g in gs if g is not None), default=(0.0, None))
+                if best[0] > 1 + AT_MARGIN:
+                    choice[(op, b)] = best[1]
+                bad = lambda n: "; ".join(res[k]["bad"][(op, n)] for k in shp if (op, n) in res[k]["bad"])
+                rows.append((op, b, f"[at] {op}/{b} ({'+'.join(k[1][0] for k in shp)}): ship " + "/".join(
+                    f"{res[k]['t'][0]:.1f}" for k in shp) + " us; " + ", ".join(
+                    f"{n} " + (f"x{g:.3f}" if g is not None else f"BAD({bad(n)})") for n, g in gs) + " -> "))
         if AT_CONFIRM and choice and time.time() < dl2:
             tab = _at_table(choice, vs)
             for b in sorted({k[0] for k, ov in tab.items() if ov}):
                 B, L = loads[b]
-                T = B * L
+                T, num, den = B * L, 0.0, 0.0
                 data = _at_input(B, L, 3000 + T, dev)
-                num = den = 0.0
                 for kind in ("sliding", "full"):
-                    ov = tab.get((b, kind))
-                    if ov:
-                        d = dict(data, config=_at_cfg(B, L, kind))
+                    if tab.get((b, kind)):
                         tl = max([AT_TOL] + [v[7] for v in vs if v[7] is not None and choice.get((v[0], b)) == v[1] and b in v[2]])
-                        r = _at_measure(d, state, base, cal[T][0], [None, ("all", "combo", (b,), (kind,), ov, True, True, tl)],
-                                        tm, 4000 + T, 2, dl2)
-                        w = AT_WEIGHT[kind]
-                        ok = not r["bad"] and len(r["r"]) > 1
-                        num, den = num + w * r["t"][0], den + (w * r["t"][0] / r["r"][1] if ok else 1e30)
+                        r = _at_measure(dict(data, config=_at_cfg(B, L, kind)), state, base, cal[T][0],
+                                        [None, ("all", "combo", (b,), (kind,), tab[(b, kind)], True, True, tl)], tm, 4000 + T, 2, dl2)
+                        num += AT_WEIGHT[kind] * r["t"][0]
+                        den += AT_WEIGHT[kind] * r["t"][0] / r["r"][1] if not r["bad"] and len(r["r"]) > 1 else 1e30
                 g = num / den if den > 0 else 0.0
-                keep = g > 1 + AT_MARGIN / 2
-                lines.append(f"[at] confirm bucket {b}: combination x{g:.3f} vs ship -> {'kept' if keep else 'REVERTED to ship'}")
-                if not keep:
+                lines.append(f"[at] confirm bucket {b}: combination x{g:.3f} vs ship -> "
+                             + ("kept" if g > 1 + AT_MARGIN / 2 else "REVERTED to ship"))
+                if g <= 1 + AT_MARGIN / 2:
                     choice = {u: n for u, n in choice.items() if u[1] != b}
                 del data
-        for row in rows:
-            row[3] = choice.get((row[0], row[1]))
-            print(row[2] + (row[3] or "ship"), flush=True)
+        for op, b, txt in rows:
+            print(txt + choice.get((op, b), "ship"), flush=True)
 #@D+
         if AT_DIAG:
             for key, r in sorted(res.items(), key=str):
@@ -663,16 +630,15 @@ def _at_tune(state, weights, t0, base):
                 cells += "".join(f" | {i[0]}:{i[1]} BAD {m}" for i, m in r["bad"].items() if i not in r["ids"])
                 print(f"[at] diag {key[0]}/{key[1]}: ship {r['t'][0]:.1f} us (n {r['n']}) | {cells}", flush=True)
 #@D-
-        _AT["choice"] = choice
-        _AT["call"] = _at_table(choice, vs)
+        _AT["choice"], _AT["call"] = choice, _at_table(choice, vs)
         for ln in lines:
             print(ln, flush=True)
-        ks = ", ".join(f"T={t}: k {c[0]:.2f} R {c[1]:.1f}/{AT_ROUTER[_k2a_bucket_of(t)][0]} D {c[2]:.1f}/{AT_ROUTER[_k2a_bucket_of(t)][1]}"
-                       for t, c in sorted(cal.items()))
         _AT["secs"] = time.time() - t1
-        print(f"[at] autotune {_AT['secs']:.1f}s ({ng} graphs, {len(res)} shapes, {AT_SEEDS}x{AT_ROUNDS} rounds, replay overhead "
-              f"{tm[4]:.1f} us, margin {AT_MARGIN:.3f}, diag {AT_DIAG}); routing {ks}; decided "
-              f"{ {f'{u[0]}/{u[1]}': n for u, n in sorted(choice.items(), key=str)} or 'none (shipped routes)'}; "
+        print(f"[at] autotune {_AT['secs']:.1f}s ({sum(len(r['ids']) for r in res.values())} graphs, {len(res)} shapes, "
+              f"{AT_SEEDS}x{AT_ROUNDS} rounds, replay overhead {tm[4]:.1f} us, margin {AT_MARGIN:.3f}, diag {AT_DIAG}); routing "
+              + ", ".join(f"T={t}: k {c[0]:.2f} R {c[1]:.1f}/{AT_ROUTER[_k2a_bucket_of(t)][0]} D {c[2]:.1f}/"
+                          f"{AT_ROUTER[_k2a_bucket_of(t)][1]}" for t, c in sorted(cal.items()))
+              + f"; decided {', '.join(f'{u[0]}/{u[1]} {n}' for u, n in sorted(choice.items(), key=str)) or 'none (shipped routes)'}; "
               f"prepare total {time.time() - t0:.1f}s", flush=True)
     except Exception as ex:
         _AT["call"], _AT["choice"] = {}, {}
