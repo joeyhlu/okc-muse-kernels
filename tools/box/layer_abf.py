@@ -49,7 +49,8 @@ def main():
         b.update(FIELDS[b["load"]])
     rs = arg("router-seed", 8677534258059892491)
     weights = ref.generate_weights(ref.WEIGHTS_SEED, device="cuda", router_seed=rs)
-    arms = [{"name": a["name"], "file": a["file"], "set": keyfix(a.get("set", {}))} for a in json.loads(Path(sys.argv[1]).read_text())]
+    raw_arms = json.loads(Path(sys.argv[1]).read_text())   # written back as given: keyfix makes tuple keys JSON cannot hold
+    arms = [{"name": a["name"], "file": a["file"], "set": keyfix(a.get("set", {}))} for a in raw_arms]
     mods, states = {}, {}
     for i, f in enumerate(dict.fromkeys(a["file"] for a in arms)):
         t0 = time.time()
@@ -119,7 +120,7 @@ def main():
         if arg("out", ""):
             dst = Path(arg("out", ""))
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(json.dumps(dict(module="files", arms=arms, router_seed=rs, shapes=measurements), indent=2, default=str))
+            dst.write_text(json.dumps(dict(module="files", arms=raw_arms, router_seed=rs, shapes=measurements), indent=2, default=str))
         del graphs, statics
         torch.cuda.synchronize()
     loads = {}
