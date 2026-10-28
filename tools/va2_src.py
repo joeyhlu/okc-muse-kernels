@@ -22,6 +22,21 @@ __device__ __forceinline__ uint64_t desc_sw128(const void* ptr) {   // K-major, 
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(ptr);
   return (uint64_t)((a & 0x3FFFF) >> 4) | (1ull << 16) | (64ull << 32) | (1ull << 62);
 }
+// VT 1: V^T per head = 72 rows (64 dims + 8 rows of e4m3 ones) x 64 keys in P-register order, K-major, 64-B swizzle
+// (8-row atoms of 512 B; logical byte c of row n at (n >> 3) * 512 + (n & 7) * 64 + ((((c >> 4) ^ (n >> 1)) & 3) << 4) + (c & 15)),
+// 4608 B per head, buffers 9728 B apart (512-B aligned); built per tile with 2 ldmatrix.x4.trans + 8 prmt + 8 4-byte stores.
+__device__ __forceinline__ uint64_t desc_sw64(const void* ptr) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(ptr);
+  return (uint64_t)((a & 0x3FFFF) >> 4) | (1ull << 16) | (32ull << 32) | (2ull << 62);
+}
+__device__ __forceinline__ int vt_sw(int n, int c) { return (n >> 3) * 512 + (n & 7) * 64 + ((((c >> 4) ^ (n >> 1)) & 3) << 4) + (c & 15); }
+__device__ __forceinline__ void pv_issue_sw(float (&O)[36], const uint32_t (&pa)[2][4], const uint8_t* vt) {
+  wg_fence();
+  const uint64_t d = desc_sw64(vt);
+  wg_rs72(O, pa[0], d);
+  wg_rs72(O, pa[1], d + 2);
+  wg_commit();
+}
 __device__ __forceinline__ void qk_issue_sw(float (&S)[32], const uint64_t dq, const uint64_t dk) {
   wg_fence();
   wg_ss(S, dq, dk, 0);
@@ -73,8 +88,10 @@ __device__ __forceinline__ bool va2_softmax_lazy(float (&S)[32], const float (&m
 // Registers: 2 CTAs/SM put 5-6 warps on an SM sub-partition (16 K regs each). PW 1: 288 threads, ptxas caps at 96 regs.
 // PW 4: 384 threads (launch 80 regs), the producer warpgroup drops to 32 and the consumers rise to 104 (setmaxnreg;
 // the pool must balance per sub-partition: 4 x (80 - 32) >= 8 x (104 - 80), else setmaxnreg.inc never returns).
-template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0, int PP = 0, int VT = 0,
+          int LZ = 0>
 __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
+  constexpr int VTB = VT ? 9728 : VT_BYTES;   // V^T buffer stride
 #if K1_ARCH_OK
   constexpr int L = 8;
   extern __shared__ __align__(128) uint8_t smem_raw[];
@@ -116,7 +133,11 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     if (lane == 0) sV[B] = carry;
   }
   __syncthreads();
-  if (tid < 64 * (NVT + 1 - NB)) {   // e4m3 ones in row group 8 of every V^T region (NVT ring buffers + the new tile)
+  if (VT && tid < 64 * NVT) {   // VT 1: rows 64..71 of both heads' V^T regions = e4m3 ones (row sums)
+    const int buf = tid >> 6, hh = (tid >> 5) & 1, ch = tid & 31;
+    *reinterpret_cast<uint4*>(vtb + buf * VTB + hh * 4608 + 4096 + ch * 16) = make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
+  }
+  if (!VT && tid < 64 * (NVT + 1 - NB)) {   // e4m3 ones in row group 8 of every V^T region (NVT ring buffers + the new tile)
     const int buf = tid >> 6, rg = (tid >> 4) & 3, ch = tid & 15;
     uint8_t* base = (buf < NVT) ? (vtb + buf * VT_BYTES) : (newk + 8192);
     *reinterpret_cast<uint4*>(base + rg * VT_REGION + 8 * VT_SBO + (ch & 7) * 16 + (ch >> 3) * 128) =
@@ -243,11 +264,27 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
   const uint64_t dq = desc_il(qs + h * 4096, 128, 512);
   auto transpose_v = [&](int nn) {
     const uint8_t* stg = smem + (nn % ST) * STAGE_BYTES + 8192;
+    if constexpr (VT) {   // keys 16 wq .. 16 wq + 15 of head h, dims 32u .. 32u + 31 per ldmatrix.x4 (matrix m = 2 gB + b)
+      const int mm = lane >> 3, key = 16 * wq + 8 * (mm & 1) + (lane & 7), vq = lane & 3, vp = lane >> 2;
+      uint8_t* vt = vtb + (nn % NVT) * VTB + h * 4608;
+#pragma unroll
+      for (int u = 0; u < 2; ++u) {
+        uint32_t r[4];
+        ldsm_x4_t(r, stg + key * 128 + (((4 * h + 2 * u + (mm >> 1)) ^ (key & 7)) << 4));
+#pragma unroll
+        for (int gB = 0; gB < 2; ++gB) {
+          const int n0 = 32 * u + 16 * gB + 2 * vp, c = 16 * wq + 4 * vq;
+          *reinterpret_cast<uint32_t*>(vt + vt_sw(n0, c)) = __byte_perm(r[2 * gB], r[2 * gB + 1], 0x6420);
+          *reinterpret_cast<uint32_t*>(vt + vt_sw(n0 + 1, c)) = __byte_perm(r[2 * gB], r[2 * gB + 1], 0x7531);
+        }
+      }
+      return;
+    }
     const int lk0 = 16 * (vtid >> 6) + 8 * ((vtid >> 5) & 1) + 2 * ((vtid >> 3) & 3), lc = vtid & 7;
     const uint4 va = *reinterpret_cast<const uint4*>(KV ? stg + lk0 * 128 + ((lc ^ (lk0 & 7)) << 4) : stg + vtid * 16);
     const uint4 vb = *reinterpret_cast<const uint4*>(KV ? stg + (lk0 + 1) * 128 + ((lc ^ ((lk0 + 1) & 7)) << 4)
                                                         : stg + 4096 + vtid * 16);
-    uint8_t* dst = vtb + (nn % NVT) * VT_BYTES + vt_own;
+    uint8_t* dst = vtb + (nn % NVT) * VTB + vt_own;
     const uint32_t wa[4] = {va.x, va.y, va.z, va.w}, wb[4] = {vb.x, vb.y, vb.z, vb.w};
 #pragma unroll
     for (int w4 = 0; w4 < 4; ++w4) {
@@ -316,6 +353,7 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 #pragma unroll
     for (int i = 0; i < 36; ++i) O[i] = 0.f;
     float m[2] = {neg_inf(), neg_inf()};
+    if (PP && h == 1 && nt > 0) asm volatile("bar.arrive 5, 256;\n" ::: "memory");   // WG 0 takes the first softmax turn
     uint32_t pa[2][4];
     for (int i = 0; i < nt; ++i, ++n) {
       const int ts = k0 + i * TILE;
@@ -353,13 +391,18 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         for (int q = 0; q < 8; ++q) pa[q >> 2][q & 3] = __float_as_uint(S[q]) & 0x37373737u;
         m[0] = 0.f; m[1] = 0.f;
       } else {
-        if (!((p.W & 2) && va2_softmax_lazy(S, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, j0)))
+        if (PP) asm volatile("bar.sync %0, 256;\n" ::"r"(5 + h) : "memory");   // my softmax turn
+        if (!((LZ || (p.W & 2)) && va2_softmax_lazy(S, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, j0)))
           softmax_pack7(S, O, m, pa, t, cl2, ts + TILE > cend, ts, cend, seq, 0, j0);
+        if (PP && (h == 0 || i + 1 < nt)) asm volatile("bar.arrive %0, 256;\n" ::"r"(6 - h) : "memory");   // the other's turn
       }
-      if (DG != 3 && DG != 5) pv_issue7(O, pa, vtb + (n % NVT) * VT_BYTES, h);
+      if (DG != 3 && DG != 5) {
+        if constexpr (VT) pv_issue_sw(O, pa, vtb + (n % NVT) * VTB + h * 4608);
+        else pv_issue7(O, pa, vtb + (n % NVT) * VT_BYTES, h);
+      }
     }
     uint8_t* nK = KV == 3 ? vtb : NB ? vtb + ((n + 1) % NVT) * VT_BYTES : newk;   // KV 3: buffer 0 is 1024-B aligned
-    uint8_t* nV = KV == 3 ? vtb + VT_BYTES : NB ? vtb + ((n + 2) % NVT) * VT_BYTES : newk + 8192;
+    uint8_t* nV = KV == 3 ? vtb + VTB : NB ? vtb + ((n + 2) % NVT) * VT_BYTES : newk + 8192;
     if (NB && has_new) {   // both warpgroups are past their loops before the V^T buffers take the new rows
       wg_wait<0>();
       asm volatile("bar.sync 3, 256;\n" ::: "memory");
@@ -383,8 +426,13 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
         } else {
           int s8, kl;
           key_to_sk(j, s8, kl);
-          nV[vt_off(h, s8, 2 * lane, kl)] = (uint8_t)(q8 & 0xFF);
-          nV[vt_off(h, s8, 2 * lane + 1, kl)] = (uint8_t)(q8 >> 8);
+          if constexpr (VT) {
+            nV[h * 4608 + vt_sw(2 * lane, 32 * s8 + kl)] = (uint8_t)(q8 & 0xFF);
+            nV[h * 4608 + vt_sw(2 * lane + 1, 32 * s8 + kl)] = (uint8_t)(q8 >> 8);
+          } else {
+            nV[vt_off(h, s8, 2 * lane, kl)] = (uint8_t)(q8 & 0xFF);
+            nV[vt_off(h, s8, 2 * lane + 1, kl)] = (uint8_t)(q8 >> 8);
+          }
         }
       }
       fence_async_smem();
@@ -395,7 +443,8 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
       else qk_issue(S, dq, desc_il(nK + h * 4096, 128, 512));
       wg_wait<0>();
       softmax_pack7(S, O, m, pa, t, cl2, true, seq, seq + L, seq, 0, j0);
-      pv_issue7(O, pa, nV, h);
+      if constexpr (VT) pv_issue_sw(O, pa, nV + h * 4608);
+      else pv_issue7(O, pa, nV, h);
     }
     wg_wait<0>();
     const size_t r0 = (size_t)(b * HP + hp) * 128;
@@ -410,7 +459,9 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     __threadfence();
     asm volatile("bar.sync 3, 256;\n" ::: "memory");
     if (tid == 0) flag[0] = (atomicAdd(p.counters + b * HP + hp, k1 - k0) + k1 - k0 == sN[b]) ? 1 : 0;
-    if (NB && has_new && tid < 64) {
+    if (VT && NB && has_new && tid < 32)   // the new K tile covered head 0's ones rows of buffer 0
+      *reinterpret_cast<uint4*>(nK + 4096 + tid * 16) = make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
+    if (!VT && NB && has_new && tid < 64) {
       const int rg = tid >> 4, ch = tid & 15;
       *reinterpret_cast<uint4*>(nK + rg * VT_REGION + 8 * VT_SBO + (ch & 7) * 16 + (ch >> 3) * 128) =
           make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
@@ -454,11 +505,12 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
 '''
 
 VA2_HOST = r'''
-template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0>
+template <int ST, int PW, int NVT, int KV = 0, int NB = 0, int DG = VA2_DIAG, int RP = 32, int PF = 0, int PP = 0, int VT = 0,
+          int LZ = 0>
 static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
   static bool attr = false;
   if (!attr) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT, NB>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF, PP, VT, LZ>, cudaFuncAttributeMaxDynamicSharedMemorySize, k1::va2_smem<ST, NVT, NB>()));
     attr = true;
   }
   int nb = 0;
@@ -469,8 +521,8 @@ static int va2_go(const k1::Params* p, dim3 grid, cudaStream_t s, bool pdl) {
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.gridDim = grid; cfg.blockDim = dim3(256 + 32 * PW); cfg.dynamicSmemBytes = k1::va2_smem<ST, NVT, NB>(); cfg.stream = s;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, *p));
-  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF>, 256 + 32 * PW, k1::va2_smem<ST, NVT, NB>()));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF, PP, VT, LZ>, *p));
+  } else C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va2_main<ST, PW, NVT, KV, NB, DG, RP, PF, PP, VT, LZ>, 256 + 32 * PW, k1::va2_smem<ST, NVT, NB>()));
   return nb;
 }'''
 
@@ -549,7 +601,7 @@ def _va2_prepare(state):
     try:
         if not state.get("va1_ok"):
             raise RuntimeError("VA1 (workspace, K1 module) not live")
-        for code in (303, 345, 347, 348, 349, 350, 351, 353):
+        for code in (303, 345, 347, 348, 349, 350, 351, 353, 401, 402, 403, 404):
             _k1_occupancy(8, code, dev)
         ws = _VA1_WS[str(dev)]
         for (B, ctx, page, kvs, seed) in VA2_CASES:
@@ -570,7 +622,7 @@ def _va2_prepare(state):
             print(f"[va2] probes {VA2_PROBES}: workspace {'clean' if state['va2_probes_ok'] else 'DIRTY (probes off)'}", flush=True)
             for t_ in ws:
                 t_.zero_()
-        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349, 350, 351, 353)]} (variant {VA2_VAR}), "
+        print(f"[va2] LIVE: verify full B >= {VA2_MIN_B}, segk {VA2_SEGK}, occupancy {[_K1_OCC.get((8, c, str(dev))) for c in (303, 345, 347, 348, 349, 350, 351, 353, 401, 402, 403, 404)]} (variant {VA2_VAR}), "
               f"enable {VA2_ENABLE}", flush=True)
     except Exception as ex:
         print(f"[va2] DISABLED, verify full stays on PR206: {ex!r}", flush=True)
@@ -586,9 +638,13 @@ def va2_patches(text):
         ("VA2 kernel", K1_MAIN, VA2_CUDA + K1_MAIN),
         ("stages_ok", ": (ST == 3 || ST == 4); }", ": (ST == 3 || ST == 4 || (ST > 1000 && ST % 1000 == 353 && ST < 8000) || ST == 303 || ST == 313 || ST == 345 || ST == 355 || "
          "ST == 347 || ST == 357 || ST == 348 || ST == 358 || ST == 349 || ST == 359 || ST == 350 || ST == 360 || ST == 351 || ST == 361 || "
-         "ST == 353 || ST == 363); }"),
+         "ST == 353 || ST == 363 || (ST >= 401 && ST <= 404)); }"),
         ("VA2 host", "int64_t k1_occupancy(int64_t L, int64_t ST) {", VA2_HOST + "\n\nint64_t k1_occupancy(int64_t L, int64_t ST) {"),
         ("occupancy", "  if (ST > 200) return (int64_t)(ST % 10 == 3 ? va_go<3>",
+         "  if (ST == 401) return (int64_t)va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 1, 0, 0>(nullptr, dim3(1), 0, false);\n"
+         "  if (ST == 402) return (int64_t)va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 0, 1, 0>(nullptr, dim3(1), 0, false);\n"
+         "  if (ST == 403) return (int64_t)va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 0, 0, 1>(nullptr, dim3(1), 0, false);\n"
+         "  if (ST == 404) return (int64_t)va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 1, 1, 1>(nullptr, dim3(1), 0, false);\n"
          "  if (ST > 300) return (int64_t)(ST == 353 ? va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
          "ST == 350 ? va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
          "ST == 351 ? va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(nullptr, dim3(1), 0, false) : "
@@ -605,6 +661,10 @@ def va2_patches(text):
          "      else if (dg == 6) va2_go<5, 4, 2, 3, 1, 6, 32, 1>(&p, grid, st, false);\n"
          "      else if (dg == 7) va2_go<5, 4, 2, 3, 1, 7, 32, 1>(&p, grid, st, false);\n"
          "      else va2_go<5, 4, 2, 3, 1, 5, 32, 1>(&p, grid, st, false);\n    }\n"
+         "    else if (stages == 401) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 1, 0, 0>(&p, grid, st, false);\n"
+         "    else if (stages == 402) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 0, 1, 0>(&p, grid, st, false);\n"
+         "    else if (stages == 403) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 0, 0, 1>(&p, grid, st, false);\n"
+         "    else if (stages == 404) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1, 1, 1, 1>(&p, grid, st, false);\n"
          "    else if (stages == 353 || stages == 363) va2_go<5, 4, 2, 3, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages == 350 || stages == 360) va2_go<4, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
          "    else if (stages == 351 || stages == 361) va2_go<5, 4, 2, 1, 1, VA2_DIAG, 32, 1>(&p, grid, st, stages > 355);\n"
