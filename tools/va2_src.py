@@ -265,10 +265,19 @@ __global__ void __launch_bounds__(256 + 32 * PW, 2) va2_main(const Params p) {
     const int nt = (cend > k0) ? (cend - k0 + TILE - 1) / TILE : 0;
     const bool has_new = (k1 == sN[b]);
     const __nv_bfloat16* qb = p.qkv + (size_t)b * L * stride;
-#pragma unroll 4
+    uint32_t qraw[16];   // QH (KV 3): every Q row load in flight before the first is used (one round trip per segment)
+    if constexpr (KV == 3) {
+#pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        const int r = wq + 4 * k;
+        qraw[k] = *reinterpret_cast<const uint32_t*>(qb + (size_t)(r >> 3) * stride + (size_t)((2 * hp + h) * 8 + (r & 7)) * 64 + 2 * lane);
+      }
+    }
+#pragma unroll
     for (int k = 0; k < 16; ++k) {                   // Q rows r = 8 token + gi of head h -> e4m3 wgmma A layout
       const int r = wq + 4 * k;
-      float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(qb + (size_t)(r >> 3) * stride + (size_t)((2 * hp + h) * 8 + (r & 7)) * 64 + 2 * lane));
+      float2 x = KV == 3 ? __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&qraw[k]))
+                         : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(qb + (size_t)(r >> 3) * stride + (size_t)((2 * hp + h) * 8 + (r & 7)) * 64 + 2 * lane));
       const float rs = rsqrtf(warp_sum(x.x * x.x + x.y * x.y) * (1.f / 64.f) + 1e-5f);
       x.x *= rs; x.y *= rs;
       *reinterpret_cast<uint16_t*>(qs + h * 4096 + il_off(r, 2 * lane, 128, 512)) =
@@ -592,6 +601,7 @@ def va2_patches(text):
          "    if (stages > 1000) {\n      const int dg = (int)(stages / 1000);\n"
          "      if (dg == 1) va2_go<5, 4, 2, 3, 1, 1, 32, 1>(&p, grid, st, false);\n      else if (dg == 2) va2_go<5, 4, 2, 3, 1, 2, 32, 1>(&p, grid, st, false);\n"
          "      else if (dg == 3) va2_go<5, 4, 2, 3, 1, 3, 32, 1>(&p, grid, st, false);\n"
+         "      else if (dg == 4) va2_go<5, 4, 2, 3, 1, 4, 32, 1>(&p, grid, st, false);\n"
          "      else if (dg == 6) va2_go<5, 4, 2, 3, 1, 6, 32, 1>(&p, grid, st, false);\n"
          "      else if (dg == 7) va2_go<5, 4, 2, 3, 1, 7, 32, 1>(&p, grid, st, false);\n"
          "      else va2_go<5, 4, 2, 3, 1, 5, 32, 1>(&p, grid, st, false);\n    }\n"
