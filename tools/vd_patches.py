@@ -52,6 +52,7 @@ VD_FLAGS = 8
 VD_TOL = (1.0e-2, 1.0e-4, 1.0e-2)
 VD_INSTS = @INSTS@
 VD_ROUTE = @ROUTE@
+VD_TT = @TT@
 VD_CPP_SRC = @CPP@
 VD_CUDA_SRC = @CUDA@
 _VD = {"mod": None, "build_s": 0.0}
@@ -132,7 +133,21 @@ def _vd_prepare(state, t0):
         print(f"[vd] build FAILED -> dense stays on today's path: {ex!r}", flush=True)
         return None
     st = {"mod": mod, "err": torch.zeros((4,), dtype=torch.int32, device=dev),
-          "stamps": torch.zeros((4,), dtype=torch.int64, device=dev), "w": {}, "route": {}}
+          "stamps": torch.zeros((4,), dtype=torch.int64, device=dev), "w": {}, "route": {}, "wt": {}}
+    for (proj, b), on in sorted(VD_TT.items()):   # torchT: cuBLAS on a K-major copy of W (lossless repack)
+        w = _dg1_weight(state, proj)
+        if not on or w is None or proj in st["wt"]:
+            continue
+        wt = w.t().contiguous()
+        x = torch.randn((min(b, 128), w.shape[1]), generator=torch.Generator(device=dev).manual_seed(77), device=dev).to(torch.bfloat16)
+        f32 = proj == "cat"
+        got = torch.mm(x, wt, out_dtype=torch.float32) if f32 else torch.mm(x, wt)
+        ref = torch.mm(x, w.t(), out_dtype=torch.float32) if f32 else torch.mm(x, w.t())
+        e = float((got.float() - ref.float()).norm() / ref.float().norm())
+        good = bool(torch.isfinite(got).all()) and e < VD_TOL[2]
+        print(f"[vd] torchT {proj}: rel vs today {e:.2e} -> {'LIVE' if good else 'FAILED'}", flush=True)
+        if good:
+            st["wt"][proj] = wt
     gen = torch.Generator(device=dev).manual_seed(4242)
     for (proj, b), kid in sorted(VD_ROUTE.items()):
         nwg, bn, nst, cl, f32, rbd = VD_INSTS[kid]
@@ -152,7 +167,7 @@ def _vd_prepare(state, t0):
         print(f"[vd] {proj}/{b} inst {VD_INSTS[kid]}: {msg} -> {'LIVE' if good else 'FAILED: today path'}", flush=True)
         if good:
             st["route"][(proj, b)] = r
-    state["vd"] = st if st["route"] else None
+    state["vd"] = st if (st["route"] or st["wt"]) else None
     print(f"[vd] routes live {sorted(st['route'])} (build {_VD['build_s']:.0f}s, prepare {time.time() - t1:.1f}s)", flush=True)
     return state["vd"]
 
@@ -163,6 +178,8 @@ def _vd(state, proj, x):
         return None
     T = x.shape[0]
     b = _k2a_bucket_of(T)
+    if VD_TT.get((proj, b)) and proj in st["wt"] and x.dtype == torch.bfloat16 and x.dim() == 2:
+        return torch.mm(x, st["wt"][proj], out_dtype=torch.float32) if proj == "cat" else torch.mm(x, st["wt"][proj])
     if b not in VD_BUCKETS or proj not in VD_PROJS or VD_ROUTE.get((proj, b)) is None:
         return None
     r = st["route"].get((proj, b))
@@ -211,7 +228,8 @@ def layer_code(routes):
         cuda = cuda.replace(old, 'constexpr long long WAIT_BUDGET = ' + str(int(ARGS['budget'])) + 'LL;')
     for bad in ("'''", '"""'):
         assert bad not in cuda and bad not in L.VD_CPP_SRC
-    code = (PY_TMPL.replace("@INSTS@", repr(insts)).replace("@ROUTE@", repr(route))
+    tt = {(p, int(b)): True for p, b in (it.split(":") for it in ARGS.get("tt", "").split(",") if it)}
+    code = (PY_TMPL.replace("@INSTS@", repr(insts)).replace("@ROUTE@", repr(route)).replace("@TT@", repr(tt))
             .replace("@CPP@", 'r"""' + cpp + '"""').replace("@CUDA@", 'r"""' + cuda + '"""'))
     return code, insts, route
 
