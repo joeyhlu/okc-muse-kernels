@@ -89,6 +89,7 @@ ROUTE = r'''#if VMS_ABS
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         S.twv[t * 8 + k] = sel_s[k] * inv;
+        if (c == 0) p.tidout[t * 8 + k] = sel_id[k];   // the layer returns the global top-8 ids
         const int rel = ((sel_id[k] - ls) % 256 + 256) % 256;
         S.lidv[t * 8 + k] = rel < 32 ? rel : -1;
       }
@@ -183,7 +184,8 @@ RUN_ABS = r'''
 void run_abs(torch::Tensor xnb, torch::Tensor y, torch::Tensor lg, torch::Tensor rbias, torch::Tensor lstart, torch::Tensor nwx,
              torch::Tensor wA, torch::Tensor wB, torch::Tensor gsA, torch::Tensor gsB, torch::Tensor nw, torch::Tensor inter,
              torch::Tensor ybuf, torch::Tensor ss, torch::Tensor ctr, torch::Tensor out, torch::Tensor marks, int64_t m,
-             double eps, double eps_n, double mult, double rscale, double deps, int64_t pdl) {
+             double eps, double eps_n, double mult, double rscale, double deps, int64_t pdl, torch::Tensor tidout) {
+  TORCH_CHECK(tidout.scalar_type() == at::kInt && tidout.numel() >= m * 8, "vms abs: tidout");
   TORCH_CHECK(m >= 1 && m <= 8 && lg.dim() == 3 && lg.size(0) <= 8 && lg.stride(2) == 1 && y.stride(1) == 1, "vms abs: shapes");
   TORCH_CHECK(lg.scalar_type() == at::kFloat && rbias.scalar_type() == at::kFloat && lstart.scalar_type() == at::kInt, "vms abs: dtypes");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(lg.data_ptr()) % 16 == 0
@@ -204,7 +206,7 @@ void run_abs(torch::Tensor xnb, torch::Tensor y, torch::Tensor lg, torch::Tensor
   p.nwx = reinterpret_cast<const __nv_bfloat16*>(nwx.data_ptr()); p.xnb = reinterpret_cast<__nv_bfloat16*>(xnb.data_ptr());
   p.l_ld = lg.stride(1); p.sstride = lg.stride(0); p.y_ld = y.stride(0); p.ns = (int)lg.size(0);
   p.y32 = y.scalar_type() == at::kFloat ? 1 : 0;
-  p.mult = (float)mult; p.rscale = (float)rscale; p.deps = (float)deps; p.eps_n = (float)eps_n;
+  p.mult = (float)mult; p.rscale = (float)rscale; p.deps = (float)deps; p.eps_n = (float)eps_n; p.tidout = tidout.data_ptr<int>();
   cudaLaunchAttribute at[1];
   at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   at[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
@@ -217,14 +219,14 @@ void run_abs(torch::Tensor xnb, torch::Tensor y, torch::Tensor lg, torch::Tensor
 RUN_ABS_DECL = ('void run_abs(torch::Tensor xnb, torch::Tensor y, torch::Tensor lg, torch::Tensor rbias, torch::Tensor lstart, '
                 'torch::Tensor nwx, torch::Tensor wA, torch::Tensor wB, torch::Tensor gsA, torch::Tensor gsB, torch::Tensor nw, '
                 'torch::Tensor inter, torch::Tensor ybuf, torch::Tensor ss, torch::Tensor ctr, torch::Tensor out, '
-                'torch::Tensor marks, int64_t m, double eps, double eps_n, double mult, double rscale, double deps, int64_t pdl);\n')
+                'torch::Tensor marks, int64_t m, double eps, double eps_n, double mult, double rscale, double deps, int64_t pdl, torch::Tensor tidout);\n')
 
 CUDA_EDITS = (
     ("abs define", "#ifndef VMS_G\n", "#ifndef VMS_ABS\n#define VMS_ABS 0\n#endif\n#ifndef VMS_G\n"),
     ("params", "  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n};",
      "  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n"
      "  const float* lg; const float* rbias; const int* lstart; const void* yin; const __nv_bfloat16* nwx; __nv_bfloat16* xnb;\n"
-     "  long l_ld, sstride, y_ld; int ns, y32; float mult, rscale, deps, eps_n;\n};"),
+     "  long l_ld, sstride, y_ld; int ns, y32; float mult, rscale, deps, eps_n; int* tidout;\n};"),
     ("smem", "  float4 red[NRB][NW][32];\n};",
      "  float4 red[NRB][NW][32];\n#if VMS_ABS\n  float twv[MAXP]; int lidv[MAXP]; float rst[16]; float redn[8][16]; int xgen;\n#endif\n};"),
     ("y8 helper", "__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {",
@@ -291,15 +293,23 @@ def _vms_abs_call(state, x, logits, data):
     v8 = state["v8"]
     m = x.shape[0]
     out = torch.empty((m, K2A_D_HIDDEN), dtype=torch.bfloat16, device=x.device)
+    tid = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
     vs["mod_abs"].run_abs(vs["xnb"], x, logits, v8["bias"], data["local_start"], v8["nw"], vs["wA"], vs["wB"], vs["gsA"],
                           vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"], out, vs["nomarks"], m,
-                          K2A_POST_NORM_EPS, RMS_EPS, 0.1767766952966369, 1.0, 1e-15, 1)
-    return out
+                          K2A_POST_NORM_EPS, RMS_EPS, 0.1767766952966369, 1.0, 1e-15, 1, tid)
+    return out, tid
 
 
 def _vms_abs_live(state, tokens, place, logits):
-    return (VMS_ABS_ENABLE and state.get("vms_abs_ok") and tokens <= VMS_ABS_MAXT and place != "main"
-            and logits is not None and logits.dim() == 3 and logits.shape[0] <= 8 and logits.stride(2) == 1)
+    if not (VMS_ABS_ENABLE and state.get("vms_abs_ok") and tokens <= VMS_ABS_MAXT):
+        return False
+    ok = place != "main" and logits is not None and logits.dim() == 3 and logits.shape[0] <= 8 and logits.stride(2) == 1
+    key = ("vmsabs_seen", tokens, ok)
+    if key not in _VMS:
+        _VMS[key] = True
+        print(f"[vmsabs] T={tokens} place={place} logits={None if logits is None else tuple(logits.shape)} -> "
+              f"{'VMS-ABS' if ok else 'tail_kernel2 + VMS'}", flush=True)
+    return ok
 
 
 def _vms_abs_prepare(state):
@@ -329,7 +339,7 @@ def _vms_abs_prepare(state):
             g = torch.Generator(device=dev).manual_seed(seed)
             y = torch.randn((T, K2A_D_HIDDEN), generator=g, device=dev).to(ydt)
             lg = torch.randn((8, T, N_EXPERTS), generator=g, device=dev) * 0.5
-            ls = int(torch.randint(0, 8, (1,), generator=g).item()) * 32
+            ls = int(torch.randint(0, 8, (1,), generator=g, device=dev).item()) * 32
             if kind == "tie":   # exact ties at the top-8 boundary: identical logit sums and bias for a run of experts
                 lg[:, :, ls:ls + 40] = 0.7
                 v8b = v8["bias"].clone()
@@ -340,7 +350,7 @@ def _vms_abs_prepare(state):
                     xn, tw, tid, lid = _v8_tail(y, lg, state, data)
                     ref = _vms_call(st, xn, lid, tw).clone()
                     st["vms"]["ctr"][2] = 0
-                    o = _vms_abs_call(state, y, lg, data)
+                    o, tid_a = _vms_abs_call(state, y, lg, data)
                     torch.cuda.synchronize()
                     errf = int(st["vms"]["ctr"][2])
                     xb = st["vms"]["xnb"]
@@ -349,6 +359,7 @@ def _vms_abs_prepare(state):
                     ids_ok = bool(torch.equal(dv[:T * 8], lid.reshape(-1)))
                     tw_ok = bool(torch.equal(dv[128:128 + T * 8].view(torch.float32), tw.reshape(-1)))
                     rel = float((o.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12))
+                    ids_ok = ids_ok and bool(torch.equal(tid_a, tid))
                     same = xs and ids_ok and tw_ok and rel < 1e-4 and errf == 0 and bool(torch.isfinite(o.float()).all())
                     if not same or k == 0:
                         print(f"[vmsabs] self-test T={T} {kind} y={str(ydt)[6:]} call {k}: xn {xs} ids {ids_ok} weights {tw_ok} "
@@ -369,7 +380,7 @@ def _vms_abs_prepare(state):
 '''
 FWD_TAIL_OLD = "        if tail is not None:\n            expert_x, topk_weights, topk_ids, local_ids = _v8_tail(expert_input, logits, state, data)\n"
 FWD_TAIL_NEW = ("        if tail is not None and _vms_abs_live(state, tokens, place, logits):\n"
-                "            abs_out = _vms_abs_call(state, expert_input, logits, data)\n"
+                "            abs_out, topk_ids = _vms_abs_call(state, expert_input, logits, data)\n"
                 "        elif tail is not None:\n"
                 "            expert_x, topk_weights, topk_ids, local_ids = _v8_tail(expert_input, logits, state, data)\n")
 FWD_EXP_OLD = "        expert_output = _v8_experts(expert_x, local_ids, topk_weights, state, cfg, tokens)\n"

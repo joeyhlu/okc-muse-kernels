@@ -79,15 +79,16 @@ def main():
             torch.cuda.synchronize()
             v1self = bool(torch.equal(ref, ref2))
             out = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
+            tida = torch.empty((T, 8), dtype=torch.int32, device=dev)
             sc["ctr"][2] = 0
             ma.run_abs(xnb, y, lg, b, lst, nwx, pk["wA"], pk["wB"], pk["gsA"], pk["gsB"], pk["nw"], sc["inter"], sc["ybuf"], sc["ss"],
-                       sc["ctr"], out, sc["nomarks"], T, 1e-8, 1e-6, 0.1767766952966369, 1.0, 1e-15, 0)
+                       sc["ctr"], out, sc["nomarks"], T, 1e-8, 1e-6, 0.1767766952966369, 1.0, 1e-15, 0, tida)
             torch.cuda.synchronize()
             same = bool(torch.equal(out, ref))
             xs = bool(torch.equal(xnb[:T], xn))
             err = int(sc["ctr"][2])
             dv = xnb[8:].reshape(-1).view(torch.int32)
-            ids_ok = bool(torch.equal(dv[:T * 8], lid.reshape(-1)))
+            ids_ok = bool(torch.equal(dv[:T * 8], lid.reshape(-1))) and bool(torch.equal(tida, tid))
             tw_ok = bool(torch.equal(dv[128:128 + T * 8].view(torch.float32), tw.reshape(-1)))
             rel = float((out.float() - ref.float()).norm() / ref.float().norm())
             ok = xs and ids_ok and tw_ok and rel < 1e-4 and err == 0
