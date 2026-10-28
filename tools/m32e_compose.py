@@ -106,7 +106,13 @@ def main():
         print(f"[m32e_compose] --dry: {len(s.encode())} B")
         return 0
     OUT.write_text(s, encoding="utf-8", newline=NL)
-    LAB.write_text(s, encoding="utf-8", newline=NL)
+    lab = s
+    if "--lab-race" in sys.argv:   # R-m32e-19: the A/B copy also carries w72r = w72 with the pre-fix barrier-6 count
+        lab = P.sub1(lab, ", " + W72 + ")}" + NL, ", " + W72 + ")," + NL + '             "w72r": ("-DVM_TRICKS_DQ=0", "-DVM_BRED=1", '
+                     '"-DVM_FSW=1", "-DVM_SYNC7=1", "-DVM_NOB9=1", ' + W72 + ', "-DVM_W5B6=0")}' + NL, "w72r defs")
+        lab = P.sub1(lab, '"bf2", "w72") else _VML["sc"]', '"bf2", "w72", "w72r") else _VML["sc"]', "w72r scx")
+        lab = P.sub1(lab, NL + "VML_ABVARS = ()" + NL, NL + "VML_ABVARS = ('w72r',)" + NL, "w72r abvars")
+    LAB.write_text(lab, encoding="utf-8", newline=NL)
     print(f"[m32e_compose] wrote {OUT.relative_to(ROOT)} + {LAB.relative_to(ROOT)} ({len(s.encode())} B, headroom "
           f"{1_000_000 - len(s.encode())} B, sha1 {hashlib.sha1(s.encode()).hexdigest()[:12]})")
     return 0

@@ -135,6 +135,10 @@ constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);
 #define VM_RSYNC() __syncthreads()
 #define VM_RNT NTH
 #endif
+#ifndef VM_W5B6
+#define VM_W5B6 1   // 0 = the R-m32e-14..17 barrier-6 count (race on ent; stress-test arm only)
+#endif
+#define VM_B6 ((VM_WG5 >= 2 && VM_W5B6) ? 32 * NCW + 96 : 32 * NCW + 32)
 constexpr int JMAX = @JMAX@, GMAX = 136, SLOTS = @SLOTS@, FIXW = (@FIXW@ > VM_NTM * 512) ? @FIXW@ : VM_NTM * 512;
 #ifndef VM_DP
 #define VM_DP 0
@@ -1434,13 +1438,13 @@ asm volatile("setmaxnreg.dec.sync.aligned.u32 " VM_S(VM_PREG) ";\n" ::: "memory"
 if (A.flags & 256) asm volatile("griddepcontrol.wait;\n" ::: "memory");
 bar_sync(9, NTH);   // the consumers arrive after the mbarrier init + route()
 const uint16_t* ent = reinterpret_cast<const uint16_t*>(smem + NS * US + (NX - 1) * XS + 4096);
-if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); return; }
+if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); if (VM_W5B6) bar_arrive(6, VM_B6); return; }
 if (warp == NCW) {
 if (A.flags & 4) bar_sync(7, 32 * NCW + 32);
 if (lane == 0) prod_w(A, T, sa(smem), bars);
 } else {
 if (A.flags & 64) gather_w5(A, T, ent, lane, 0);
-bar_sync(6, 32 * NCW + 32);
+bar_sync(6, VM_B6);
 if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);
 else if VM_F9(A) bperm_lanes(A, T, lane);
 }
@@ -1503,7 +1507,7 @@ return;
 #endif
 if (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));
 else gather(A, T, ent);
-bar_arrive(6, 32 * NCW + 32);
+bar_arrive(6, VM_B6);
 if (A.flags & 4) bar_arrive(7, 32 * NCW + 32);
 #if VM_WG5 == 1 || VM_WG5 == 3
 asm volatile("setmaxnreg.inc.sync.aligned.u32 " VM_S(VM_CREG) ";\n" ::: "memory");

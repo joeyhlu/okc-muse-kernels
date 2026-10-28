@@ -712,16 +712,20 @@ _W5TOP = (
     "if (A.flags & 256) asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n"
     "bar_sync(9, NTH);   // the consumers arrive after the mbarrier init + route()\n"
     "const uint16_t* ent = reinterpret_cast<const uint16_t*>(smem + NS * US + (NX - 1) * XS + 4096);\n"
-    "if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); return; }\n"
+    # R-m32e-19 race fix: ent lives in x slot NX-1, which prod_x's first TMA overwrites; gather parts 1-2 (warps NCW+2/3)
+    # must finish reading ent before warp NCW+1 passes barrier 6, so they arrive on it (VM_B6 = 32 * NCW + 96 threads)
+    "if (warp > NCW + 1) { if (A.flags & 64) gather_w5(A, T, ent, lane, warp - NCW - 1); if (VM_W5B6) bar_arrive(6, VM_B6); return; }\n"
     "if (warp == NCW) {\nif (A.flags & 4) bar_sync(7, 32 * NCW + 32);\nif (lane == 0) prod_w(A, T, sa(smem), bars);\n"
-    "} else {\nif (A.flags & 64) gather_w5(A, T, ent, lane, 0);\nbar_sync(6, 32 * NCW + 32);\n"
+    "} else {\nif (A.flags & 64) gather_w5(A, T, ent, lane, 0);\nbar_sync(6, VM_B6);\n"
     "if (lane == 0) prod_x(A, T, sa(smem + NS * US), bars);\nelse if VM_F9(A) bperm_lanes(A, T, lane);\n}\nreturn;\n}\n"
     "#if VM_WG5 == 2\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n"
     "#endif\n")
 W5T_PATCHES = [
     ("constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);\n",
      "constexpr int NTH = 32 * NCW + (VM_WG5 ? 128 : 64);\n#if VM_WG5 >= 2\n#define VM_RSYNC() bar_sync(8, 32 * NCW)\n"
-     "#define VM_RNT (32 * NCW)\n#else\n#define VM_RSYNC() __syncthreads()\n#define VM_RNT NTH\n#endif\n"),
+     "#define VM_RNT (32 * NCW)\n#else\n#define VM_RSYNC() __syncthreads()\n#define VM_RNT NTH\n#endif\n"
+     "#ifndef VM_W5B6\n#define VM_W5B6 1   // 0 = the R-m32e-14..17 barrier-6 count (race on ent; stress-test arm only)\n#endif\n"
+     "#define VM_B6 ((VM_WG5 >= 2 && VM_W5B6) ? 32 * NCW + 96 : 32 * NCW + 32)\n"),
     ("const uint32_t bars = sa(smem + BAR_OFF);\nif (tid == 0) {\n", "const uint32_t bars = sa(smem + BAR_OFF);\n" + _W5TOP + "if (tid == 0) {\n"),
     ("route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));\n",
      "route(A, T, hist, ent, reinterpret_cast<uint32_t*>(scr + 12288));\n#if VM_WG5 >= 2\nbar_arrive(9, NTH);\n#endif\n"),
@@ -730,6 +734,8 @@ W5T_PATCHES = [
      "}\nreturn;\n}\n#endif\nif (A.flags & 64) self_fill(A, T, smem, bars, ent, nfill_of(A, T));\n"),
     ("#if VM_WG5\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n",
      "#if VM_WG5 == 1 || VM_WG5 == 3\nasm volatile(\"setmaxnreg.inc.sync.aligned.u32 \" VM_S(VM_CREG) \";\\n\" ::: \"memory\");\n#endif\n"),
+    ("bar_arrive(6, 32 * NCW + 32);\nif (A.flags & 4) bar_arrive(7, 32 * NCW + 32);\n#if VM_WG5 == 1 || VM_WG5 == 3\n",
+     "bar_arrive(6, VM_B6);\nif (A.flags & 4) bar_arrive(7, 32 * NCW + 32);\n#if VM_WG5 == 1 || VM_WG5 == 3\n"),
 ]
 # (span start, span end, old, new, count): replacements inside one function only
 SPAN_PATCHES = [("__device__ void route(", "__device__ void gather(", "__syncthreads();", "VM_RSYNC();", 6),
