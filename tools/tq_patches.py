@@ -455,6 +455,14 @@ FULL_DEFS = {"bf2t": ("bf2", ("-DVM_TQ=1",)), "w72t": ("w72", ("-DVM_TQ=1",)),
              "bf2tm": ("bf2", ("-DVM_TQ=1", "-DVM_MKW=64")), "w72tm": ("w72", ("-DVM_TQ=1", "-DVM_MKW=64"))}
 
 
+def rider(s0, at=11, lag=-1):
+    """VM_TQ routed at T = 128 / 256 (w72t), T = 32 keeps the static bf2 plan; the call default carries (lag, at)."""
+    s = defs(cuda(s0), {"w72t": FULL_DEFS["w72t"]})
+    s = _sub(s, "pdel=0, tq=(-1, 12, None)):", f"pdel=0, tq=({lag}, {at}, None)):")
+    s = _sub(s, "\nVML_BVAR = {256: 'w72', 128: 'w72'}\n", "\nVML_BVAR = {256: 'w72t', 128: 'w72t'}\n")
+    return s
+
+
 def nonce(s, tag):
     lines = s.split("\n", 2)
     assert lines[1].startswith("# nonce "), lines[1][:60]
@@ -478,7 +486,10 @@ def main():
         build("k3_tq_s.py", nonce(s, f"k3-tq-s ({base_p.name} + VM_TQ / VM_NULL arms bf2n bf2q w72n w72q bf2t w72t; tools/tq_patches.py; lab)"))
     elif mode == "rider":
         assert out_p, "--out=kernels/...py required"
-        raise SystemExit("rider: written after step 1 / step 2 (routing + tq args at the call site)")
+        s = rider(s0, at=int(next((a.split("=", 1)[1] for a in sys.argv[2:] if a.startswith("--at=")), "11")),
+                  lag=int(next((a.split("=", 1)[1] for a in sys.argv[2:] if a.startswith("--lag=")), "-1")))
+        Path(ROOT / out_p).write_text(s, encoding="utf-8", newline="\n")
+        print(f"wrote {out_p} (TQ rider on {base_p.name}: w72t at T 128 / 256)")
     else:
         raise SystemExit(f"unknown mode {mode}")
 
