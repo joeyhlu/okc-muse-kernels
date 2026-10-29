@@ -19,7 +19,9 @@ BASE = ROOT / "kernels/muse_decode_layer/k3_gc_14.py"
 CODES = {   # var -> code -> extra defines
     "bf2": {"a": ("-DVM_ICXM=0x8A",), "a4": ("-DVM_ICXM=0x8B",), "s": ("-DVM_ICXM=0x80",), "f": ("-DVM_ICXF=193",),
             "af": ("-DVM_ICXM=0x8A", "-DVM_ICXF=193"), "a4f": ("-DVM_ICXM=0x8B", "-DVM_ICXF=193"),
-            "sf": ("-DVM_ICXM=0x80", "-DVM_ICXF=193")},
+            "sf": ("-DVM_ICXM=0x80", "-DVM_ICXF=193"),
+            "e4": ("-DVM_ICXM=0x8F",), "e4f": ("-DVM_ICXM=0x8F", "-DVM_ICXF=193"), "e5": ("-DVM_ICXM=0x9F",),
+            "e6": ("-DVM_ICXM=0xBF",)},
     "w72": {"a": ("-DVM_ICXM=0x10A",), "a4": ("-DVM_ICXM=0x10B",), "a8": ("-DVM_ICXM=0x18A",), "s": ("-DVM_ICXM=0x100",),
             "f": ("-DVM_ICXF=193",), "af": ("-DVM_ICXM=0x10A", "-DVM_ICXF=193"), "a4f": ("-DVM_ICXM=0x10B", "-DVM_ICXF=193"),
             "sf": ("-DVM_ICXM=0x100", "-DVM_ICXF=193")},
@@ -91,6 +93,22 @@ def main():
     if mode == "lab":
         s = nonce(s, "k3-icx-0 (k3_gc_14 + ICX VML footprint flags, all off; tools/gen_k3_icx.py)")
         p = out / "k3_icx_0.py"
+    elif mode == "ab":   # ab bf2:e4+e4f,w72:... -> kernels/lab/k3_icx_ab.py (+ VML variants <var>_<code>)
+        extra = {}
+        for a in sys.argv[2].split(","):
+            var, codes = a.split(":")
+            for c in codes.split("+"):
+                extra[f"{var}_{c}"] = defs(var, c)
+        line = "_VML_DEFS.update({" + ", ".join(f"{k!r}: _VML_DEFS[{k[:3]!r}] + {v!r}" for k, v in extra.items()) + "})\n"
+        s = _sub(s, '_VML = {"mod": None, "mods": {}, ', line + '_VML = {"mod": None, "mods": {}, ')
+        s = _sub(s, "VML_ABVARS = ()\nVML_BVAR = {256: 'w72', 128: 'w72'}\n",
+                 f"VML_ABVARS = {tuple(extra)!r}\nVML_BVAR = {{256: 'w72', 128: 'w72', 32: 'bf2'}}\n")
+        s = _sub(s, 'scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "w72") else',
+                 'scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "w72") or var[:4] in ("bf2_", "w72_") else')
+        s = _sub(s, "pairs = [(rep, v) for rep in VML_BVAR for v in dict.fromkeys((VML_BVAR[rep],) + tuple(VML_ABVARS))]",
+                 "pairs = [(rep, v) for rep in VML_BVAR for v in dict.fromkeys((VML_BVAR[rep],) + tuple(VML_ABVARS)) if (v[:3] == 'bf2') == (rep == 32)]")
+        s = nonce(s, f"k3-icx-ab (k3_gc_14 + ICX A/B variants {sorted(extra)}; tools/gen_k3_icx.py)")
+        p = out / "k3_icx_ab.py"
     else:
         arms, n = dict(a.split(":") for a in sys.argv[2].split(",")), sys.argv[3]
         for var, code in arms.items():
