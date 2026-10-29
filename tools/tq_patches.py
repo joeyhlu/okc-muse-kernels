@@ -460,7 +460,15 @@ def rider(s0, at=11, lag=-1):
     s = defs(cuda(s0), {"w72t": FULL_DEFS["w72t"]})
     s = _sub(s, "pdel=0, tq=(-1, 12, None)):", f"pdel=0, tq=({lag}, {at}, None)):")
     s = _sub(s, "\nVML_BVAR = {256: 'w72', 128: 'w72'}\n", "\nVML_BVAR = {256: 'w72t', 128: 'w72t'}\n")
+    s = _sub(s, 'scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "w72") else _VML["sc"]',
+             'scx = _VML["scb"] if var in ("b", "bd", "p", "bf", "bg", "bf2", "w72", "w72t") else _VML["sc"]')
     return s
+
+
+def lab2(s0):
+    """step-2 lab file: the rider + the shipped w72 built too (ship / mid / VCT arms by VML_BVAR / VML_COST in one file)."""
+    s = defs(rider(s0), {"w72m": ("w72", ("-DVM_MKW=64",)), "w72tm": FULL_DEFS["w72tm"]})   # marks twins (standalone tq_run.py only)
+    return _sub(s, "\nVML_ABVARS = ()\n", "\nVML_ABVARS = ('w72',)\n")
 
 
 def nonce(s, tag):
@@ -484,10 +492,13 @@ def main():
     if mode == "skel":
         s = defs(cuda(s0), {**SKEL_DEFS, **FULL_DEFS})
         build("k3_tq_s.py", nonce(s, f"k3-tq-s ({base_p.name} + VM_TQ / VM_NULL arms bf2n bf2q w72n w72q bf2t w72t; tools/tq_patches.py; lab)"))
+    elif mode == "lab2":
+        build("k3_tq_L.py", nonce(lab2(s0), f"k3-tq-L ({base_p.name} + VM_TQ w72t at T 128 / 256, w72 kept for ship arms; tools/tq_patches.py; lab)"))
     elif mode == "rider":
         assert out_p, "--out=kernels/...py required"
         s = rider(s0, at=int(next((a.split("=", 1)[1] for a in sys.argv[2:] if a.startswith("--at=")), "11")),
                   lag=int(next((a.split("=", 1)[1] for a in sys.argv[2:] if a.startswith("--lag=")), "-1")))
+        s = nonce(s, f"{Path(out_p).stem.replace('_', '-')} ({base_p.name} + VM_TQ ticket queue w72t at T 128 / 256; tools/tq_patches.py)")
         Path(ROOT / out_p).write_text(s, encoding="utf-8", newline="\n")
         print(f"wrote {out_p} (TQ rider on {base_p.name}: w72t at T 128 / 256)")
     else:
