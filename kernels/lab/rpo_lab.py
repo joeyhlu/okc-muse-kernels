@@ -363,6 +363,11 @@ GD_ARMS_PF = {
     8: [("p_ship", (1, 1, 8, 2, 2, 1, 2)), ("p_w1", (1, 1, 4, 4, 4, 1, 2))],
     16: [("p_ship", (2, 2, 4, 4, 2, 1, 2)), ("p_w1", (2, 1, 4, 4, 4, 1, 2)), ("p_o8", (2, 1, 8, 2, 2, 1, 2))],
 }
+# R-rpo-4: PF + x via plain ld.global (XP 6, tools/rpo_patches.py ldxg) when the layer's GD source has ldxg
+GD_ARMS_G = {1: [("g_ship", (1, 2, 4, 4, 2, 1, 6)), ("g_o8", (1, 1, 8, 2, 2, 1, 6))], 8: [("g_ship", (1, 1, 8, 2, 2, 1, 6))],
+             16: [("g_ship", (2, 2, 4, 4, 2, 1, 6)), ("g_o8", (2, 1, 8, 2, 2, 1, 6))]}
+ONLY = set(ARGS["only"].split(",")) if ARGS.get("only") else None   # GD arm names to keep (ship always)
+NORPO = ARGS.get("norpo", "0") == "1"   # skip the raw RPO arms
 CONFIGS = {1: [("x18", 2500), ("x18", 4500), ("x18", 7000), ("x18", 12000), ("t1", 12000)],
            8: [("x18", 4500), ("x18", 12000), ("t1", 12000)],
            16: [("x18", 4500), ("x18", 12000), ("t1", 12000)]}
@@ -403,6 +408,12 @@ def main():
     if "ldwp(" in ns["GD_CUDA_SRC"]:
         for T in TS:
             GD_ARMS[T] = GD_ARMS[T] + GD_ARMS_PF[T]
+    if "ldxg(" in ns["GD_CUDA_SRC"]:
+        for T in TS:
+            GD_ARMS[T] = GD_ARMS[T] + GD_ARMS_G[T]
+    if ONLY:
+        for T in TS:
+            GD_ARMS[T] = [a for a in GD_ARMS[T] if a[0] == "ship" or a[0] in ONLY]
     routes = {}   # (T, name) -> rt
     for T in TS:
         for name, rt in GD_ARMS[T]:
@@ -493,7 +504,7 @@ def main():
             arms.append((f"gd_{name}", gd_fn, y, ginfo[key], rt))
         mt = 1 if T <= 8 else 2
         for i, (nm, v) in enumerate(RPO_INSTS):
-            if v[0] != mt or (nm == "r_reg128" and T != 1) or (nm == "r_reggx" and T == 8):
+            if NORPO or v[0] != mt or (nm == "r_reg128" and T != 1) or (nm == "r_reggx" and T == 8):
                 continue
             y = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=dev)
             keep.append(y)

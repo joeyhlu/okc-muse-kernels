@@ -13,7 +13,8 @@ ld.global.cg: with the stages above ACQBULK ptxas hoisted ld.global.nc x loads a
 SAFETY GATE: every PF build must pass tools/rpo_sass.py (no x / non-weight global load above ACQBULK) before any GPU run.
 
   python -I tools/rpo_patches.py --n=<n> [--base=k3_gc_20] [--mode=lab|clean] [--pf=o,unpooler,pooler]
-                                 [--oroutes="1:1,2,4,4,2,1,2;8:...;16:..."] [--dry]
+                                 [--oroutes="1:1,2,4,4,2,1,2;8:...;16:..."] [--xg=o:8,unpooler:16] [--altdef=rpo4] [--dry]
+     --xg: these PF routes load x with plain ld.global (XP | 4, L1-cached; R-rpo-4) instead of ld.global.cg
      -> kernels/lab/k3_rpo_<n>.py (base k3_gc_19) | kernels/lab/k3_rpo_g<NN>_<n>.py (base k3_gc_<NN>, e.g. k3_rpo_g20_1)
 mode lab:   PF support + RPO_GD_ALT {(proj, b, tag): route} built / packed / self-tested at prepare, RPO_GD_ON {(proj, b): tag}
             picks one at call (capture) time (rev_ab3 arms); empty = the base routes. Base k3_gc_19: ALT_DEFAULT (R-rpo-1);
@@ -64,15 +65,21 @@ def pf_support(t):
             '  uint4 r;\n'
             '  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];' + BS + 'n"\n'
             '               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));\n  return r;\n}\n'
+            '__device__ __forceinline__ uint4 ldxg(const uint4* p) {   // R-rpo-4: plain (weak, L1-cached) x load, after the wait\n'
+            '  uint4 r;\n'
+            '  asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];' + BS + 'n"\n'
+            '               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));\n  return r;\n}\n'
             'template <int XP>\n__device__ __forceinline__ uint4 ldxk(const uint4* p) {\n'
-            '  if constexpr ((XP & 2) != 0) return ldxc(p);\n  else return ldx(p);\n}\n')
+            '  if constexpr ((XP & 4) != 0) return ldxg(p);\n'
+            '  else if constexpr ((XP & 2) != 0) return ldxc(p);\n  else return ldx(p);\n}\n')
     c = sub(c, ldx, ldx + ldxk, what="ldxk")
     k0 = c.index("template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int VF = 0, int CAT = 0>")
     k1 = c.index("template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int CAT = 0>" + NL + "static int launch")
     body = c[k0:k1]
     check(body.count("= ldx(") == 6, f"gd_kernel x loads: {body.count('= ldx(')}")
     c = c[:k0] + body.replace("= ldx(", "= ldxk<XP>(") + c[k1:]
-    c = sub(c, "  constexpr int XB = XP ? 2 : 1;", "  constexpr int XB = (XP & 1) ? 2 : 1;   // XP & 2: PF (R-rpo)", what="XB")
+    c = sub(c, "  constexpr int XB = XP ? 2 : 1;", "  constexpr int XB = (XP & 1) ? 2 : 1;   // XP & 2: PF (R-rpo), XP & 4: x plain ld.global",
+            what="XB")
     c = sub(c, "      for (int p = 0; p < NP; ++p) R[i][p] = ldw(wp + (size_t)i * wstep + p * 32);",
             "      for (int p = 0; p < NP; ++p)\n"
             "        R[i][p] = (XP & 2) ? ldwp(wp + (size_t)i * wstep + p * 32) : ldw(wp + (size_t)i * wstep + p * 32);",
@@ -114,6 +121,16 @@ def alt_routes(t, altdef):
 
 PF_PROJ = ("o", "unpooler", "pooler")
 
+# R-rpo-4 lab arms on k3_gc_20 (XP: 2 = PF + x .cg, 6 = PF + x plain ld.global, | 1 = x one-ahead): pf = k3_rpo_g20_4's T 1 routes,
+# o8 / o8g = o at T 1 on the o8 geometry (WK 8 KU 2), g = the base route + PF + plain x (T 1 / 8 / 16)
+ALT_RPO4 = ('RPO_GD_ALT = {("o", 1, "pf"): (1, 2, 4, 4, 2, 1, 2), ("unpooler", 1, "pf"): (1, 1, 16, 4, 2, 1, 2),' + NL +
+            '              ("pooler", 1, "pf"): (1, 1, 8, 16, 2, 1, 3), ("o", 1, "o8"): (1, 1, 8, 2, 2, 1, 2),' + NL +
+            '              ("o", 1, "o8g"): (1, 1, 8, 2, 2, 1, 6), ("o", 1, "g"): (1, 2, 4, 4, 2, 1, 6),' + NL +
+            '              ("unpooler", 1, "g"): (1, 1, 16, 4, 2, 1, 6), ("pooler", 1, "g"): (1, 1, 8, 16, 2, 1, 7),' + NL +
+            '              ("o", 8, "g"): (1, 1, 8, 2, 2, 1, 6), ("unpooler", 8, "g"): (1, 1, 16, 4, 2, 1, 6),' + NL +
+            '              ("pooler", 8, "g"): (1, 1, 8, 16, 2, 1, 7), ("o", 16, "g"): (2, 2, 4, 4, 2, 1, 6),' + NL +
+            '              ("unpooler", 16, "g"): (2, 2, 4, 16, 2, 1, 6)}')
+
 
 def gd_route_span(t):
     a = t.index(NL + "GD_ROUTE = {") + 1
@@ -135,7 +152,7 @@ def derive_alt(t):
     return "RPO_GD_ALT = {" + ("," + NL + " " * 14).join(", ".join(ents[i:i + 2]) for i in range(0, len(ents), 2)) + "}"
 
 
-def pf_routes(t, projs):
+def pf_routes(t, projs, xg=()):
     a, b = gd_route_span(t)
     seg, n = t[a:b], [0]
 
@@ -147,7 +164,8 @@ def pf_routes(t, projs):
             return m.group(0)
         check(len(rt) == 7 and rt[6] in (0, 1), f"route {m.group(0)}")
         n[0] += 1
-        return f'("{m.group(1)}", {m.group(2)}): {rt[:6] + (rt[6] | 2,)}'
+        g = 4 if ((m.group(1), None) in xg or (m.group(1), int(m.group(2))) in xg) else 0
+        return f'("{m.group(1)}", {m.group(2)}): {rt[:6] + (rt[6] | 2 | g,)}'
     seg = re.sub(r'\("(\w+)", (\d+)\): \(([\d, ]+)\)', rep, seg)
     check(n[0] >= len(sel), f"pf routes changed {n[0]}")
     return t[:a] + seg + t[b:]
@@ -165,7 +183,7 @@ def o_routes(t, spec):
     else:
         cur = {b: rt[:6] + (rt[6] | 2,) for b, rt in cur.items()}
     for b, rt in cur.items():
-        check(len(rt) == 7 and rt[6] in (0, 1, 2, 3), f"route {b} {rt}")
+        check(len(rt) == 7 and rt[6] in (0, 1, 2, 3, 6, 7), f"route {b} {rt}")
     new = ", ".join(f'("o", {b}): {cur[b]}' for b in (1, 8, 16))
     return t.replace(m.group(0), new), cur
 
@@ -183,7 +201,8 @@ def main():
     bn = b.split(NL)[1]
     t = pf_support(b)
     if mode == "lab":
-        t = alt_routes(t, ARGS.get("altdef", ALT_DEFAULT if bstem == "k3_gc_19" else derive_alt(b)))
+        ad = ARGS.get("altdef", ALT_DEFAULT if bstem == "k3_gc_19" else derive_alt(b))
+        t = alt_routes(t, ALT_RPO4 if ad == "rpo4" else ad)
         what = "GD PF support + RPO_GD_ALT / RPO_GD_ON alternates (inert unless armed)"
     else:
         projs = ARGS.get("pf", "o").split(",")
@@ -191,7 +210,8 @@ def main():
         if ARGS.get("oroutes"):   # legacy: explicit o routes (MID k3_rpo_3)
             t, cur = o_routes(t, ARGS["oroutes"])
             projs = [q for q in projs if q.split(":")[0] != "o"]
-        t = pf_routes(t, projs) if projs else t
+        xg = [(q.split(":")[0], int(q.split(":")[1]) if ":" in q else None) for q in ARGS.get("xg", "").split(",") if q]
+        t = pf_routes(t, projs, xg) if projs else t
         a_, b_ = gd_route_span(t)
         what = "GD pre-wait stages coherent (PF) on " + "/".join(projs) + ": " + " ".join(
             f"{p_}{bb}:{rt.replace(', ', '')}" for p_, bb, rt in re.findall(r'\("(\w+)", (\d+)\): \(([\d, ]+)\)', t[a_:b_])

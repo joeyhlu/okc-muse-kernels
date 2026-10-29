@@ -72,13 +72,16 @@ def main():
         sts = sum(1 for s in pre if "LDGSTS" in s)
         other = [s for s in pre if "LDG" in s and "LDGSTS" not in s and "LDGDEPBAR" not in s and "LDG.E.NA.128" not in s
                  and not re.search(r"LDG\.E\.CONSTANT ", s)]
+        post = ins[acq + 1:] if acq >= 0 else ins
+        xpost = sum(1 for s in post if re.search(r"LDG\.E(\.\w+)*\.128", s) and ".NA." not in s and not s.endswith(".NA"))
+        xkind = sorted({re.search(r"LDG\.E[\w.]*", s).group(0) for s in post if re.search(r"LDG\.E(\.\w+)*\.128", s) and ".NA" not in s})
         st, xp = t[5], t[8]
         flag = ""
         if other:
             flag = "  <-- RACE: non-weight load above the wait: " + "; ".join(o[:60] for o in other[:3])
             bad += 1
         print(f"{t[1:9]} VF{t[9]} CAT{t[10]} {names.get(t[:9], ['(VF/CAT)'])}: ACQBULK@{acq} pre-wait weight LDG {w} "
-              f"(ST x 3 = {3 * st}{', PF' if xp & 2 else ''}) esc {esc} LDGSTS {sts}{flag}")
+              f"(ST x 3 = {3 * st}{', PF' if xp & 2 else ''}{'+xg' if xp & 4 else ''}) esc {esc} LDGSTS {sts} | post-wait x LDG.128 {xpost} {xkind}{flag}")
     print(f"[rpo_sass] {path.name}: {'FAIL' if bad else 'OK'} ({bad} racy instance(s))")
     return 1 if bad else 0
 
