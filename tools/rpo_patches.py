@@ -12,11 +12,14 @@ same decode / mma order -> outputs bitwise == the route without PF. PF routes al
 ld.global.cg: with the stages above ACQBULK ptxas hoisted ld.global.nc x loads above it too (a race; R-rpo-1 k3_rpo_1).
 SAFETY GATE: every PF build must pass tools/rpo_sass.py (no x / non-weight global load above ACQBULK) before any GPU run.
 
-  python -I tools/rpo_patches.py --n=<n> [--base=k3_gc_19] [--mode=lab|clean] [--oroutes="1:1,2,4,4,2,1,2;8:...;16:..."] [--dry]
-     -> kernels/lab/k3_rpo_<n>.py
+  python -I tools/rpo_patches.py --n=<n> [--base=k3_gc_20] [--mode=lab|clean] [--pf=o,unpooler,pooler]
+                                 [--oroutes="1:1,2,4,4,2,1,2;8:...;16:..."] [--dry]
+     -> kernels/lab/k3_rpo_<n>.py (base k3_gc_19) | kernels/lab/k3_rpo_g<NN>_<n>.py (base k3_gc_<NN>, e.g. k3_rpo_g20_1)
 mode lab:   PF support + RPO_GD_ALT {(proj, b, tag): route} built / packed / self-tested at prepare, RPO_GD_ON {(proj, b): tag}
-            picks one at call (capture) time (rev_ab3 arms); empty = the base routes.
-mode clean: PF support + the o routes of --oroutes (default: the base o routes with XP | 2), nothing else.
+            picks one at call (capture) time (rev_ab3 arms); empty = the base routes. Base k3_gc_19: ALT_DEFAULT (R-rpo-1);
+            other bases: tag "pf" = every base o / unpooler / pooler route with XP | 2, tag "pfw1" = o WR 1 ST 4 KU 4 + PF.
+mode clean: PF support + XP | 2 on every GD_ROUTE entry of the --pf projections (default o; o / unpooler / pooler are the
+            PDL GD routes: pooler = the VF 0 GD pooler at T 1 / 8); --oroutes overrides single o routes; nothing else.
 """
 import hashlib
 import pathlib
@@ -109,6 +112,47 @@ def alt_routes(t, altdef):
     return t
 
 
+PF_PROJ = ("o", "unpooler", "pooler")
+
+
+def gd_route_span(t):
+    a = t.index(NL + "GD_ROUTE = {") + 1
+    return a, t.index("}" + NL, a) + 1
+
+
+def derive_alt(t):
+    """tag pf = base route | PF for every PDL GD route; pfw1 = o at WR 1 / ST 4 / KU 4 (+ PF), MT kept."""
+    a, b = gd_route_span(t)
+    rows = re.findall(r'\("(\w+)", (\d+)\): \(([\d, ]+)\)', t[a:b])
+    ents = []
+    for proj, bb, rt in rows:
+        rt = tuple(int(x) for x in rt.split(", "))
+        if proj in PF_PROJ:
+            ents.append(f'("{proj}", {bb}, "pf"): {rt[:6] + (rt[6] | 2,)}')
+            if proj == "o":
+                ents.append(f'("o", {bb}, "pfw1"): {(rt[0], 1, 4, 4, 4, 1, rt[6] | 2)}')
+    check(len(ents) >= 9, f"alt entries {len(ents)}")
+    return "RPO_GD_ALT = {" + ("," + NL + " " * 14).join(", ".join(ents[i:i + 2]) for i in range(0, len(ents), 2)) + "}"
+
+
+def pf_routes(t, projs):
+    a, b = gd_route_span(t)
+    seg, n = t[a:b], [0]
+
+    sel = [(q.split(":")[0], int(q.split(":")[1]) if ":" in q else None) for q in projs]   # "proj" = every bucket, "proj:b"
+
+    def rep(m):
+        rt = tuple(int(x) for x in m.group(3).split(", "))
+        if (m.group(1), None) not in sel and (m.group(1), int(m.group(2))) not in sel:
+            return m.group(0)
+        check(len(rt) == 7 and rt[6] in (0, 1), f"route {m.group(0)}")
+        n[0] += 1
+        return f'("{m.group(1)}", {m.group(2)}): {rt[:6] + (rt[6] | 2,)}'
+    seg = re.sub(r'\("(\w+)", (\d+)\): \(([\d, ]+)\)', rep, seg)
+    check(n[0] >= len(sel), f"pf routes changed {n[0]}")
+    return t[:a] + seg + t[b:]
+
+
 def o_routes(t, spec):
     m = re.search(r'\("o", 1\): \(\d+, \d+, \d+, \d+, \d+, \d+, \d+\), \("o", 8\): \(\d+, \d+, \d+, \d+, \d+, \d+, \d+\), '
                   r'\("o", 16\): \(\d+, \d+, \d+, \d+, \d+, \d+, \d+\)', t)
@@ -131,19 +175,28 @@ def main():
     check(n, "--n=<n> required")
     mode = ARGS.get("mode", "lab")
     check(mode in ("lab", "clean"), "--mode=lab|clean")
-    base = ROOT / f"kernels/muse_decode_layer/{ARGS.get('base', 'k3_gc_19')}.py"
-    out = ROOT / f"kernels/lab/k3_rpo_{n}.py"
+    bstem = ARGS.get("base", "k3_gc_20")
+    base = ROOT / f"kernels/muse_decode_layer/{bstem}.py"
+    out = ROOT / ("kernels/lab/k3_rpo_%s.py" % n if bstem == "k3_gc_19" else "kernels/lab/k3_rpo_g%s_%s.py" % (bstem.split("_")[-1], n))
     check(not out.exists(), f"{out.name} exists (never overwrite)")
     b = base.read_text(encoding="utf-8")
     bn = b.split(NL)[1]
     t = pf_support(b)
     if mode == "lab":
-        t = alt_routes(t, ARGS.get("altdef", ALT_DEFAULT))
+        t = alt_routes(t, ARGS.get("altdef", ALT_DEFAULT if bstem == "k3_gc_19" else derive_alt(b)))
         what = "GD PF support + RPO_GD_ALT / RPO_GD_ON alternates (inert unless armed)"
     else:
-        t, cur = o_routes(t, ARGS.get("oroutes", ""))
-        what = "GD pre-wait stages coherent (PF) on o: " + " ".join(f"{b_}:{''.join(map(str, r_))}" for b_, r_ in sorted(cur.items()))
-    nonce = f"# nonce k3-rpo-{n} ({base.stem} + {what}; tools/rpo_patches.py)"
+        projs = ARGS.get("pf", "o").split(",")
+        check({q.split(":")[0] for q in projs} <= set(PF_PROJ) and projs, f"--pf={projs}")
+        if ARGS.get("oroutes"):   # legacy: explicit o routes (MID k3_rpo_3)
+            t, cur = o_routes(t, ARGS["oroutes"])
+            projs = [q for q in projs if q.split(":")[0] != "o"]
+        t = pf_routes(t, projs) if projs else t
+        a_, b_ = gd_route_span(t)
+        what = "GD pre-wait stages coherent (PF) on " + "/".join(projs) + ": " + " ".join(
+            f"{p_}{bb}:{rt.replace(', ', '')}" for p_, bb, rt in re.findall(r'\("(\w+)", (\d+)\): \(([\d, ]+)\)', t[a_:b_])
+            if int(rt.split(", ")[6]) & 2)
+    nonce = f"# nonce {out.stem.replace('_', '-')} ({base.stem} + {what}; tools/rpo_patches.py)"
     t = t.replace(bn, nonce, 1)
     check(t.split(NL)[1] == nonce, "nonce")
     check(t.isascii(), "non-ASCII")

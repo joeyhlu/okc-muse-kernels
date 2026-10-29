@@ -83,5 +83,177 @@ def main():
     return 1 if bad else 0
 
 
+# ---- --audit: the other non-MoE PDL kernels that read predecessor data (R-rpo-2 step 0) -----------------------------------
+# rpo_sass.py --audit <layer.py> [OUTDIR] [--units=ks1,sbb1,...] [-v]
+# Each unit's CUDA source is rebuilt exactly as the layer's _build function does (literal strings + the same .replace()s), compiled
+# device-only for sm_90a with -lineinfo, and disassembled with nvdisasm -g -gi. Per kernel: the pre-wait set = instructions
+# reachable from the entry without passing an ACQBULK (CFG over BRA targets; a predicated ACQBULK counts as executed). Every
+# pre-wait global access (LDG / LD / LDGSTS / ATOMG / RED / STG / UTMALDG / UBLKCP) is listed with its outermost source line
+# (the kernel-level call site): SRC-PRE = written before the wait in the source (intended; must read graph inputs / weights
+# only), HOISTED = written after the wait but scheduled above it by ptxas (only .nc loads can move: a RACE if the address is
+# predecessor output). Verdicts need the source text printed next to each access (no pointer provenance here).
+NVDIS = "/root/cudaenv/lib/python3.14/site-packages/triton/backends/nvidia/bin/nvdisasm"
+TORCH_NV = ["-D__CUDA_NO_HALF_OPERATORS__", "-D__CUDA_NO_HALF_CONVERSIONS__", "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-D__CUDA_NO_HALF2_OPERATORS__", "--expt-relaxed-constexpr", "-DTORCH_EXTENSION_NAME=rpoaudit"]
+MEMOP = re.compile(r"^(?:@!?U?P\w+\s+)?(LDG|LD|LDGSTS|ATOMG|ATOM|RED|STG|ST|UTMALDG|UBLKCP|UTMAPF|CCTL)(\.[\w.]+)?\s")
+
+
+def _layer_ns(path, names):
+    ns = {"__name__": "rpo_audit"}
+    for n in ast.parse(pathlib.Path(path).read_text(encoding="utf-8")).body:
+        tg = [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []
+        if set(tg) & set(names):
+            exec(compile(ast.Module(body=[n], type_ignores=[]), str(path), "exec"), ns)
+    return ns
+
+
+def audit_units(path):
+    ns = _layer_ns(path, ["K1_CUDA_SRC", "V8_TAIL_CUDA_SRC", "KS1_CUDA_SRC", "KS1_INSTS", "VSL_KS1_INSTS", "VSL_KS3_INSTS",
+                          "VSL_ENABLE", "SBB1_CU", "SBB1_HOST", "VG_CU", "VG_HOST", "VGF_CU", "VGF_HOST", "SU1_CUDA_SRC",
+                          "VD_CUDA_SRC"])
+    ve = ns.get("VSL_ENABLE", False)
+    ks1 = (ns["KS1_CUDA_SRC"].replace("@INSTS@", " ".join("KS1_X(%d, %d, %d)" % t for t in ns["KS1_INSTS"]))
+           .replace("@MINSTS@", " ".join("KS1_XM(%d, %d, %d, %d)" % t for t in ns["VSL_KS1_INSTS"]) if ve else "")
+           .replace("@M3INSTS@", " ".join("KS3_XM(%d, %d)" % t for t in ns["VSL_KS3_INSTS"]) if ve else ""))
+    return {"k1": ns["K1_CUDA_SRC"], "tail": ns["V8_TAIL_CUDA_SRC"], "ks1": ks1, "sbb1": ns["SBB1_CU"] + ns["SBB1_HOST"],
+            "vgf": ns["VG_CU"] + ns["VG_HOST"] + ns["VGF_CU"] + ns["VGF_HOST"], "su1": ns["SU1_CUDA_SRC"], "vd": ns["VD_CUDA_SRC"]}
+
+
+def _compile(tag, src, out):
+    import sysconfig
+    import torch.utils.cpp_extension as ce
+    inc = [f"-I{p}" for p in ce.include_paths()] + [f"-I{sysconfig.get_paths()['include']}"]
+    cu, cub = out / f"a_{tag}.cu", out / f"a_{tag}.cubin"
+    cu.write_text(src)
+    r = subprocess.run(["nvcc", "-cubin", "-arch=sm_90a", "-O3", "-lineinfo", "-std=c++20", *TORCH_NV, *inc, "-o", str(cub), str(cu)],
+                       capture_output=True, text=True)
+    if r.returncode:
+        return None, " | ".join(ln[-160:] for ln in r.stderr.splitlines() if "error" in ln)[:500]
+    return subprocess.run([NVDIS, "-c", "-g", "-gi", str(cub)], capture_output=True, text=True).stdout, ""
+
+
+def _functions(dis):
+    """nvdisasm text -> {mangled: [(addr, ins, outer_line)]}; outer_line = last '//## File ..., line N' before the instruction."""
+    fns, cur, line, lab, pend = {}, None, None, {}, []
+    for ln in dis.splitlines():
+        m = re.match(r"^//-+ \.text\.(\S+)", ln.strip())
+        if m:
+            cur = fns.setdefault(m.group(1), [])
+            continue
+        m = re.match(r'\s*//## File "([^"]+)", line (\d+)', ln)
+        if m:
+            line = (m.group(1), int(m.group(2)) if m.group(1).endswith(".cu") else -1)
+            continue
+        m = re.match(r"^\s*(\.L_x_\d+):", ln)
+        if m:
+            pend.append(m.group(1))
+            continue
+        m = re.match(r"\s*/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;", ln)
+        if m and cur is not None:
+            cur.append((int(m.group(1), 16), m.group(2), line))
+            for lb in pend:
+                lab[lb] = int(m.group(1), 16)
+            pend = []
+    # branch targets are printed as labels: `(.L_x_12) -> 0x<addr> so the CFG walk can follow them
+    rl = lambda s: re.sub(r"`\((\.L_x_\d+)\)", lambda q: "0x%x" % lab[q.group(1)] if q.group(1) in lab else q.group(0), s)
+    return {f: [(a_, rl(s_), l_) for a_, s_, l_ in v] for f, v in fns.items()}
+
+
+def _prewait(ins):
+    idx = {a: i for i, (a, _, _) in enumerate(ins)}
+    seen, todo = set(), [0]
+    while todo:
+        i = todo.pop()
+        if i in seen or i >= len(ins):
+            continue
+        seen.add(i)
+        s = ins[i][1]
+        op = re.sub(r"^@!?U?P\w+\s+", "", s)
+        if op.startswith("ACQBULK"):
+            continue
+        pred = s.startswith("@")
+        m = re.match(r"(?:BRA|BRA\.\w+|JMP)\s+(?:`\(\.L_x_\d+\)|0x([0-9a-f]+))", op)
+        if op.startswith(("EXIT", "RET")) and not pred:
+            continue
+        if m and m.group(1):
+            todo.append(idx.get(int(m.group(1), 16), len(ins)))
+            if not pred and not op.startswith("BRA.DIV"):
+                continue
+        if op.startswith(("BRX", "JMX")):
+            todo.extend(range(i + 1, len(ins)))
+            continue
+        todo.append(i + 1)
+    return seen
+
+
+def audit(path, out, units, verbose):
+    import concurrent.futures as cf
+    srcs = audit_units(path)
+    if units:
+        srcs = {k: v for k, v in srcs.items() if k in units}
+    with cf.ThreadPoolExecutor(4) as ex:
+        res = dict(zip(srcs, ex.map(lambda kv: _compile(kv[0], kv[1], out), srcs.items())))
+    names = demangle_all([f for k in res if res[k][0] for f in _functions(res[k][0])])
+    bad = 0
+    for tag, (dis, err) in res.items():
+        if dis is None:
+            print(f"[audit] {tag}: COMPILE FAILED {err}")
+            bad += 1
+            continue
+        lines = srcs[tag].split("\n")
+        for fn, ins in _functions(dis).items():
+            acq = [i for i, (_, s, _) in enumerate(ins) if "ACQBULK" in s]
+            if not acq:
+                continue
+            pre = _prewait(ins)
+            wl = max((ins[i][2][1] for i in acq if ins[i][2]), default=0)   # src-pre = written before the LAST wait line
+            ops = [(ins[i][1], ins[i][2]) for i in sorted(pre) if MEMOP.match(ins[i][1])]
+            hz = [(s, l) for s, l in ops if l and l[1] > wl and not s.split()[0].endswith(("STG", "ST"))]
+            short = names.get(fn, fn)[:70]
+            print(f"[audit] {tag} {short}: ACQBULK x{len(acq)} @{acq[0]} (src line {wl}) pre-wait mem ops {len(ops)} "
+                  f"(src-pre {len(ops) - len(hz)}, HOISTED {len(hz)})")
+            show = {}
+            for s, l in ops:
+                k = (l[1] if l else -1)
+                show.setdefault(k, [s.split()[0] if not s.startswith("@") else " ".join(s.split()[:2]), 0])[1] += 1
+            for k, (op, c) in sorted(show.items()):
+                tag2 = "HOISTED" if k > wl else ("src-pre" if k > 0 else "hdr")
+                if verbose or tag2 == "HOISTED":
+                    txt = lines[k - 1].strip()[:110] if 0 < k <= len(lines) else "?"
+                    print(f"    {tag2} x{c} {op:22s} L{k}: {txt}")
+            # reverse direction: loads the source writes BEFORE the (first) wait that ptxas scheduled below it = lost prefetch
+            w0 = min((ins[i][2][1] for i in acq if ins[i][2] and ins[i][2][1] > 0), default=0)
+            sunk = {}
+            for i, (_, s, l) in enumerate(ins):
+                if i not in pre and MEMOP.match(s) and l and 0 < l[1] < w0 and not re.match(r"(?:@!?U?P\w+\s+)?(STG|ST)\b", s):
+                    op = re.sub(r"^@!?U?P\w+\s+", "", s).split()[0]
+                    sunk.setdefault(l[1], []).append(op)
+            srcpre = len(ops) - len(hz)
+            print(f"    intended pre-wait (src line < {w0}): ABOVE {srcpre} | BELOW (sunk) {sum(len(v) for v in sunk.values())}")
+            for k, v in sorted(sunk.items())[:10]:
+                print(f"    SUNK x{len(v)} {','.join(sorted(set(v)))} L{k}: {lines[k - 1].strip()[:110] if k <= len(lines) else '?'}")
+            if "--nc" in sys.argv:   # post-wait .nc loads: legal for ptxas to hoist above ACQBULK -> latent race on predecessor data
+                post = {}
+                for i, (_, s, l) in enumerate(ins):
+                    if i not in pre and re.search(r"\bLDG\.[\w.]*CONSTANT", s) and l and l[1] > 0:
+                        post[l[1]] = post.get(l[1], 0) + 1
+                for k, c in sorted(post.items())[:12]:
+                    print(f"    post-wait nc x{c} L{k}: {lines[k - 1].strip()[:120] if k <= len(lines) else '?'}")
+    return bad
+
+
+def demangle_all(fns):
+    if not fns:
+        return {}
+    r = subprocess.run(["c++filt"], input="\n".join(fns), capture_output=True, text=True).stdout.splitlines()
+    return dict(zip(fns, (re.sub(r"\(.*", "", x) for x in r)))
+
+
 if __name__ == "__main__":
+    if "--audit" in sys.argv:
+        a = [x for x in sys.argv[1:] if not x.startswith("-")]
+        o = pathlib.Path(a[1]) if len(a) > 1 else pathlib.Path(tempfile.mkdtemp())
+        o.mkdir(parents=True, exist_ok=True)
+        u = next((x.split("=", 1)[1].split(",") for x in sys.argv if x.startswith("--units=")), None)
+        sys.exit(1 if audit(pathlib.Path(a[0]), o, u, "-v" in sys.argv) else 0)
     sys.exit(main())
