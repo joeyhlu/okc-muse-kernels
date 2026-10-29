@@ -13,7 +13,7 @@ Flags (int32 x 4, _L1B["fl"]): [0] h ready (reset by R CTA 0 before its trigger)
 trigger), [2] sticky error. Causality: P launches only after every K CTA triggered, K only after every R CTA triggered, so
 both resets precede any poll; R sets [0] after griddepcontrol.wait returned (sbb1 complete and visible).
 FG = 0 instances are PTX-identical to the base (tools/l1f_local_compile.py). Marks (L1B_MK_ON): mk[0..2] K entry / wait /
-done, mk[16 + c*4 + {0 entry, 1 flag pass, 3 end}] P CTA c, mk[1040 + c*2 + {0 post-wait, 1 end}] R CTA c.
+done, mk[16 + c*4 + {0 entry, 1 flag pass, 3 end}] P CTA c, mk[1040 + c*2 + {0 post-wait, 1 end}], mk[1300 + c] entry, R CTA c.
 """
 NL = chr(10)
 
@@ -81,10 +81,12 @@ struct ReB {
   int* fl; long long* mk;
 };
 constexpr int REB_DS = (2 * 8 * 256 + 8 * 256) * 16;   // R: 2 pieces of 8 router rows x 1024 K + the x slice [8][1024] f32
+constexpr int REB_DS_ALLOC = 116 * 1024;   // R-l1b-1: > 114 KB -> one R CTA per SM (2 R CTAs blocked P's second CTA, R-l1b-0)
 
 __global__ void __launch_bounds__(256) reb_router_kernel(const __grid_constant__ ReB B) {
   const int cb = (int)blockIdx.x, tx = (int)threadIdx.x, lane = tx & 31, warp = tx >> 5;
   const int vf_sl = (2 * cb) >> 5;
+  if (B.mk && tx == 0) B.mk[1300 + cb] = vf_gt();
   if (cb == 0 && tx == 0) { *reinterpret_cast<volatile int*>(B.fl) = 0; __threadfence(); }
   __syncthreads();
   if (B.trig) pdl_trigger();
@@ -226,7 +228,7 @@ int gd_reb_run_raw(const float* x32, const float* w32, float* part, const void* 
                    int* fl, long long* mk, int pdl, cudaStream_t st) {
   static bool set = false;
   if (!set) {
-    const int e = (int)cudaFuncSetAttribute(reb_router_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, REB_DS);
+    const int e = (int)cudaFuncSetAttribute(reb_router_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, REB_DS_ALLOC);
     if (e) return e;
     set = true;
   }
@@ -234,7 +236,7 @@ int gd_reb_run_raw(const float* x32, const float* w32, float* part, const void* 
   B.x32 = x32; B.w32 = w32; B.part = part; B.M = M; B.trig = (pdl >> 1) & 1;
   B.bias = bias; B.ls = ls; B.tw = tw; B.tid = tid; B.lid = lid; B.mult = mult; B.rscale = rscale; B.deps = deps;
   B.fl = fl; B.mk = mk;
-  int e = reb_launch(reb_router_kernel, B, 128, REB_DS, pdl, st);
+  int e = reb_launch(reb_router_kernel, B, 128, REB_DS_ALLOC, pdl, st);
   if (e) return e;
   e = reb_launch(reb_route_kernel, B, (M + 7) / 8, 0, pdl, st);
   if (e) return e;
@@ -268,7 +270,7 @@ int gd_reb_info_raw(int k, int64_t* res) {   // 0: R, 1: K, 2: P
   cudaFuncAttributes fa;
   int e = 0, occ = 0, ds = 0;
   if (k == 0) {
-    ds = REB_DS;
+    ds = REB_DS_ALLOC;
     e = (int)cudaFuncSetAttribute(reb_router_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ds);
     if (!e) e = (int)cudaFuncGetAttributes(&fa, reb_router_kernel);
     if (!e) e = (int)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, reb_router_kernel, 256, ds);
