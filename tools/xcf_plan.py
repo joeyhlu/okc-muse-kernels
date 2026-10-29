@@ -11,6 +11,10 @@ Projection per routing (us, per CTA, the max over CTAs is the call's end):
   b_red  = B stages x c(N) x rel(N, KB) from the probe (kb arms vs inc, interpolated in log2 KB; KB >= 4096 -> kb4096)
   a_tail = per segment: the last A row group of r = slices mod 4 WGs costs aw_r / inc of a full row group, not r / 4
 Layer routings: box_out/{vms,vms6,m32,sk}/run.json (counts per expert).
+--clusters: the cluster variants (Astra, relayed 2026-10-29): (a) C CTAs per expert, experts never split (full-K B, no red),
+whole experts LPT-placed on 128 / C clusters -> makespan / ideal; (b) XCF-C: clusters of C CTAs get contiguous cost-balanced
+slice ranges, h shared in the cluster, B K = the cluster's segment (red vs the fair kb4096 zero), busiest CTA's A share
+(ceil + partial row group via aw) -> worst CTA / ideal.
 """
 from __future__ import annotations
 
@@ -147,6 +151,40 @@ def project(counts, pr, G=132):
             "kb_med": sorted(32 * k for s in segs for _, _, k in s)[len([1 for s in segs for _ in s]) // 2]}
 
 
+def ecost(n):
+    return 768.0 * c_stage(n)   # one expert: W13 512 + W2 256 stage-equivalents
+
+
+def astra(counts, C, ncta=128):
+    loads = [0.0] * (ncta // C)
+    for c in sorted((ecost(n) for n in counts), reverse=True):
+        i = min(range(len(loads)), key=lambda k: loads[k])
+        loads[i] += c / C
+    return max(loads) / (sum(ecost(n) for n in counts) / 132)
+
+
+def xcfc(counts, pr, C, ncl):
+    fair = {"rel": {}, "aw": pr["aw"]}
+    for (N, k), v in pr["rel"].items():
+        fair["rel"][(N, k)] = (1 + v) / (1 + pr["rel"][(N, 4096)]) - 1.0
+    segs, _ = plan(counts, ncl)
+    worst = 0.0
+    for s in segs:
+        base = red = tail = 0.0
+        for e, n, k in s:
+            cn = c_stage(n)
+            p = math.ceil(n / 64)
+            npass = -(-math.ceil(n / p) // 8) * 8
+            base += 6.0 * k * cn
+            red += 2.0 * k * cn * max(0.0, interp_rel(fair, npass, min(32 * k, 4096)))
+            per = math.ceil(k / C)
+            r = per % 4
+            extra = 4.0 * (per - k / C) + (16.0 * (pr["aw"].get((min(64, max(8, npass)), r), r / 4) - r / 4) if r else 0.0)
+            tail += extra * cn
+        worst = max(worst, (base + red) / C + tail)
+    return worst / (sum(ecost(n) for n in counts) / (ncl * C))
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     arg = lambda k, d: next((a.split("=", 1)[1] for a in argv if a.startswith(f"--{k}=")), d)  # noqa: E731
@@ -161,6 +199,12 @@ def main(argv=None):
         print(f"T={T:3d} ({len(rs)} routings): per-CTA base avg {med('avg_base'):.1f} max {med('max_base'):.1f} us | "
               f"+ B red {med('b_red_mean'):.1f} + A tail {med('a_tail_mean'):.1f} -> max CTA {med('max_total'):.1f} us | "
               f"segments/CTA {med('segs_mean'):.2f}, median segment K {med('kb_med')}")
+        if "--clusters" in argv and pr:
+            md = lambda v: sorted(v)[len(v) // 2]  # noqa: E731
+            print("        astra (C per expert, LPT, 128 CTAs) makespan/ideal: " + "  ".join(
+                f"C{C} {md([astra(c, C) for c in L]):.2f}" for C in (4, 8, 16)))
+            print("        xcf-c (cluster ranges, fair red, A share) worst/ideal: " + "  ".join(
+                f"C{C} {md([xcfc(c, pr, C, n) for c in L]):.3f}" for C, n in ((1, 132), (2, 66), (4, 32), (8, 16), (16, 8))))
     return 0
 
 
