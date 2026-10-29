@@ -5,7 +5,7 @@ Same contract as gen_k3_b1a.py: the base must be a gen_k3_m32.finish() fixed poi
 goes through gen_k3_m32.finish (strip + AST checks, ASCII, nonce, judge-checker scan <= base, < 1 MB) and the output is a
 finish() fixed point. Refuses to overwrite.
 
-    python -I tools/gen_k3_att1.py --out=k3_att1_lab [--base=k3_gc_7] [--b1a] [--sets=sets.json] [--check]
+    python -I tools/gen_k3_att1.py --out=k3_att1_lab [--base=k3_gc_7] [--b1a | --b1v] [--sets=sets.json] [--check]
     python -I tools/gen_k3_att1.py --defaults-only --in=<file> --out=<name> --sets=sets.json    # box: knob defaults only
 sets.json: {"NAME": "python literal", ...} replaces the module line NAME = ... (one each); the nonce lists them.
 """
@@ -26,11 +26,12 @@ OUT_NAME = ARGS.get("out", "k3_att1_lab")
 OUT = ROOT / f"kernels/lab/{OUT_NAME}.py"
 SETS = json.loads(pathlib.Path(ARGS["sets"]).read_text()) if "sets" in ARGS else {}
 TAG = OUT_NAME.replace("_", "-")
+B1V = "--b1v" in FLAGS
 
 
 def nonce(base_stem, b1a):
     return (f"# nonce {TAG} ({base_stem} + ATT1: B = 1 full attention handoff knobs (prologue trigger-first, per-shape FA4 "
-            f"prewait / trigger, combine warps){' + B1A (routed off, lab B1A_DBG)' if b1a else ''}"
+            f"prewait / trigger, combine warps){' + B1A (routed off, lab B1A_DBG)' if b1a else ''}{' + B1V (wgmma compute, counter barrier)' if B1V else ''}"
             + (f"; defaults {sorted(SETS.items())}" if SETS else "") + ")")
 
 
@@ -66,7 +67,7 @@ def main():
     base_name = ARGS.get("base", "k3_gc_7")
     base = ROOT / f"kernels/muse_decode_layer/{base_name}.py"
     check = "--check" in FLAGS
-    b1a = "--b1a" in FLAGS
+    b1a = "--b1a" in FLAGS or B1V
     GM.check(base.exists(), f"{base.name} not found")
     if not check:
         GM.check(not OUT.exists(), f"{OUT.relative_to(ROOT)} exists; pick another --out")
@@ -81,12 +82,20 @@ def main():
     fixed = GM.finish(b, bn, bn.split()[2], chk_base, []) == b   # k3_gc_7 came from m32e_compose (own checks, not finish)
     rep = [f"{base.name} {'is' if fixed else 'is NOT'} a finish() fixed point ({len(b.encode())} B); the output goes through finish()"]
     nn = nonce(base.stem, b1a)
-    t = AP.apply(b.replace(bn, nn))
-    rep.append("att1_patches.apply: knobs, prologue TF, per-shape PW / TRIG, combine warps")
+    if "ATT1_PRO_TF = " in b:   # e.g. k3_gc_9 = k3_gc_8 + ATT1: only the B1A / B1V block is added
+        t = b.replace(bn, nn)
+        rep.append(f"{base.name} already carries ATT1: att1_patches.apply skipped")
+    else:
+        t = AP.apply(b.replace(bn, nn))
+        rep.append("att1_patches.apply: knobs, prologue TF, per-shape PW / TRIG, combine warps")
     if b1a:
         import b1a_patches as BP  # noqa: E402
         saved = BP.B1A_BLOCK
         BP.B1A_BLOCK = AP.b1a_block_edits(saved)
+        if B1V:
+            import b1v_patches as VP  # noqa: E402
+            BP.B1A_BLOCK = VP.edit_block(BP.B1A_BLOCK)
+            rep.append("b1v_patches.edit_block: WG wgmma compute, FIN counter barrier, (wg, fin) self-test variants")
         try:
             t = BP.apply(t, ())
         finally:
