@@ -23,6 +23,12 @@ on the control-flow graph (not in linear order, so warp-specialised branches are
     armed in the ship is a HAZARD; a HAZARD in an instance disarmed in the ship (vm_main with VML_FLAGS bit 256 clear: no PDL
     attribute, no wait) is printed LATENT-HAZARD and also exits 1 (the SASS has the load above the wait, the first flag change
     arms it) unless --allow-latent.
+
+  --nc-below (R-pdl-1): additionally list EVERY non-coherent load (LDG.*.CONSTANT = ld.global.nc / __ldg / const __restrict__)
+    of predecessor data, ABOVE or BELOW the wait, with its source line (the cubins carry -lineinfo; nvdisasm -g maps SASS idx ->
+    .cu line -> layer-file line), for vms_kernel, vm_main / vm_fin (bf2 / w72), vgf_kernel, the K2A33 kernels of the routed
+    variants (vid 0 1 2 6) and tail_kernel / tail_kernel2 (the writer of kernel_fn's `experts`); also counts the stores whose
+    address slice reaches ids / wts / tid / lid (who writes the routing tensors).  PRED = predecessor output, UP2 = wts.
 """
 import ast
 import collections
@@ -36,12 +42,13 @@ import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OBJ = "/root/cudaenv/lib/python3.14/site-packages/triton/backends/nvidia/bin/cuobjdump"
+NVD = "/root/cudaenv/lib/python3.14/site-packages/triton/backends/nvidia/bin/nvdisasm"
 PARAM0 = 0x210                                       # c[0x0][0x210]: first kernel parameter byte (sm_90)
 TORCH_NV = ["-D__CUDA_NO_HALF_OPERATORS__", "-D__CUDA_NO_HALF_CONVERSIONS__", "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__", "--expt-relaxed-constexpr", "-DTORCH_EXTENSION_NAME=pdl"]
 
 # ---- member classes --------------------------------------------------------------------------------------------------
-WEIGHT = {"ws13", "ws2", "gsc13", "gsc2", "nw", "wA", "wB", "gsA", "gsB"}
+WEIGHT = {"ws13", "ws2", "gsc13", "gsc2", "nw", "wA", "wB", "gsA", "gsB", "bias", "lstart"}   # bias / lstart: router bias, data["local_start"]
 UPSTREAM2 = {"wts"}
 DIAG = {"marks"}
 RANK = {"WEIGHT": 0, "DIAG": 0, "UPSTREAM2": 1, "UNKNOWN": 3, "PRED": 4}
@@ -71,6 +78,13 @@ def literal_nodes(path, names):
     return ns
 
 
+def lineno_of(path, name):
+    for n in ast.parse(pathlib.Path(path).read_text(encoding="utf-8")).body:
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+            return n.value.lineno
+    raise SystemExit(f"[pdl_sass] {name} not found in {path}")
+
+
 def vms_flags(path):
     """the flag list of _vms_build with G = 132 (the H200), evaluated from the file's own AST."""
     for n in ast.parse(pathlib.Path(path).read_text(encoding="utf-8")).body:
@@ -81,12 +95,12 @@ def vms_flags(path):
     raise SystemExit("[pdl_sass] _vms_build flags not found")
 
 
-def units_of(path, only):
+def units_of(path, only, nc=False):
     ns = literal_nodes(path, ["_vml_JMAX", "_vml_SLOTS", "_vml_FIXW", "_vml_wg_spec", "_vml_wg_spec64", "_vml_CUDA_T", "_vml_CUDA",
                               "_vml_FLAGS", "_VML_DEFS", "VML_VAR", "VML_ABVARS", "VML_BVAR", "VML_BUCKETS", "VML_FLAGS",
                               "VML_ENABLE", "VMS_CUDA_SRC", "VMS_ENABLE"])
     us = [dict(name="vms", src=ns["VMS_CUDA_SRC"], flags=vms_flags(path), kernels=["vms_kernel"], struct="Params", ns="vms",
-               routes="T<=16 (VMS_MAXT)", armed={"vms_kernel": True})]       # _vms_call passes pdl=1: PDL attribute set
+               routes="T<=16 (VMS_MAXT)", armed={"vms_kernel": True}, origin="VMS_CUDA_SRC")]   # _vms_call passes pdl=1: PDL attribute set
     vars_ = list(dict.fromkeys([ns["VML_VAR"]] + list(ns["VML_ABVARS"]) + list(ns["VML_BVAR"].values())))
     for v in vars_:
         bk = [b for b, on in ns["VML_BUCKETS"].items() if on and ns["VML_BVAR"].get(b, ns["VML_VAR"]) == v]
@@ -94,7 +108,27 @@ def units_of(path, only):
         us.append(dict(name=f"vm_{v}", src=ns["_vml_CUDA"], flags=list(ns["_vml_FLAGS"]) + list(ns["_VML_DEFS"][v]),
                        kernels=["vm_main", "vm_fin"], struct="Args", ns="vm",
                        routes=f"T-buckets {bk or 'none (self-test / default only)'} flags {fl}",
-                       armed={"vm_main": any(f & 256 for f in fl), "vm_fin": True}))   # vm_fin: PDL attribute always set
+                       armed={"vm_main": any(f & 256 for f in fl), "vm_fin": True}, origin="_vml_CUDA_T"))   # vm_fin: PDL attribute always set
+    if nc:
+        t = literal_nodes(path, ["V8_TAIL_CUDA_SRC", "VGF_CU", "VGF_HOST", "K2A33_PLAN", "SK1_VID", "K2A33_VARIANTS", "_k2a33_wg_specs",
+                                 "K2A33_KERNEL_SRC"])
+        us.append(dict(name="tail", src=t["V8_TAIL_CUDA_SRC"], flags=["-O3", "-lineinfo"], kernels=["tail_kernel2", "tail_kernel"], struct=None,
+                       ns=None, routes="V8_TAIL_ROUTE 'cat' T>=16 / 'sep' T<=8 (TL1_TAIL2 -> tail_kernel2)", armed={}, origin="V8_TAIL_CUDA_SRC"))
+        us.append(dict(name="vgf", src=t["VGF_CU"] + t["VGF_HOST"], flags=["-O3"], kernels=["vgf_kernel"], struct=None, ns=None,
+                       routes="not routed (_vgf_on never called; self-test only)", armed={}, origin="VGF_CU"))
+        vids = sorted(set(t["K2A33_PLAN"].values()) | {t["SK1_VID"]})
+        cs, at = [], []
+        for v in vids:
+            ex = tuple(t["K2A33_VARIANTS"][v])
+            assert len(ex) == 4, ex     # the routed vids are the plain launch3 variants
+            cs.append("    case %d: launch3<%d, %d, %d, %d>(p, (int)G, (int)G3, (int)mask); break;" % ((v,) + ex))
+            at.append("    case %d: return attrs3<%d, %d, %d, %d>();" % ((v,) + ex))
+        ksrc = t["K2A33_KERNEL_SRC"].replace("@CASES3@", "\n".join(cs)).replace("@ATTRS3@", "\n".join(at)).replace("@WGSPECS@", t["_k2a33_wg_specs"]())
+        us.append(dict(name="k2a", src=ksrc, flags=["-O3", "--expt-relaxed-constexpr"], kernels=["k1_kernel", "k2_kernel", "p0_kernel", "k3_kernel"],
+                       struct="Params", ns="k3", routes=f"K2A33_PLAN {t['K2A33_PLAN']} + SK1_VID {t['SK1_VID']}: vids {vids} (fallback when vms / vml are off)",
+                       armed={}, origin="K2A33_KERNEL_SRC", info=True))   # lazy waits (pdl_wait() inside loops): path-insensitive ABOVE / BELOW
+    for u in us:
+        u["layer"] = str(path)
     return [u for u in us if not only or u["name"] in only]
 
 
@@ -119,6 +153,39 @@ def struct_members(src, struct):
     return names
 
 
+SCALAR8 = ("long", "size_t", "double", "int64_t", "uint64_t", "ptrdiff_t")
+SCALAR4 = ("int", "float", "unsigned", "uint32_t", "int32_t")
+
+
+def sig_params(src, kname):
+    """[(name, offset, is_ptr)] of a plain-parameter __global__ kernel (natural alignment); None if a parameter is a struct."""
+    m = re.search(r"__global__\s+void\s+(?:__launch_bounds__\((?:[^()]|\([^()]*\))*\)\s+)?%s\s*\(" % re.escape(kname), src)
+    if not m:
+        return None
+    i, d = m.end(), 1
+    while d:
+        d += {"(": 1, ")": -1}.get(src[i], 0)
+        i += 1
+    out, off = [], 0
+    for decl in split_ops(src[m.end():i - 1]):
+        decl = re.sub(r"__restrict__|__grid_constant__|\bconst\b|__align__\(\d+\)", " ", decl)
+        ids = re.findall(r"[A-Za-z_]\w*", decl)
+        if not ids:
+            continue
+        if "*" in decl:
+            sz, ptr = 8, True
+        elif ids[0] in SCALAR8 or decl.strip().startswith("long long"):
+            sz, ptr = 8, False
+        elif ids[0] in SCALAR4:
+            sz, ptr = 4, False
+        else:
+            return None
+        off = (off + sz - 1) // sz * sz
+        out.append((ids[-1], off, ptr))
+        off += sz
+    return out
+
+
 def probe_src(src, ns, struct, names):
     out = ["\n// ---- pdl_sass probe: offsetof(member) baked into template kernel names (-1: member compiled out) ----",
            "#include <stddef.h>",
@@ -134,25 +201,26 @@ def compile_units(units, out, reuse):
     import sysconfig
     import torch.utils.cpp_extension as ce
     inc = [f"-I{p}" for p in ce.include_paths()] + [f"-I{sysconfig.get_paths()['include']}"]
-    sem, res = threading.Semaphore(3), {}
+    sem, res = threading.Semaphore(4), {}
 
     def job(u):
         with sem:
             n = u["name"]
-            mem = struct_members(u["src"], u["struct"])
+            mem = struct_members(u["src"], u["struct"]) if u["struct"] else {}
             names = list(mem)
             cu, cub, sas = out / f"{n}.cu", out / f"{n}.cubin", out / f"{n}.sass"
-            cu.write_text(probe_src(u["src"], u["ns"], u["struct"], names))
+            cu.write_text(probe_src(u["src"], u["ns"], u["struct"], names) if u["struct"] else u["src"])
             (out / f"{n}.members.json").write_text(json.dumps(mem))
             if not (reuse and cub.exists() and sas.exists()):
-                fl = [f for f in u["flags"] if not f.startswith("-gencode") and f != "-Xptxas=-warn-spills"]
-                r = subprocess.run(["nvcc", "-cubin", "-arch=sm_90a", "-std=c++20", *TORCH_NV, *fl, "-Xptxas=-v", *inc,
+                fl = [f for f in u["flags"] if not f.startswith("-gencode") and f not in ("-Xptxas=-warn-spills", "-lineinfo")]
+                r = subprocess.run(["nvcc", "-cubin", "-arch=sm_90a", "-std=c++20", *TORCH_NV, *fl, "-lineinfo", "-Xptxas=-v", *inc,
                                     "-o", str(cub), str(cu)], capture_output=True, text=True)
                 (out / f"{n}.ptxas.log").write_text(r.stdout + r.stderr)
                 if r.returncode:
                     res[n] = "FAIL " + " | ".join(ln[-200:] for ln in (r.stdout + r.stderr).splitlines() if "error" in ln)[:600]
                     return
                 sas.write_text(subprocess.run([OBJ, "-sass", str(cub)], capture_output=True, text=True).stdout)
+                (out / f"{n}.lines.txt").write_text(subprocess.run([NVD, "-g", "-c", str(cub)], capture_output=True, text=True).stdout)
             res[n] = "ok"
     ths = [threading.Thread(target=job, args=(u,)) for u in units]
     for t in ths:
@@ -347,8 +415,9 @@ def src_regs(i):
 
 
 class Slicer:
-    def __init__(self, fn, offs):
-        self.fn, self.offs, self.memo, self.busy = fn, offs, {}, set()
+    def __init__(self, fn, offs, through_loads=True):
+        """through_loads: a loaded value carries the provenance of ITS address (data dependence); False = pointer provenance only."""
+        self.fn, self.offs, self.memo, self.busy, self.tl = fn, offs, {}, set(), through_loads
         self.dests = [dest_regs(i) for i in fn.ins]
 
     def member(self, boff):
@@ -388,6 +457,8 @@ class Slicer:
             tg.add(("smem", None))
         elif i.op.startswith(("S2R", "S2UR", "CS2R")):
             tg.add(("sreg", None))
+        elif not self.tl and i.op.startswith(("LDG", "LD.", "LDGSTS")):
+            tg.add(("ld", None))
         else:
             for r in src_regs(i):
                 if r[1] < 255 or r[0] == "UR":
@@ -435,6 +506,16 @@ def classify(members):
     return c
 
 
+def addr_regs(i):
+    regs = []
+    for o in i.ops:
+        if o.startswith("desc["):
+            o = o[o.index("]") + 1:]
+        if "[" in o and not o.startswith("c["):
+            regs += regs_of(o, pair_default=i.op.startswith(("UBLK", "UTMA")))
+    return regs
+
+
 def analyse_fn(fn, offs, ptrs, armed_prune=True):
     """-> dict(acq, preexit, pre_n, accesses[(idx, op, kind, members, cls)], notes)"""
     cut = fn.prune_armed() if armed_prune else []
@@ -445,13 +526,7 @@ def analyse_fn(fn, offs, ptrs, armed_prune=True):
         i = fn.ins[k]
         if not MEMOPS.match(i.op) or i.op.startswith(("LDGDEPBAR", "LDGSTS.BYPASS.COMMIT")):
             continue
-        regs = []
-        for o in i.ops:
-            if o.startswith("desc["):
-                o = o[o.index("]") + 1:]
-            if "[" in o and not o.startswith("c["):
-                regs += regs_of(o, pair_default=i.op.startswith(("UBLK", "UTMA")))
-        tg = sl.tags(k, regs)
+        tg = sl.tags(k, addr_regs(i))
         mem = sorted({t[1] for t in tg if t[0] == "p" and t[1] in ptrs})
         cls = classify(mem) if mem else "UNKNOWN"
         acc.append((i.idx, i.op, mem_kind(i.op), mem, cls, [t[0] for t in tg if t[0] != "p"]))
@@ -474,6 +549,108 @@ def verdict(kernel, res):
     return hz, dead
 
 
+def parse_lines(txt):
+    """nvdisasm -g -c: {function: {idx: (file, line)}} (the innermost frame of an inlined chain)."""
+    out, cur, fn = {}, None, None
+    for ln in txt.splitlines():
+        m = re.match(r"\s*\.text\.(\S+):\s*$", ln)
+        if m:
+            fn, cur = m.group(1), None
+            out[fn] = {}
+            continue
+        m = re.match(r'\s*//## File "([^"]*)", line (\d+)', ln)
+        if m:
+            cur = (m.group(1), int(m.group(2)))
+            continue
+        m = re.match(r"\s*/\*([0-9a-f]{4,})\*/", ln)
+        if m and fn is not None and cur is not None:
+            out[fn][int(m.group(1), 16) // 16] = cur
+    return out
+
+
+def layer_map(u):
+    """cu line (1-based) -> (layer-file line, exact?) by aligning the unit's source with its literal in the layer file."""
+    import difflib
+    lines = pathlib.Path(u["layer"]).read_text(encoding="utf-8").split("\n")
+    start = lineno_of(u["layer"], u["origin"])
+    cu = u["src"].split("\n")
+    a = [x.strip() for x in cu]
+    b = [x.strip() for x in lines[start - 1:start - 1 + len(cu) + 800]]
+    m, last = {}, (start, False)
+    blocks = difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks()
+    for i, j, n in blocks:
+        for k in range(n):
+            m[i + k + 1] = (start + j + k, True)
+    cur = (start, False)
+    for k in range(1, len(cu) + 1):
+        if k in m:
+            cur = m[k]
+        else:
+            m[k] = (cur[0], False)
+    return m, lines
+
+
+def demangle(names):
+    r = subprocess.run(["c++filt"], input="\n".join(names), capture_output=True, text=True)
+    return dict(zip(names, r.stdout.splitlines())) if r.returncode == 0 else {n: n for n in names}
+
+
+def where(u, lmap, ln, idx, mem=()):
+    """'k3_gc_20.py:8564 `source text`' for SASS idx of a function with line table ln.  The leaf frame of __ldg / atomics is a CUDA
+    header, so for those the nearest .cu line in the SASS (+-10 instr) is taken and snapped to a `__ldg(` line within +-3 source
+    lines (marked ~: approximate)."""
+    if ln is None or idx not in ln:
+        return "(no line info)"
+    f, line = ln[idx]
+    m, lines = lmap
+    mine = f.endswith(f"{u['name']}.cu")
+    if not mine:
+        near = [(abs(d), d > 0, ln[idx + d]) for d in range(-10, 11) if idx + d in ln and ln[idx + d][0].endswith(f"{u['name']}.cu")]
+        if not near:
+            return f"{pathlib.Path(f).name}:{line}"
+        line = min(near)[2][1]
+    ll, exact = m.get(line, (0, False))
+    if not mine:
+        ldg = r"__ldg\(|ld\.global\.nc"
+        named = [x for x in range(ll - 15, ll + 16) if 0 < x <= len(lines) and re.search(ldg, lines[x - 1])
+                 and any(re.search(r"\b(?:\w+\.)?%s\b" % m, lines[x - 1]) for m in mem)]
+        cand = [x for x in range(ll - 3, ll + 4) if 0 < x <= len(lines) and re.search(ldg + r"|__restrict__", lines[x - 1])]
+        pick = named or cand
+        if pick:
+            ll = min(pick, key=lambda x: abs(x - ll))
+        exact = False
+    txt = lines[ll - 1].strip() if 0 < ll <= len(lines) else ""
+    return f"{pathlib.Path(u['layer']).name}:{ll}{'' if exact else '~'} `{txt[:96]}`"
+
+
+def nc_scan(fn, sl, pre, ptrs):
+    """every LDG with a .CONSTANT qualifier (ld.global.nc): [(idx, op, members, class, ABOVE|BELOW|NOWAIT)]."""
+    rows = []
+    for k, i in enumerate(fn.ins):
+        if not (i.op.startswith("LDG") and "CONSTANT" in i.op):
+            continue
+        tg = sl.tags(k, addr_regs(i))
+        mem = sorted({t[1] for t in tg if t[0] == "p" and t[1] in ptrs})
+        cls = classify(mem) if mem else "UNKNOWN"
+        rows.append((i.idx, i.op, mem, cls, "NOWAIT" if not fn.acq else ("ABOVE" if k in pre else "BELOW")))
+    return rows
+
+
+def store_scan(fn, sl, ptrs, watch=("ids", "wts", "tw", "tid", "lid")):
+    """members reached by the address slice of every global store / reduction / atomic: (Counter, [(idx, op, members)] touching `watch`)."""
+    cnt, hits = collections.Counter(), []
+    for k, i in enumerate(fn.ins):
+        if mem_kind(i.op) != "W" or not MEMOPS.match(i.op) or i.op.startswith(("STS", "STL")):
+            continue
+        tg = sl.tags(k, addr_regs(i))
+        mm = sorted({t[1] for t in tg if t[0] == "p" and t[1] in ptrs})
+        for m in mm:
+            cnt[m] += 1
+        if set(mm) & set(watch):
+            hits.append((i.idx, i.op, mm))
+    return cnt, hits
+
+
 def short(a):
     return f"{a[0]}:{a[1]} {','.join(a[3]) or '?'} [{a[4]}{'' if a[2] == 'R' else '/' + a[2]}]"
 
@@ -484,10 +661,10 @@ def main():
     out = pathlib.Path(args[1]) if len(args) > 1 else pathlib.Path(tempfile.mkdtemp(prefix="pdl_sass_"))
     out.mkdir(parents=True, exist_ok=True)
     only = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--only=")), None)
-    verbose, strict = "-v" in sys.argv, "--allow-latent" not in sys.argv
-    units = units_of(path, only)
+    verbose, strict, nc = "-v" in sys.argv, "--allow-latent" not in sys.argv, "--nc-below" in sys.argv
+    units = units_of(path, only, nc)
     res = compile_units(units, out, "--reuse" in sys.argv)
-    bad = latent = ninst = ndead = 0
+    bad = latent = ninst = ndead = ncpred = 0
     for u in units:
         n = u["name"]
         if res[n] != "ok":
@@ -500,31 +677,46 @@ def main():
         ptrs = {k for k, v in mem.items() if v}
         offp = {int(a): int(b.replace("n", "-")) for a, b in re.findall(r"pdl_off_probeILi(\d+)ELi(n?\d+)E", sass)}
         offs = sorted((offp[i], names[i]) for i in offp if offp[i] >= 0)
-        u["ptrs"] = ptrs
         fns = parse_sass(sass)
-        print(f"[pdl_sass] {n}: {u['routes']}; params {' '.join(f'{nm}@{o}' for o, nm in offs[:10])} ...")
+        lines = parse_lines((out / f"{n}.lines.txt").read_text()) if (out / f"{n}.lines.txt").exists() else {}
+        lmap = layer_map(u) if nc else None
+        dem = demangle([f for f in fns if "pdl_off_probe" not in f])
+        print(f"[pdl_sass] {n}: {u['routes']}" + (f"; params {' '.join(f'{nm}@{o}' for o, nm in offs[:10])} ..." if offs else ""))
         for fname, ins in fns.items():
             kn = next((k for k in u["kernels"] if k in fname), None)
             if kn is None:
                 continue
             ninst += 1
             fn = Fn(fname, ins)
+            if not u["struct"]:       # plain-parameter kernel: offsets from the signature
+                base = re.search(r"(\w+)(?:<|\()", dem[fname].split("::")[-1] if "::" in dem[fname] else dem[fname].split()[-1]).group(1) \
+                    if False else kn
+                sp = sig_params(u["src"], kn)
+                if sp is None:
+                    print(f"  {kn}: struct-by-value / unparsable signature, skipped")
+                    continue
+                offs = sorted((o, nm) for nm, o, _ in sp)
+                ptrs = {nm for nm, _, pt in sp if pt}
             r = analyse_fn(fn, offs, ptrs)
             hz, dead = verdict(kn, r)
             armed = u["armed"].get(kn, True)
             agg = collections.Counter((a[1], ",".join(a[3]) or "?", a[4], a[2]) for a in r["acc"])
             v = "HAZARD" if hz else ("PREFETCH-DEAD" if dead else "SAFE")
+            if u.get("info"):
+                v += " (info only: lazy in-loop waits, K2 reads 2-hop-upstream ids by design)" if hz else " (info)"
+                hz, dead = [], []
             if hz and not armed:
                 v = "LATENT-HAZARD"
                 latent += 1
             elif hz:
                 bad += 1
             ndead += bool(dead and not hz)
-            print(f"  {kn}: {len(ins)} instr, ACQBULK@{r['acq'] or 'none'} (wait {'ARMED' if armed else 'DISARMED in ship'}), "
+            title = dem[fname].replace("void ", "")[:70] if (nc or len(u["kernels"]) > 2) else kn
+            print(f"  {title}: {len(ins)} instr, ACQBULK@{r['acq'] or 'none'} (wait {'ARMED' if armed else 'DISARMED in ship'}), "
                   f"PREEXIT pre-wait@{r['preexit'] or '-'}, pre-wait region {r['pre_n']} instr, {len(r['acc'])} global accesses above the wait "
                   f"-> {v}{'  (intended pre-wait loads missing: ' + ' '.join(dead) + ')' if dead else ''}")
-            for (op, mem, cls, kind), c in sorted(agg.items()):
-                print(f"      {c:3d} x {op:<22s} {mem:<12s} {cls}{'' if kind == 'R' else '/' + kind}")
+            for (op, mm, cls, kind), c in sorted(agg.items()):
+                print(f"      {c:3d} x {op:<22s} {mm:<12s} {cls}{'' if kind == 'R' else '/' + kind}")
             for a in hz[:6]:
                 print(f"      !! {short(a)} via {sorted(set(a[5]))}")
             if verbose:
@@ -534,7 +726,30 @@ def main():
                     print(f"      armed: pruned skip-branch(es) (branch idx, ACQBULK idx) {r['cut']}")
             for w in r["warn"][:3]:
                 print(f"      INCOMPLETE (BRX above the wait): {w}")
-    print(f"[pdl_sass] {path.name}: {ninst} instance(s), {bad} hazard(s) (wait armed in ship), {latent} latent hazard(s), {ndead} prefetch-dead -> "
+            if nc:
+                sl = Slicer(fn, offs, through_loads=False)
+                pre = fn.prewait()
+                rows = nc_scan(fn, sl, pre, ptrs)
+                data = [x for x in rows if x[3] in ("PRED", "UPSTREAM2", "UNKNOWN")]
+                ncpred += len(data)
+                print(f"    [nc] {len(rows)} LDG.*.CONSTANT loads, {len(data)} of predecessor data / unknown source "
+                      f"({sum(1 for x in data if x[4] == 'ABOVE')} above the wait, {sum(1 for x in data if x[4] == 'BELOW')} below, "
+                      f"{sum(1 for x in data if x[4] == 'NOWAIT')} no wait):")
+                grp = collections.OrderedDict()
+                for idx, op, mm, cls, pos in data:
+                    wh = where(u, lmap, lines.get(fname), idx, mm)
+                    key = (pos, op, ",".join(mm) or "?", "UP2" if cls == "UPSTREAM2" else cls, wh)
+                    grp.setdefault(key, []).append(idx)
+                for (pos, op, mm, cls, wh), idxs in grp.items():
+                    print(f"      {pos:<6s} {len(idxs):2d} x {op:<20s} {mm:<8s} {cls:<7s} idx {idxs[0]}{'..' + str(idxs[-1]) if len(idxs) > 1 else ''}  {wh}")
+                if "--no-stores" not in sys.argv:
+                    st, hits = store_scan(fn, sl, ptrs)
+                    print("    [stores] address slices reaching: " + (", ".join(f"{m}:{c}" for m, c in sorted(st.items())) or "none"))
+                    if verbose:
+                        for idx, op, mm in hits[:8]:
+                            print(f"      store to a routing pointer? idx {idx} {op} {mm}  {where(u, lmap, lines.get(fname), idx)}")
+    print(f"[pdl_sass] {path.name}: {ninst} instance(s), {bad} hazard(s) (wait armed in ship), {latent} latent hazard(s), {ndead} prefetch-dead"
+          + (f", {ncpred} non-coherent loads of predecessor data" if nc else "") + f" -> "
           f"{'FAIL' if bad or (strict and latent) else 'OK'}")
     return 1 if bad or (strict and latent) else 0
 
