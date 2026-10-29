@@ -150,7 +150,9 @@ def nonce(s, tag):
 
 def main():
     mode = sys.argv[1]
-    s = patch(BASE.read_text(encoding="utf-8"))
+    s = BASE.read_text(encoding="utf-8")
+    if not (mode == "final" and set(sys.argv[2]) <= {"c"}):   # c alone is a defines-only change: no rider flags in the file
+        s = patch(s)
     out = ROOT / "kernels/lab"
     if mode == "lab":
         s = nonce(s, "k3-vrb-0 (k3_gc_14 + VRB rider flags, all off; tools/gen_k3_vrb.py)")
