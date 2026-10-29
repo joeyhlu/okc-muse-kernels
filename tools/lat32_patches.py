@@ -79,6 +79,28 @@ def cfl(s):
     return s[:a] + r + s[b:]
 
 
+def ldcg(s):
+    """R-pdl-0 fix: predecessor outputs (topk ids, x) in VML's route() / gathers via __ldcg (coherent: ptxas keeps them below
+    griddepcontrol.wait; LDG.E.CONSTANT from __ldg was hoisted above ACQBULK in bf2 = the R15 failure)."""
+    a = s.index("#ifndef VM_MKW@n#define VM_MKW 32@n#endif@n".replace("@n", chr(10)))
+    b = s.index("std::vector<int64_t> vml_cfg()")
+    r = s[a:b]
+    n1, n2 = r.count("__ldg(A.ids"), r.count("__ldg(reinterpret_cast<const uint4*>(A.x")
+    assert n1 == 2 and n2 == 2, (n1, n2)
+    r = r.replace("__ldg(A.ids", "__ldcg(A.ids").replace("__ldg(reinterpret_cast<const uint4*>(A.x", "__ldcg(reinterpret_cast<const uint4*>(A.x")
+    return s[:a] + r + s[b:]
+
+
+def pdl8(s, buckets):
+    import ast
+    i = s.index(chr(10) + "VML_FLAGS = {") + 1
+    j = s.index(chr(10), i)
+    d = ast.literal_eval(s[i + len("VML_FLAGS = "):j])
+    for bk in buckets:
+        d[bk] = d[bk] | 256
+    return s[:i] + "VML_FLAGS = " + repr(d) + s[j:]
+
+
 def hook_all(s):
     n = s.count("((T.jC[j] + 7) >> 3) - 1] += s1 - s0;")
     s = _sub(s, "((T.jC[j] + 7) >> 3) - 1] += s1 - s0;", "min((T.jC[j] + 7) >> 3, 8) - 1] += s1 - s0;", n=n)   # w72 N 65..72
@@ -125,6 +147,16 @@ def main():
         s = set_defs(base, ["-DVM_NWF=1"])
         Path(ROOT / out_p).write_text(s, encoding="utf-8", newline=chr(10))
         print(f"wrote {out_p} (rider VM_NWF on {base_p.name})")
+    elif mode in ("ldcg", "pdl8", "nwfpdl8", "ldcgnwf"):   # R-lat32-4 riders on --base: ldcg only / + bit 8 at buckets / + VM_NWF
+        assert out_p, "--out required"
+        bks = [int(x) for x in next((a.split("=", 1)[1] for a in sys.argv[2:] if a.startswith("--buckets=")), "32").split(",")]
+        s = ldcg(s0)
+        if mode in ("pdl8", "nwfpdl8"):
+            s = pdl8(s, bks)
+        if mode in ("nwfpdl8", "ldcgnwf"):
+            s = set_defs(nwf(s), ["-DVM_NWF=1"])
+        Path(ROOT / out_p).write_text(s, encoding="utf-8", newline=chr(10))
+        print(f"wrote {out_p} ({mode} buckets {bks} on {base_p.name})")
     elif mode == "cfl":
         build("k3_lat32_c.py", nonce(cfl(base), "k3-lat32-c (k3_sfx_2 + VM_CFLAGS hook; SASS audit only)"))
     else:
