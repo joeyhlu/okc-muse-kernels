@@ -5,9 +5,9 @@
 Compile-time defines (all default off = the gc_16 code):
   VM_NS   weight-ring depth (default 3).
   VM_XB   x ring as ONE byte ring of VM_XB bytes with VM_NX barrier entries. Entry it holds npad * 512 B at the next free
-          offset (wrap to 0 when it does not fit); the x producer lane waits for the free of the oldest in-flight entry while
-          it overlaps (frees are in order, so the oldest is the first one a new entry can hit) or while NX entries are in
-          flight. Offsets go through a per-entry smem table xo[] (producer / self-fill tid 0 write before the full-barrier
+          offset (wrap to 0 when it does not fit); the x producer lane waits (frees are in order) up to the newest in-flight entry
+          the new one overlaps (k3_vso_0 checked only the oldest: wrong with two wraps in flight, R-vso-1b L256) and
+          for its barrier slot (NX entries in flight). Offsets go through a per-entry smem table xo[] (producer / self-fill tid 0 write before the full-barrier
           arrive, consumers read after the full wait). Route / gather scratch (12.8 KB) sits at the ring end; self-fill
           only uses entries that end below it. Needs VM_XB >= 2 x the largest entry (stage<N> frees x one stage late).
 Variants (_VML_DEFS): w72n4x2 (NS 4, NX 2 fixed 36 KB slots), w72n4b (NS 4 + 78 KB byte ring, 4 entries), w72n3b (NS 3 +
@@ -101,8 +101,10 @@ CU = [
      "const int sl = it % NX;\n"
      "#if VM_XB\n"
      "const uint32_t off = (hd + bytes <= (uint32_t)XR) ? hd : 0u;\n"
-     "while (tq < it && (it - tq >= NX || (off < xpe[tq % NX] && xps[tq % NX] < off + bytes))) {\n"
-     "mbar_wait(bars + 8 * (2 * NS + NX + tq % NX), (tq / NX) & 1, A.err);\n++tq;\n}\n"
+     "int need = it - NX + 1;   // barrier slot reuse; then the newest in-flight entry the new one overlaps (two wraps\n"
+     "for (int q = tq; q < it; ++q)   // can be in flight, so it need not be the oldest; frees are in order)\n"
+     "if (off < xpe[q % NX] && xps[q % NX] < off + bytes) need = max(need, q + 1);\n"
+     "for (; tq < need; ++tq) mbar_wait(bars + 8 * (2 * NS + NX + tq % NX), (tq / NX) & 1, A.err);\n"
      "xps[sl] = off; xpe[sl] = off + bytes; hd = off + bytes;\nxo[sl] = off;\n"
      "const uint32_t fb = bars + 8 * (2 * NS + sl);\nmbar_expect_tx(fb, bytes);\nbulk_g2s(xring + off, src, bytes, fb);\n"
      "#else\n"
