@@ -46,6 +46,17 @@ def main():
         if kk not in keys:
             keys.append(kk)
         names.setdefault(kk, []).append(f"{proj}/{b}" + (f"/{al[0]}" if al else ""))
+    # dpf-0: GD-cat keys (10 args incl. CAT units) as the layer's _gd_keys() adds them (rpo-0..5 never compiled these)
+    try:
+        cns = _layer_ns(path, ["GD_CAT_ROUTE", "GD_CAT_UNITS", "HIDDEN", "D_EXPERT", "N_EXPERTS", "GD_SMS", "_gd_cat_key",
+                               "_gd_cat_keys", "DPF_CAT_ALT"])
+        for kk in cns["_gd_cat_keys"]():
+            if kk not in keys:
+                keys.append(kk)
+                names.setdefault(kk[:9], []).extend(f"cat/{b}" for b, rt in sorted(cns["GD_CAT_ROUTE"].items())
+                                                + sorted(cns.get("DPF_CAT_ALT", {}).items()) if rt and cns["_gd_cat_key"](rt) == kk)
+    except (KeyError, NameError):
+        pass
     src = vals["GD_CUDA_SRC"]
     src = src.replace("@INST@", "\n".join("    GD_INST(%d, %s)" % (i, ", ".join(map(str, kk))) for i, kk in enumerate(keys)))
     src = src.replace("@INFO@", "\n".join("    GD_INFO(%d, %s)" % (i, ", ".join(map(str, kk))) for i, kk in enumerate(keys)))
@@ -104,7 +115,8 @@ MEMOP = re.compile(r"^(?:@!?U?P\w+\s+)?(LDG|LD|LDGSTS|ATOMG|ATOM|RED|STG|ST|UTMA
 def _layer_ns(path, names):
     ns = {"__name__": "rpo_audit"}
     for n in ast.parse(pathlib.Path(path).read_text(encoding="utf-8")).body:
-        tg = [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []
+        tg = [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else (
+            [n.name] if isinstance(n, ast.FunctionDef) else [])
         if set(tg) & set(names):
             exec(compile(ast.Module(body=[n], type_ignores=[]), str(path), "exec"), ns)
     return ns
@@ -113,13 +125,15 @@ def _layer_ns(path, names):
 def audit_units(path):
     ns = _layer_ns(path, ["K1_CUDA_SRC", "V8_TAIL_CUDA_SRC", "KS1_CUDA_SRC", "KS1_INSTS", "VSL_KS1_INSTS", "VSL_KS3_INSTS",
                           "VSL_ENABLE", "SBB1_CU", "SBB1_HOST", "VG_CU", "VG_HOST", "VGF_CU", "VGF_HOST", "SU1_CUDA_SRC",
-                          "VD_CUDA_SRC"])
+                          "VD_CUDA_SRC", "DG1_CUDA_SRC", "DG1_INSTS", "dg1_wg_spec", "dg1_cuda_src", "P1_CUDA_SRC",
+                          "P1M_INST", "P1M_CUDA_ADD", "V20_P1M_ROUTE", "_inst_lines", "p1m_cuda_src", "_v20_inst"])
     ve = ns.get("VSL_ENABLE", False)
     ks1 = (ns["KS1_CUDA_SRC"].replace("@INSTS@", " ".join("KS1_X(%d, %d, %d)" % t for t in ns["KS1_INSTS"]))
            .replace("@MINSTS@", " ".join("KS1_XM(%d, %d, %d, %d)" % t for t in ns["VSL_KS1_INSTS"]) if ve else "")
            .replace("@M3INSTS@", " ".join("KS3_XM(%d, %d)" % t for t in ns["VSL_KS3_INSTS"]) if ve else ""))
     return {"k1": ns["K1_CUDA_SRC"], "tail": ns["V8_TAIL_CUDA_SRC"], "ks1": ks1, "sbb1": ns["SBB1_CU"] + ns["SBB1_HOST"],
-            "vgf": ns["VG_CU"] + ns["VG_HOST"] + ns["VGF_CU"] + ns["VGF_HOST"], "su1": ns["SU1_CUDA_SRC"], "vd": ns["VD_CUDA_SRC"]}
+            "vgf": ns["VG_CU"] + ns["VG_HOST"] + ns["VGF_CU"] + ns["VGF_HOST"], "su1": ns["SU1_CUDA_SRC"], "vd": ns["VD_CUDA_SRC"],
+            "dg1": ns["dg1_cuda_src"](), "p1": "#define P1_LAYER_ONLY 1\n" + ns["P1_CUDA_SRC"] + "\n" + ns["p1m_cuda_src"](ns["_v20_inst"](), ())}
 
 
 def _compile(tag, src, out):
