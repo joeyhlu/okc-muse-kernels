@@ -303,6 +303,74 @@ __global__ void __launch_bounds__(BLOCK, 1) dsm_kernel(P p) {
   if (p.C > 1) cluster_sync();
 }
 
+// R-dsm-0c (lead): does a fence wait for every CTA's bulk copies on the SM or only its own? 2 CTAs per SM (grid 2G,
+// smem sized so exactly 2 fit); per SM the first arriver is Q (streams, no fences), the second P (thread 0 times lone
+// fences / an acq_rel ticket atomic every 5 us). qs: Q streams; ps: P streams itself too (own copies, as R-dsm-0b).
+constexpr int XM = 160, XSM = 3 * 36864 + 256;
+struct PX { const unsigned char* wbuf; long long nchunk; int ns, sb, qs, ps; int* smc; int* done; int* tick;
+            long long* fa; long long* fs; long long* ta; unsigned long long* bw; unsigned* err; };
+__device__ __forceinline__ unsigned smid() { unsigned r; asm volatile("mov.u32 %0, %%smid;" : "=r"(r)); return r; }
+__global__ void __launch_bounds__(96, 2) xcta_kernel(PX p) {
+  extern __shared__ __align__(1024) unsigned char smem[];
+  uint64_t* full = reinterpret_cast<uint64_t*>(smem + 3 * 36864);
+  uint64_t* empty = full + 3;
+  volatile int* tag = reinterpret_cast<volatile int*>(empty + 3);
+  volatile int* role = tag + 3;
+  const int tid = threadIdx.x;
+  if (tid == 0) {
+    for (int s = 0; s < 3; ++s) { mbar_init(su32(&full[s]), 1); mbar_init(su32(&empty[s]), 1); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    *role = atomicAdd(p.smc + smid(), 1);                  // 0 = Q, 1 = P, >= 2 idle
+  }
+  __syncthreads();
+  const int r = *role;
+  const unsigned sm = smid();
+  volatile int* dn = p.done + sm;
+  const bool strm = (r == 0 && p.qs) || (r == 1 && p.ps);
+  if (tid == 32 && strm) {                                 // producer (Q, or P when ps)
+    uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    const long long t0 = gtime();
+    long long k = 0; int slot = 0; unsigned par = 0;
+    for (;;) {
+      if (*dn || gtime() - t0 > 3000000) break;
+      mbar_wait<false>(su32(&empty[slot]), par ^ 1u, p.err);
+      tag[slot] = 0;
+      mbar_expect_tx(su32(&full[slot]), p.sb);
+      bulk_g2s(su32(smem + slot * p.sb), p.wbuf + ((blockIdx.x + k * gridDim.x) % p.nchunk) * p.sb, p.sb, su32(&full[slot]), pol);
+      ++k;
+      if (++slot == p.ns) { slot = 0; par ^= 1u; }
+    }
+    mbar_wait<false>(su32(&empty[slot]), par ^ 1u, p.err);
+    tag[slot] = -1; mbar_arrive(su32(&full[slot]));
+    p.bw[blockIdx.x * 3] = t0; p.bw[blockIdx.x * 3 + 1] = gtime(); p.bw[blockIdx.x * 3 + 2] = (unsigned long long)k * p.sb;
+  } else if (tid == 64 && strm) {                          // release
+    int slot = 0; unsigned par = 0;
+    for (;;) {
+      mbar_wait<false>(su32(&full[slot]), par, p.err);
+      if (tag[slot] < 0) break;
+      mbar_arrive(su32(&empty[slot]));
+      if (++slot == p.ns) { slot = 0; par ^= 1u; }
+    }
+  } else if (tid == 0 && r == 1) {                         // P: timed fences
+    int* tk = p.tick + sm * 32;
+    const long long tb = gtime() + 50000;
+    for (int i = 0; i < XM; ++i) {
+      while (gtime() < tb + i * 5000ll) { }
+      const long long a = gtime();
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
+      const long long b = gtime();
+      asm volatile("fence.sc.gpu;" ::: "memory");
+      const long long c = gtime();
+      const int o = atom_acqrel_add(tk, 1);
+      const long long d = gtime();
+      if (o == -12345) atomicOr(p.err, 16u);
+      p.fa[sm * XM + i] = b - a; p.fs[sm * XM + i] = c - b; p.ta[sm * XM + i] = d - c;
+    }
+    *dn = 1; __threadfence();
+  }
+  __syncthreads();
+}
+
 __global__ void gate_kernel(long long ns) { const long long t0 = gtime(); while (gtime() - t0 < ns) { } }
 
 static int argi(int argc, char** argv, const char* k, int d) {
@@ -406,6 +474,51 @@ static void sweep_n(int G, int reps, double ghz, const P& p, size_t pm) {
   run_c<N>(1, {1, 6}, {0}, 3, 36864, G, reps, ghz, p, pm);
 }
 
+static void run_xcta(int G, int reps, unsigned char* wb, long long WB) {
+  CK(cudaFuncSetAttribute(xcta_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, XSM));
+  int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, xcta_kernel, 96, XSM));
+  const int NSM = 256;
+  PX p = {}; p.wbuf = wb;
+  CK(cudaMalloc(&p.smc, NSM * 4)); CK(cudaMalloc(&p.done, NSM * 4)); CK(cudaMalloc(&p.tick, NSM * 128)); CK(cudaMemset(p.tick, 0, NSM * 128));
+  CK(cudaMalloc(&p.fa, NSM * XM * 8)); CK(cudaMalloc(&p.fs, NSM * XM * 8)); CK(cudaMalloc(&p.ta, NSM * XM * 8));
+  CK(cudaMalloc(&p.bw, (size_t)2 * G * 24)); CK(cudaMalloc(&p.err, 4));
+  const int pts[][2] = {{1, 16384}, {2, 36864}, {3, 36864}};
+  const int cs[][2] = {{1, 0}, {0, 1}, {1, 1}};
+  for (int ci = -1; ci < 9; ++ci) {
+    const int ns = ci < 0 ? 1 : pts[ci / 3][0], sb = ci < 0 ? 16384 : pts[ci / 3][1];
+    const int qs = ci < 0 ? 0 : cs[ci % 3][0], ps = ci < 0 ? 0 : cs[ci % 3][1];
+    std::vector<double> fa, fs, ta, bws; unsigned errs = 0; int pairs = 0;
+    for (int r = 0; r < reps; ++r) {
+      p.ns = ns; p.sb = sb; p.qs = qs; p.ps = ps; p.nchunk = WB / sb;
+      CK(cudaMemset(p.smc, 0, NSM * 4)); CK(cudaMemset(p.done, 0, NSM * 4)); CK(cudaMemset(p.err, 0, 4));
+      CK(cudaMemset(p.bw, 0, (size_t)2 * G * 24));
+      gate_kernel<<<1, 32>>>(300000); CK(cudaGetLastError());
+      xcta_kernel<<<2 * G, 96, XSM>>>(p); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+      std::vector<int> smc(NSM); std::vector<long long> a(NSM * XM), b(NSM * XM), c(NSM * XM);
+      std::vector<unsigned long long> bw((size_t)2 * G * 3); unsigned e = 0;
+      CK(cudaMemcpy(smc.data(), p.smc, NSM * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(a.data(), p.fa, a.size() * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b.data(), p.fs, b.size() * 8, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(c.data(), p.ta, c.size() * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(bw.data(), p.bw, bw.size() * 8, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(&e, p.err, 4, cudaMemcpyDeviceToHost)); errs |= e;
+      pairs = 0;
+      for (int s = 0; s < NSM; ++s) {
+        if (smc[s] > 2) errs |= 32u;
+        if (smc[s] != 2) continue;
+        ++pairs;
+        for (int i = 5; i < XM; ++i) { fa.push_back(a[s * XM + i]); fs.push_back(b[s * XM + i]); ta.push_back(c[s * XM + i]); }
+      }
+      unsigned long long t0 = ~0ull, t1 = 0, by = 0;
+      for (int k = 0; k < 2 * G; ++k) if (bw[k * 3 + 2]) { t0 = std::min(t0, bw[k * 3]); t1 = std::max(t1, bw[k * 3 + 1]); by += bw[k * 3 + 2]; }
+      if (t1 > t0) bws.push_back((double)by / (double)(t1 - t0) / 1e3);
+    }
+    printf("{\"x\":1,\"occ\":%d,\"sm_pairs\":%d,\"ns\":%d,\"sb\":%d,\"qs\":%d,\"ps\":%d,\"TBps\":%.3f,\"fa_p50\":%.0f,\"fa_p95\":%.0f,"
+           "\"fs_p50\":%.0f,\"fs_p95\":%.0f,\"ta_p50\":%.0f,\"ta_p95\":%.0f,\"n\":%zu,\"err\":%u}\n", occ, pairs, ns, sb, qs, ps,
+           bws.empty() ? -1.0 : pct(bws, .5), pct(fa, .5), pct(fa, .95), pct(fs, .5), pct(fs, .95), pct(ta, .5), pct(ta, .95),
+           fa.size(), errs);
+    fflush(stdout);
+  }
+}
+
 int main(int argc, char** argv) {
   const int reps = argi(argc, argv, "--reps", 3);
   cudaDeviceProp pr; CK(cudaGetDeviceProperties(&pr, 0));
@@ -428,6 +541,10 @@ int main(int argc, char** argv) {
   CK(cudaMalloc(&p.chase, nch * 4)); CK(cudaMemcpy(p.chase, ch.data(), nch * 4, cudaMemcpyHostToDevice));
   printf("{\"dev\":\"%s\",\"G\":%d,\"clk_khz\":%d,\"smem\":%d,\"block\":%d}\n", pr.name, G, clk_khz, SMEM, BLOCK);
   const double ghz = clk_khz / 1e6;
+  if (argi(argc, argv, "--xcta", 0)) {
+    run_xcta(G, reps, wb, WB);
+    return 0;
+  }
   if (argi(argc, argv, "--sweep", 0)) {
     sweep_n<32>(G, reps, ghz, p, pairs_max);
     sweep_n<72>(G, reps, ghz, p, pairs_max);
@@ -496,6 +613,12 @@ def verdict(rows):
 
 def summarize(rows):
     for r in rows:
+        if r.get("x"):
+            who = {(0, 0): "idle", (1, 0): "Q streams (other CTA)", (0, 1): "P streams (own)", (1, 1): "both"}[(r["qs"], r["ps"])]
+            print(f"xcta ring {r['ns']}x{r['sb'] // 1024}K {who:22s} BW {r['TBps']:6.3f}  fence.acq_rel {r['fa_p50']:.0f}/{r['fa_p95']:.0f}"
+                  f"  fence.sc {r['fs_p50']:.0f}/{r['fs_p95']:.0f}  atom.acq_rel {r['ta_p50']:.0f}/{r['ta_p95']:.0f} ns"
+                  f"  occ {r['occ']} sm_pairs {r['sm_pairs']} n {r['n']} err {r['err']}")
+            continue
         if "mode" not in r:
             print(json.dumps(r))
             continue
@@ -513,7 +636,7 @@ def summarize(rows):
                   f"  clk {r['clk_p50']:.0f}/{r['clk_p95']:.0f} ns")
         s += f"  n{r['n']} tick{r['tick_ns']} err{r['err']}"
         print(s)
-    if any("ns" in r and r["ns"] * r["sb"] != 6 * 24576 for r in rows if "mode" in r):
+    if any(r.get("x") for r in rows) or any("ns" in r and r["ns"] * r["sb"] != 6 * 24576 for r in rows if "mode" in r):
         return   # R-dsm-0b sweep: no R-dsm-0 verdict
     for line in verdict(rows):
         print(line)
@@ -533,6 +656,8 @@ def main(argv):
             out = a[6:]
         if a == "--sweep":
             extra = ["--sweep", "1"]
+        if a == "--xcta":
+            extra = ["--xcta", "1"]
     tag = pathlib.Path(out).stem
     wd = ROOT / "box_out/dsm0"
     wd.mkdir(parents=True, exist_ok=True)
