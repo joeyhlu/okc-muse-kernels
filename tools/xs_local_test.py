@@ -22,10 +22,11 @@ import vms_moe_lab as V  # noqa: E402
 import xs_moe as X  # noqa: E402
 
 
-def check_w2_layout(w):
+def check_w2_layout(w, pos=None):
     """decode the XS W2 words / scales of expert 0 on the host (the kernel's r0..r3 decode) vs V.dequant"""
     e = 0
-    pk = X.prepack_w2(w["w2"][e], w["w2_sf"][e]).cpu()
+    pos = pos or V.POS
+    pk = X.prepack_w2(w["w2"][e], w["w2_sf"][e], pos).cpu()
     ref = V.dequant(w["w2"][e], w["w2_sf"][e], 1.0).cpu()           # [4096 rows, 4096 K], gs = 1
     grid = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
     bad = 0
@@ -40,7 +41,7 @@ def check_w2_layout(w):
             row = 16 * gr + g + (8 if r & 1 else 0)
             for h in range(2):
                 k = 16 * s + 2 * t + h + (8 if r >= 2 else 0)
-                code = sum(((word >> V.POS[r][h][b]) & 1) << b for b in range(4))
+                code = sum(((word >> pos[r][h][b]) & 1) << b for b in range(4))
                 mag = grid[code & 7] * (-1.0 if code & 8 else 1.0)
                 scb = sc[1 if r & 1 else 0]
                 val = mag * float(torch.tensor([scb], dtype=torch.uint8).view(torch.float8_e4m3fn).float())
@@ -59,11 +60,13 @@ def main():
         return 0
     G = torch.cuda.get_device_properties(0).multi_processor_count
     ns = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    mod, dt = X.build(G, ns, "sm_86", name=f"xs_lab86_{ns}")
+    l2 = "l2" in sys.argv
+    mod, dt = X.build(G, ns, "sm_86", name=f"xs_lab86_{ns}_{int(l2)}", l2=l2)
     print(f"[xs] sm_86 build ok in {dt:.0f} s: regs/local/smem/G/NS/sizeof(Smem) {list(mod.attrs())}")
     w = VT.make_weights(dev)
-    ok_all = check_w2_layout(w)
-    pk = X.prepack(w)
+    ok_all = check_w2_layout(w, X.POS_L2 if l2 else None)
+    pk = X.prepack(w, l2=l2)
+    print(f"[xs] l2 layout {l2}")
     sc = X.scratch(dev)
     cases = [(1, 1, "normal"), (1, 2, "normal"), (2, 3, "normal"), (4, 4, "skew"), (5, 5, "normal"), (8, 6, "normal"),
              (8, 7, "hot"), (12, 8, "skew"), (16, 9, "normal"), (16, 10, "hot"), (16, 11, "skew"), (3, 12, "nolocal"),
