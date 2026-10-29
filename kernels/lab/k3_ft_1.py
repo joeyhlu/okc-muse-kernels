@@ -17950,7 +17950,7 @@ def _k3_disable(state, key, value, piece, ex):
 
 TL1_TAIL2 = True
 
-FT_TAIL3 = {1: 4, 8: 4, 16: 4, 32: 4, 128: 4, 256: 4}   # R-ft-0: T bucket -> 0 tail_kernel2 / 4 tail3 RW 2 / 8 tail3 RW 8
+FT_TAIL3 = {1: 8, 8: 8, 16: 8, 32: 8, 128: 8, 256: 8}   # R-ft-0 (step 1: RW 8 best at every T): T bucket -> 0 tail_kernel2 / 4 tail3 RW 2 / 8 tail3 RW 8
 FT_OK = False
 
 
