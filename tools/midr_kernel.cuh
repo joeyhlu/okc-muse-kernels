@@ -13,6 +13,7 @@
 #include <tvm/ffi/optional.h>
 #include <cstdint>
 
+namespace sglang {   // SGLang's types / device / host namespaces live here (as in norm_residual.cuh)
 namespace okc_midr {
 using namespace device;
 constexpr int kVec = 8;
@@ -197,19 +198,20 @@ struct OkcMidr {
   }
   static const bf16_t* bp(const OT& t) { return t.has_value() ? static_cast<const bf16_t*>(t.value().data_ptr()) : nullptr; }
   static const fp32_t* fp(const OT& t) { return t.has_value() ? static_cast<const fp32_t*>(t.value().data_ptr()) : nullptr; }
-  static bool cw(const OT& t) { return t.has_value() && t.value().size(0) == kH; }
-  static void runA(const TV b1, const TV s, const TV out, OT pw1, OT qw, OT a1, OT g1, double e1, double qe) {
+  static void runA(const TV b1, const TV s, const TV out, OT pw1, OT qw, OT a1, OT g1, double e1, double qe, bool cw1) {
     const okc_midr::P p{static_cast<const bf16_t*>(b1.data_ptr()), static_cast<const fp32_t*>(s.data_ptr()), nullptr,
                         static_cast<bf16_t*>(out.data_ptr()), nullptr, bp(pw1), fp(a1), fp(g1), nullptr, bp(qw), nullptr, nullptr,
-                        (float)e1, 0.f, (float)qe, cw(a1), false, qw.has_value()};
+                        (float)e1, 0.f, (float)qe, cw1, false, qw.has_value()};
     go<false>(p, b1);
   }
   static void runF(const TV b1, const TV s, const TV b2, const TV out, const TV ns, OT pw1, OT a1, OT g1, double e1, OT pw2, OT qw,
-                   OT a2, OT g2, double e2, double qe) {
+                   OT a2, OT g2, double e2, double qe, bool cw1, bool cw2) {
     const okc_midr::P p{static_cast<const bf16_t*>(b1.data_ptr()), static_cast<const fp32_t*>(s.data_ptr()),
                         static_cast<const bf16_t*>(b2.data_ptr()), static_cast<bf16_t*>(out.data_ptr()),
                         static_cast<fp32_t*>(ns.data_ptr()), bp(pw1), fp(a1), fp(g1), bp(pw2), bp(qw), fp(a2), fp(g2), (float)e1,
-                        (float)e2, (float)qe, cw(a1), cw(a2), qw.has_value()};
+                        (float)e2, (float)qe, cw1, cw2, qw.has_value()};
     go<true>(p, b1);
   }
 };
+
+}  // namespace sglang

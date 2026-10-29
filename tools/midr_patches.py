@@ -105,7 +105,10 @@ def _midr_prepare(state):
         src = pathlib.Path(tempfile.gettempdir()) / f"okc_midr_{hashlib.sha1(MIDR_CUH.encode()).hexdigest()[:12]}.cuh"
         if not src.exists():
             src.write_text(MIDR_CUH)
-        M = {"a": (A[0], A[1], A[2], A[3], A[5], A[6]), "f": (A[0], A[2], A[3], A[5], Fw[0], Fw[1], Fw[2], Fw[3], Fw[5], Fw[6])}
+        cw1 = A[2] is not None and A[2].numel() == HIDDEN
+        cw2 = Fw[2] is not None and Fw[2].numel() == HIDDEN
+        M = {"a": (A[0], A[1], A[2], A[3], A[5], A[6], cw1),
+             "f": (A[0], A[2], A[3], A[5], Fw[0], Fw[1], Fw[2], Fw[3], Fw[5], Fw[6], cw1, cw2)}
         dev = state["router"].device
         gen = torch.Generator(device=dev).manual_seed(912)
         for T in MIDR_TS:
@@ -164,8 +167,9 @@ def patch_midr(t):
     return t
 
 
-def patch(t, midr=True):
-    t = patch_tail_disc(t)
+def patch(t, midr=True, disc=False):
+    """R6a TAIL_DISC is off by default: R-midr-1 KILL (unpooler / cat no drop >= 0.4 us)."""
+    t = patch_tail_disc(t) if disc else t
     return patch_midr(t) if midr else t
 
 
@@ -181,8 +185,8 @@ def main():
     bn = b.split(NL)[1]
     if not bn.startswith("# nonce "):
         raise SystemExit("[midr_patches] line 2 is not a nonce line")
-    t = patch(b)
-    t = t.replace(bn, f"# nonce {outn.replace('_', '-')} ({base.stem} + MIDR + R6a tail discard; tools/midr_patches.py)", 1)
+    t = patch(b, disc="--disc" in sys.argv)
+    t = t.replace(bn, f"# nonce {outn.replace('_', '-')} ({base.stem} + MIDR; tools/midr_patches.py)", 1)
     assert t.isascii() and len(t.encode()) < 1_000_000, len(t.encode())
     assert max(len(x) for x in t.split(NL)) <= max(len(x) for x in b.split(NL))
     assert len(re.findall(r"importlib|sys\.modules", t)) == len(re.findall(r"importlib|sys\.modules", b))

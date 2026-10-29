@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-midr-1 (k3_sfx_2 + MIDR + R6a tail discard; tools/midr_patches.py)
+# nonce k3-midr-1 (k3_sfx_2 + MIDR; tools/midr_patches.py)
 
 from typing import TypedDict
 
@@ -2438,7 +2438,6 @@ V8_DENSE_GEMV_T1 = True
 V8_R1B = True
 V8_TAIL_ROUTE = {1: 'sep', 8: 'sep', 16: 'cat', 32: 'cat', 128: 'cat', 256: 'cat'}
 V9_TAIL_PDL = True
-TAIL_DISC = True   # R6a (tools/midr_patches.py): discard the dead FP32 cat output in tail_kernel2
 V8_TAIL = True
 
 R1B_FIXUP = True
@@ -3145,8 +3144,6 @@ __global__ void __launch_bounds__(NT + 32) tail_kernel2(
     float eps, float mult, float rscale, float deps) {
   const int t = blockIdx.x, tx = threadIdx.x, lane = tx & 31, warp = tx >> 5;
   __shared__ float red[NT / 32];
-  const bool disc = (ns & 256) != 0;   // R6a TAIL_DISC: y is dead after this kernel's reads
-  ns &= 255;
   if (warp == NT / 32) {
     const float4* pbias = reinterpret_cast<const float4*>(bias) + lane * 2;
     const float4 c0 = pbias[0], c1 = pbias[1];
@@ -3206,10 +3203,6 @@ __global__ void __launch_bounds__(NT + 32) tail_kernel2(
           if (j == bj) b[j] = -INFINITY;
       }
     }
-    if (disc && (lane & 3) == 0) {   // R6a: la / lb lines, every lane's loads consumed by the top-k
-      asm volatile("discard.global.L2 [%0], 128;" ::"l"(la + (long)t * l_ld + lane * 8) : "memory");
-      if (lb != nullptr) asm volatile("discard.global.L2 [%0], 128;" ::"l"(lb + (long)t * l_ld + lane * 8) : "memory");
-    }
     if (lane == 0) {
       float sum = 0.f;
 #pragma unroll
@@ -3249,8 +3242,6 @@ __global__ void __launch_bounds__(NT + 32) tail_kernel2(
   for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
   if (lane == 0) red[warp] = ss;
   asm volatile("bar.sync 1, %0;\n" ::"r"(NT) : "memory");   // the 16 norm warps only
-  if (Y32 && disc && (tx & 3) == 0)   // R6a: this 128 B line's 4 readers all passed the barrier
-    asm volatile("discard.global.L2 [%0], 128;" ::"l"(reinterpret_cast<const float*>(y) + (long)t * y_ld + tx * 8) : "memory");
   float tot = 0.f;
 #pragma unroll
   for (int i = 0; i < NT / 32; ++i) tot += red[i];
@@ -3341,7 +3332,6 @@ void v8_tail(torch::Tensor y, torch::Tensor lg, int64_t la_off, int64_t lb_off, 
               && reinterpret_cast<uintptr_t>(base) % 16 == 0 && reinterpret_cast<uintptr_t>(bias.data_ptr()) % 16 == 0,
               "v8_tail: logits / bias alignment");
   const long y_ld = y.stride(0);
-  const int nsd = (int)ns | (((pdl & 6) == 6) ? 256 : 0);   // R6a: discard flag, tail_kernel2 only
   auto* xp = reinterpret_cast<__nv_bfloat16*>(xn.data_ptr());
   const auto* wp = reinterpret_cast<const __nv_bfloat16*>(nw.data_ptr());
   cudaLaunchAttribute at[1];
@@ -3355,20 +3345,20 @@ void v8_tail(torch::Tensor y, torch::Tensor lg, int64_t la_off, int64_t lb_off, 
   lc.attrs = at;
   lc.numAttrs = 1;
   if (y.scalar_type() == at::kFloat)
-    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 8> : v8::tail_kernel<true, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, nsd,
+    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 8> : v8::tail_kernel<true, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps));
-      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 1> : v8::tail_kernel<true, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, nsd,
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<true, 1> : v8::tail_kernel<true, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps)); }
   else
-    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 8> : v8::tail_kernel<false, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, nsd,
+    { if (ns > 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 8> : v8::tail_kernel<false, 8>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps));
-      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 1> : v8::tail_kernel<false, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, nsd,
+      else C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, ((pdl & 2) ? v8::tail_kernel2<false, 1> : v8::tail_kernel<false, 1>), y.data_ptr(), y_ld, la, lb, (long)l_ld, (int)ns,
         (long)sstride, wp, (const float*)bias.data_ptr<float>(), (const int*)lstart.data_ptr<int>(), xp,
         tw.data_ptr<float>(), tid.data_ptr<int>(), lid.data_ptr<int>(), (float)eps, (float)mult, (float)rscale,
         (float)deps)); }
@@ -3384,7 +3374,7 @@ def _v8_tail_build():
                        functions=["v8_tail", "v8_router32"], extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
 
 
-def _v8_tail(y, logits, state, data, disc=False):
+def _v8_tail(y, logits, state, data):
     v8 = state["v8"]
     tokens = y.shape[0]
     dev = y.device
@@ -3401,8 +3391,7 @@ def _v8_tail(y, logits, state, data, disc=False):
     else:
         lg, la, lb, l_ld = logits, 0, -1, logits.stride(0)
     v8["mod"].v8_tail(y, lg, la, lb, l_ld, ns, sstride, v8["nw"], v8["bias"], data["local_start"], xn, tw, tid, lid,
-                      RMS_EPS, 0.1767766952966369, 1.0, 1e-15, (1 if V9_TAIL_PDL else 0) | (2 if TL1_TAIL2 else 0)
-                      | (4 if (disc and TAIL_DISC and logits is None and y.dtype == torch.float32) else 0))
+                      RMS_EPS, 0.1767766952966369, 1.0, 1e-15, (1 if V9_TAIL_PDL else 0) | (2 if TL1_TAIL2 else 0))
     return xn, tw, tid, lid
 
 
@@ -3733,6 +3722,7 @@ MIDR_CUH = r"""
 #include <tvm/ffi/optional.h>
 #include <cstdint>
 
+namespace sglang {   // SGLang's types / device / host namespaces live here (as in norm_residual.cuh)
 namespace okc_midr {
 using namespace device;
 constexpr int kVec = 8;
@@ -3917,22 +3907,23 @@ struct OkcMidr {
   }
   static const bf16_t* bp(const OT& t) { return t.has_value() ? static_cast<const bf16_t*>(t.value().data_ptr()) : nullptr; }
   static const fp32_t* fp(const OT& t) { return t.has_value() ? static_cast<const fp32_t*>(t.value().data_ptr()) : nullptr; }
-  static bool cw(const OT& t) { return t.has_value() && t.value().size(0) == kH; }
-  static void runA(const TV b1, const TV s, const TV out, OT pw1, OT qw, OT a1, OT g1, double e1, double qe) {
+  static void runA(const TV b1, const TV s, const TV out, OT pw1, OT qw, OT a1, OT g1, double e1, double qe, bool cw1) {
     const okc_midr::P p{static_cast<const bf16_t*>(b1.data_ptr()), static_cast<const fp32_t*>(s.data_ptr()), nullptr,
                         static_cast<bf16_t*>(out.data_ptr()), nullptr, bp(pw1), fp(a1), fp(g1), nullptr, bp(qw), nullptr, nullptr,
-                        (float)e1, 0.f, (float)qe, cw(a1), false, qw.has_value()};
+                        (float)e1, 0.f, (float)qe, cw1, false, qw.has_value()};
     go<false>(p, b1);
   }
   static void runF(const TV b1, const TV s, const TV b2, const TV out, const TV ns, OT pw1, OT a1, OT g1, double e1, OT pw2, OT qw,
-                   OT a2, OT g2, double e2, double qe) {
+                   OT a2, OT g2, double e2, double qe, bool cw1, bool cw2) {
     const okc_midr::P p{static_cast<const bf16_t*>(b1.data_ptr()), static_cast<const fp32_t*>(s.data_ptr()),
                         static_cast<const bf16_t*>(b2.data_ptr()), static_cast<bf16_t*>(out.data_ptr()),
                         static_cast<fp32_t*>(ns.data_ptr()), bp(pw1), fp(a1), fp(g1), bp(pw2), bp(qw), fp(a2), fp(g2), (float)e1,
-                        (float)e2, (float)qe, cw(a1), cw(a2), qw.has_value()};
+                        (float)e2, (float)qe, cw1, cw2, qw.has_value()};
     go<true>(p, b1);
   }
 };
+
+}  // namespace sglang
 """
 
 
@@ -3957,7 +3948,10 @@ def _midr_prepare(state):
         src = pathlib.Path(tempfile.gettempdir()) / f"okc_midr_{hashlib.sha1(MIDR_CUH.encode()).hexdigest()[:12]}.cuh"
         if not src.exists():
             src.write_text(MIDR_CUH)
-        M = {"a": (A[0], A[1], A[2], A[3], A[5], A[6]), "f": (A[0], A[2], A[3], A[5], Fw[0], Fw[1], Fw[2], Fw[3], Fw[5], Fw[6])}
+        cw1 = A[2] is not None and A[2].numel() == HIDDEN
+        cw2 = Fw[2] is not None and Fw[2].numel() == HIDDEN
+        M = {"a": (A[0], A[1], A[2], A[3], A[5], A[6], cw1),
+             "f": (A[0], A[2], A[3], A[5], Fw[0], Fw[1], Fw[2], Fw[3], Fw[5], Fw[6], cw1, cw2)}
         dev = state["router"].device
         gen = torch.Generator(device=dev).manual_seed(912)
         for T in MIDR_TS:
@@ -21403,9 +21397,7 @@ def kernel_fn(data, state):
             y32 = _dg1(state, "cat", ffn_input)
         if y32 is None:
             y32 = torch.mm(ffn_input, state["v8"]["wcat"].t(), out_dtype=torch.float32)
-            expert_x, topk_weights, topk_ids, local_ids = _v8_tail(y32, None, state, data, disc=True)
-        else:
-            expert_x, topk_weights, topk_ids, local_ids = _v8_tail(y32, None, state, data)
+        expert_x, topk_weights, topk_ids, local_ids = _v8_tail(y32, None, state, data)
     else:
         vgr = _vfr_fused(state, ffn_input, router_input) if (tail is not None and mode == "f32") else None
         if vgr is not None:
