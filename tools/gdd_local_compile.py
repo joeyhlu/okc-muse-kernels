@@ -43,6 +43,9 @@ spec = importlib.util.spec_from_file_location("gdd_lab", path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 keys = mod._gd_keys()
+import os  # noqa: E402
+if os.environ.get("GDDC_KEYS"):   # e.g. "(0, 2, 1, 2,|(0, 4, 1, 2," : keep only keys whose str() contains one of these
+    keys = [k for k in keys if any(s in str(k) for s in os.environ["GDDC_KEYS"].split("|"))]
 for k in keys:
     print("[gddc] key", k)
 inst = "\n".join("    GD_INST(%d, %s)" % (i, ", ".join(str(v) for v in k)) for i, k in enumerate(keys))
@@ -56,5 +59,6 @@ fns = ["gd_run", "gd_info", "gd_unpack", "gdr_run", "gdr_info", "gdc_run", "gd_u
 if "gd_marks" in mod.GD_CPP_SRC:
     fns += ["gd_marks", "gd_marks_log"]
 load_inline(name="gddc", cpp_sources=mod.GD_CPP_SRC, cuda_sources=cuda, functions=fns, build_directory=bd,
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", "-Xptxas=-warn-spills"], verbose=False)
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", "-Xptxas=-warn-spills"] + (["-Xptxas=-v"] if os.environ.get("GDDC_V") else []),
+            verbose=bool(os.environ.get("GDDC_V")))
 print(f"[gddc] OK build {time.time() - t0:.0f} s ({len(keys)} instances)")
