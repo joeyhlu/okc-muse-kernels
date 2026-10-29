@@ -67,13 +67,16 @@ def main():
             assert cu.count(a) == 1, a
             cu = cu.replace(a, b)
     flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=2", "-DVMS_RO=1", "-gencode=arch=compute_86,code=sm_86"]
+    if os.environ.get("NTL_MK_ARCH") == "sm_90a":   # H200 box: the layer's VMS flags
+        flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=3", "-DVMS_RO=1", "-gencode=arch=compute_90a,code=sm_90a"]
     var = os.environ.get("NTL_MK_VARIANTS", "ni1xn0:-DVMS_NTL_NI=1 -DVMS_NTL_XN=0")
-    mb = load_inline(name="ntlm_base86", cpp_sources=src["VMS_CPP_SRC"], cuda_sources=cu, functions=["run", "attrs"],
+    mb = load_inline(name="ntlm_base" + os.environ.get("NTL_MK_ARCH", "86")[-3:], cpp_sources=src["VMS_CPP_SRC"], cuda_sources=cu, functions=["run", "attrs"],
                      extra_cuda_cflags=flags)
-    mods = {}
+    mods, var_fl = {}, {}
     for item in var.split(";"):
         name, fl = item.split(":", 1)
-        mods[name] = load_inline(name=f"ntlm_{name}_86", cpp_sources=src["VMS_CPP_SRC"] + src["_NTL_VMS_CPP"],
+        var_fl[name] = fl
+        mods[name] = load_inline(name=f"ntlm_{name}_" + os.environ.get("NTL_MK_ARCH", "86")[-3:], cpp_sources=src["VMS_CPP_SRC"] + src["_NTL_VMS_CPP"],
                                  cuda_sources=cu, functions=["run", "run_ntl", "attrs"],
                                  extra_cuda_cflags=flags + ["-DVMS_NTL=1"] + fl.split())
     print(f"[ntl-mk] G {G} regs base {list(mb.attrs())[:2]} " + " ".join(f"{k} {list(m.attrs())[:2]}" for k, m in mods.items()))
@@ -116,10 +119,14 @@ def main():
         tm.v8_tail(y, lg, 0, -1, lg.stride(1), 8, lg.stride(0), xw, bias, lst, xn, tw, tid, lid, eps, NT.MULT, 1.0, 1e-15, 2)
         out = torch.empty((T, 4096), dtype=torch.bfloat16, device=dev)
         tid2 = torch.empty((T, 8), dtype=torch.int32, device=dev)
+        lgr = lg[0].clone()   # NTL_NS=1 variants: producer-reduced logits, slice order 0..7 (bitwise = tail2's sum)
+        for q in range(1, 8):
+            lgr = lgr + lg[q]
+        lgr = torch.cat([lgr.unsqueeze(0), lg[1:]]).contiguous()   # host wants [8, T, 256]; NS=1 reads slice 0 only
         runs = {"base": lambda mk: mb.run(xn, lid, tw, wA, wB, gsA, gsB, nwp, inter, ybuf, ssv, ctr, out, mk, T, 1e-8, 0, 0)}
         for name, m in mods.items():
-            runs[name] = (lambda m: lambda mk: m.run_ntl(y, lg, bias, lst, ssum, xw, tid2, tw_o, lid_o, wA, wB, gsA, gsB, nwp, inter,
-                                                         ybuf, ssv, ctr, out, mk, T, 1e-8, eps, NT.MULT, 1.0, 1e-15, 0))(m)
+            runs[name] = (lambda m, L: lambda mk: m.run_ntl(y, L, bias, lst, ssum, xw, tid2, tw_o, lid_o, wA, wB, gsA, gsB, nwp, inter,
+                                                         ybuf, ssv, ctr, out, mk, T, 1e-8, eps, NT.MULT, 1.0, 1e-15, 0))(m, lgr if "VMS_NTL_NS=1" in var_fl[name] else lg)
         for name, fn in runs.items():
             ev, rows, subr = [], [], [[], [], [], []]
             for i in range(160):
@@ -148,6 +155,8 @@ def main():
                             for j, (x0, x1) in enumerate(((11, 12), (12, 13), (13, 14), (14, 15))):
                                 subr[j].append(v[x1] - v[x0])
             med = [(statistics.median(x[i][0] for x in rows), statistics.median(x[i][1] for x in rows)) for i in range(len(MK))]
+            if name != "base":
+                print(f"[ntl-mk] T={T:2d} {name:7s} ids bitwise vs tail2 {bool(torch.equal(tid2, tid))}")
             if sub and name != "base":
                 print(f"[ntl-mk] T={T:2d} {name:7s} route cycles "
                       + " / ".join(f"{statistics.median(x):.0f}" for x in subr) + " (SUB=1: loads, sigmoid, top-k, writes+rest; SUB=2: phase 1, barrier, top-k+rs, -)")

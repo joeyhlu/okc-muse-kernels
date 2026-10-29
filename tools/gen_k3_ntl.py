@@ -285,7 +285,7 @@ __device__ __forceinline__ void nt_route_fr(const float* plg, long long sst, lon
       if (it < nit) {
         const float* row = plg + (it >> 6) * lld;
 #pragma unroll
-        for (int q = 0; q < 8; ++q) v[k][q] = __ldcg(reinterpret_cast<const float4*>(row + q * sst) + (it & 63));
+        for (int q = 0; q < VMS_NTL_NS; ++q) v[k][q] = __ldcg(reinterpret_cast<const float4*>(row + q * sst) + (it & 63));
       }
     }
 #pragma unroll
@@ -294,7 +294,7 @@ __device__ __forceinline__ void nt_route_fr(const float* plg, long long sst, lon
       if (it < nit) {
         float4 a = v[k][0];
 #pragma unroll
-        for (int q = 1; q < 8; ++q) { a.x += v[k][q].x; a.y += v[k][q].y; a.z += v[k][q].z; a.w += v[k][q].w; }
+        for (int q = 1; q < VMS_NTL_NS; ++q) { a.x += v[k][q].x; a.y += v[k][q].y; a.z += v[k][q].z; a.w += v[k][q].w; }
         a.x += 0.f; a.y += 0.f; a.z += 0.f; a.w += 0.f;
         float4 o;
         o.x = 1.f / (1.f + expf(-a.x * mult));
@@ -429,7 +429,7 @@ void run_ntl(torch::Tensor x, torch::Tensor lg, torch::Tensor rbias, torch::Tens
 VMS_PATCHES = [
     ("#ifndef VMS_G\n#define VMS_G 132\n#endif\n",
      "#ifndef VMS_G\n#define VMS_G 132\n#endif\n#ifndef VMS_NTL\n#define VMS_NTL 0\n#endif\n#ifndef VMS_NTL_NI\n#define VMS_NTL_NI 1\n#endif\n"
-     "#ifndef VMS_NTL_XN\n#define VMS_NTL_XN 2\n#endif\n#ifndef VMS_NTL_FR\n#define VMS_NTL_FR " + ARGS.get("fr", "1") + "\n#endif\n", "VMS_NTL defaults (NI: noinline routing, XN: 0 none / 1 at job switch / 2 after the weight wait)"),
+     "#ifndef VMS_NTL_XN\n#define VMS_NTL_XN 2\n#endif\n#ifndef VMS_NTL_FR\n#define VMS_NTL_FR " + ARGS.get("fr", "1") + "\n#endif\n#ifndef VMS_NTL_NS\n#define VMS_NTL_NS " + ARGS.get("ns", "8") + "\n#endif\n", "VMS_NTL defaults (NI: noinline routing, XN: 0 none / 1 at job switch / 2 after the weight wait)"),
     ("  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n};",
      "  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n#if VMS_NTL\n"
      "  const float* lg; const float* rbias; const int* lstart; float* ssum; const __nv_bfloat16* xw;\n"
@@ -463,7 +463,7 @@ VMS_PATCHES = [
 
 # ------------------------------------------------------------------------------------------------------------------- Python
 PY_GLOBALS = r'''NTL_ENABLE = True
-NTL_MODE = {1: 2, 8: 2, 16: 2, 32: 0}   # per GD bucket, read at call time: 0 tail2 + VMS (base), 2 live (no tail2), 1 inert (tail2 kept + VMS-NTL); diagnostics: 3 pooler sum only (tail2 + VMS), 4 VMS-NTL on unarmed sums (tail2 kept)
+NTL_MODE = @@NTL_MODE@@   # per GD bucket, read at call time: 0 tail2 + VMS (base), 2 live (no tail2), 1 inert (tail2 kept + VMS-NTL); diagnostics: 3 pooler sum only (tail2 + VMS), 4 VMS-NTL on unarmed sums (tail2 kept)
 NTL_SELF_TEST_T = {1: (1,), 8: (8, 2, 5), 16: (16, 9, 13)}
 _NTL = {"mod": None, "G": None, "ok": {}, "ss": None, "scr": None, "live": False, "armed": False, "pend": None, "seen": set()}
 _NTL_VMS_CPP = r"""
@@ -474,6 +474,7 @@ void run_ntl(torch::Tensor x, torch::Tensor lg, torch::Tensor rbias, torch::Tens
              double rscale, double deps, int64_t pdl);
 """
 '''
+PY_GLOBALS = PY_GLOBALS.replace("@@NTL_MODE@@", ARGS.get("mode", "{1: 2, 8: 2, 16: 2, 32: 0}"))
 
 PY_FUNCS = r'''
 
@@ -633,11 +634,11 @@ PY_PATCHES = [
      'functions=["gd_run", "gd_info", "gd_unpack", "gdr_run", "gdr_info", "gdc_run", "gd_unpack_cat", "gd_ntl_arm"]',
      "GD module exports gd_ntl_arm"),
     ("        pdl = (1 if GD_PDL.get(proj) else 0) | (2 if GD_TRIG.get(proj) else 0)\n"
-     "        r[\"mod\"].gd_run(r[\"inst\"], r[\"w\"], r[\"esc\"], x, out, T, r[\"K\"], ldo, r[\"tb\"], r[\"nbx\"], 1, pdl)\n",
+     "        r[\"mod\"].gd_run(r[\"inst\"], r[\"w\"], r[\"esc\"], x, out, T, r[\"K\"], ldo, r[\"tb\"], r[\"nbx\"], r.get(\"nz\", 1), pdl)\n",
      "        pdl = (1 if GD_PDL.get(proj) else 0) | (2 if GD_TRIG.get(proj) else 0)\n"
      "        if proj == \"pooler\" and _NTL[\"live\"] in (1, 2, 3):\n"
      "            _ntl_arm(r[\"mod\"])\n"
-     "        r[\"mod\"].gd_run(r[\"inst\"], r[\"w\"], r[\"esc\"], x, out, T, r[\"K\"], ldo, r[\"tb\"], r[\"nbx\"], 1, pdl)\n",
+     "        r[\"mod\"].gd_run(r[\"inst\"], r[\"w\"], r[\"esc\"], x, out, T, r[\"K\"], ldo, r[\"tb\"], r[\"nbx\"], r.get(\"nz\", 1), pdl)\n",
      "_gd arms the T = 1 pooler"),
     ("    r[\"mod\"].gdr_run(vf, r[\"w\"], r[\"esc\"], x, y, T, r[\"K\"], r[\"N\"], r[\"tb\"], r[\"nbx\"], pdl,\n",
      "    if vf == 2 and _NTL[\"live\"] in (1, 2, 3):\n        _ntl_arm(r[\"mod\"])\n"
@@ -697,6 +698,8 @@ def main():
     _, chk_base, _ = GM.G37.generate()
     b = BASE.read_text(encoding="utf-8")
     bn = b.split(NL)[1]
+    if ARGS.get("strip") == "1":   # base with comments (e.g. k3_gc_18): use its finish() form (comment/blank strip only)
+        b = GM.finish(b, bn, bn.split()[2], chk_base, [])
     GM.check(GM.finish(b, bn, bn.split()[2], chk_base, []) == b, f"{BASE.name} is not a finish() fixed point")
     nonce = (f"# nonce {TAG} ({BASE.stem} + NTL: no routing tail at T <= 16; per-CTA top-8 in VMS after its PDL wait, "
              "pooler sum(p^2) red.add + xn built in the VMS x load; NTL_MODE per bucket read at call time)")
