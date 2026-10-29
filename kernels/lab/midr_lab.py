@@ -29,7 +29,7 @@ def vendored(nr, kind, outdir):
     if kind == "nost":
         for s in STORES:
             assert src.count(s) == 1, s
-            src = src.replace(s, "      /* MIDR step 0: new_stream store compiled out */\n")
+            src = src.replace(s, "      { /* MIDR step 0: new_stream store compiled out (empty loop body) */ }\n")
     f = outdir / f"norm_residual_{kind}.cuh"
     f.write_text(src)
     cache = {}
