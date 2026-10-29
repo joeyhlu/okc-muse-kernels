@@ -189,7 +189,143 @@ void nt_route(const float* plg, long long sst, long long lld, const int* lstart,
 
 '''
 
-VMS_ROUTE_POST = r'''#if VMS_NTL
+VMS_ROUTE_FR = r"""#if VMS_NTL && VMS_NTL_FR
+// FR (R-ntl-1, local marks): the routing replay sits on the critical path before the first weight issue (~6.4k cycles
+// at T=1 on the 3070: loads ~2.8k, sigmoid ~1k, top-k ~2.1k; T=16 = 2 serial rounds per warp). FR: (1) every thread
+// of the CTA builds s = sigmoid(sum of the 8 partials) for 4 experts at once (loads up front; smem scratch in ring slot
+// 0, free until the first issue); (2) the top-k warp pre-sorts its 8 (b, j) per lane (19-CAS network, ties -> lower j =
+// the scan's choice), so each of the 8 rounds is key -> redux -> ballot -> shift (no 8-wide scan; the id / s shuffles
+// leave the chain); (3) a warp with 2 tokens (T > 8) runs both selections interleaved. Same arithmetic, same order,
+// same tie rules as tail_kernel2: bitwise ids / tw / lid.
+__device__ __forceinline__ bool nt_better(float b1, int j1, float b2, int j2) { return b1 > b2 || (b1 == b2 && j1 < j2); }
+template <int NU>
+__device__ __forceinline__ void nt_topk(const float* scr, const int t0, const int nls, const float rscale, const float deps,
+                                        int* tid_out, float* tw_out, int* lid_out, Smem& S, const int lane, const int c,
+                                        const float4 nb0, const float4 nb1) {
+  const float bs[8] = {nb0.x, nb0.y, nb0.z, nb0.w, nb1.x, nb1.y, nb1.z, nb1.w};
+  constexpr int NWK[19][2] = {{0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}, {0, 1}, {2, 3},
+                              {4, 5}, {6, 7}, {2, 4}, {3, 5}, {1, 4}, {3, 6}, {1, 2}, {3, 4}, {5, 6}};
+  float hb[NU][8], hs[NU][8];
+  int hj[NU][8];
+#pragma unroll
+  for (int u = 0; u < NU; ++u) {
+    const float4* sp = reinterpret_cast<const float4*>(scr + (t0 + u * NW) * 256) + lane * 2;
+    const float4 s0 = sp[0], s1 = sp[1];
+    const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { hs[u][j] = sv[j]; hb[u][j] = sv[j] + bs[j]; hj[u][j] = j; }
+#pragma unroll
+    for (int x = 0; x < 19; ++x) {
+      const int i = NWK[x][0], k = NWK[x][1];
+      const bool sw = nt_better(hb[u][k], hj[u][k], hb[u][i], hj[u][i]);
+      const float tb = hb[u][i], ts = hs[u][i];
+      const int tj = hj[u][i];
+      hb[u][i] = sw ? hb[u][k] : tb; hs[u][i] = sw ? hs[u][k] : ts; hj[u][i] = sw ? hj[u][k] : tj;
+      hb[u][k] = sw ? tb : hb[u][k]; hs[u][k] = sw ? ts : hs[u][k]; hj[u][k] = sw ? tj : hj[u][k];
+    }
+  }
+  int ow[NU][8], rj[NU][8];
+  float rsv[NU][8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+#pragma unroll
+    for (int u = 0; u < NU; ++u) {
+      const unsigned uu = __float_as_uint(hb[u][0] + 0.f);
+      const unsigned key = (uu & 0x80000000u) ? ~uu : (uu | 0x80000000u);
+      const unsigned mx = __reduce_max_sync(0xffffffffu, key);
+      const int owner = __ffs(__ballot_sync(0xffffffffu, key == mx)) - 1;
+      ow[u][k] = owner; rj[u][k] = hj[u][0]; rsv[u][k] = hs[u][0];
+      const bool me = lane == owner;
+#pragma unroll
+      for (int j = 0; j < 7; ++j) {
+        hb[u][j] = me ? hb[u][j + 1] : hb[u][j]; hs[u][j] = me ? hs[u][j + 1] : hs[u][j]; hj[u][j] = me ? hj[u][j + 1] : hj[u][j];
+      }
+      hb[u][7] = me ? -INFINITY : hb[u][7];
+    }
+  }
+#pragma unroll
+  for (int u = 0; u < NU; ++u) {
+    const int t = t0 + u * NW;
+    int sel_id[8];
+    float sel_s[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      sel_id[k] = __shfl_sync(0xffffffffu, lane * 8 + rj[u][k], ow[u][k]);
+      sel_s[k] = __shfl_sync(0xffffffffu, rsv[u][k], ow[u][k]);
+    }
+    if (lane == 0) {
+      float sum = 0.f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) sum += sel_s[i];
+      const float inv = rscale / (sum + deps);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const float wv = sel_s[k] * inv;
+        const int rel = ((sel_id[k] - nls) % 256 + 256) % 256, li = rel < 32 ? rel : -1;
+        S.rtw[t * 8 + k] = wv;
+        S.rid[t * 8 + k] = li;
+        if (c == 0) { tid_out[t * 8 + k] = sel_id[k]; tw_out[t * 8 + k] = wv; lid_out[t * 8 + k] = li; }
+      }
+    }
+  }
+}
+__device__ __forceinline__ void nt_route_fr(const float* plg, long long sst, long long lld, const int* lstart, const float* ssum,
+                                            int m, float mult, float rscale, float deps, float xeps, int* tid_out,
+                                            float* tw_out, int* lid_out, Smem& S, float* scr, const int warp, const int lane,
+                                            const int tid, const int c, const float4 nb0, const float4 nb1) {
+  int nls = 0;
+  float ssv = 0.f;
+  if (warp < NW) { nls = __ldcg(lstart); ssv = tid < m ? __ldcg(ssum + tid) : 0.f; }
+  const int nit = m * 64;   // items (token, 4 experts): <= 1024 at T = 16 -> <= 2 passes of 2 x NTL
+  for (int b0 = 0; b0 < nit; b0 += 2 * NTL) {
+    float4 v[2][8];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const int it = b0 + k * NTL + tid;
+      if (it < nit) {
+        const float* row = plg + (it >> 6) * lld;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) v[k][q] = __ldcg(reinterpret_cast<const float4*>(row + q * sst) + (it & 63));
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const int it = b0 + k * NTL + tid;
+      if (it < nit) {
+        float4 a = v[k][0];
+#pragma unroll
+        for (int q = 1; q < 8; ++q) { a.x += v[k][q].x; a.y += v[k][q].y; a.z += v[k][q].z; a.w += v[k][q].w; }
+        a.x += 0.f; a.y += 0.f; a.z += 0.f; a.w += 0.f;
+        float4 o;
+        o.x = 1.f / (1.f + expf(-a.x * mult));
+        o.y = 1.f / (1.f + expf(-a.y * mult));
+        o.z = 1.f / (1.f + expf(-a.z * mult));
+        o.w = 1.f / (1.f + expf(-a.w * mult));
+        reinterpret_cast<float4*>(scr)[it] = o;
+      }
+    }
+  }
+  __syncthreads();
+  if (warp < NW) {
+    if (warp < m) {
+      if (warp + NW < m) nt_topk<2>(scr, warp, nls, rscale, deps, tid_out, tw_out, lid_out, S, lane, c, nb0, nb1);
+      else nt_topk<1>(scr, warp, nls, rscale, deps, tid_out, tw_out, lid_out, S, lane, c, nb0, nb1);
+    }
+    if (tid < m) S.rs[tid] = rsqrtf(ssv / 4096.f + xeps);
+  }
+#if __CUDA_ARCH__ >= 900
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // scratch (generic) before the ring's first TMA write
+#endif
+}
+#endif
+
+"""
+
+VMS_ROUTE_POST = r'''#if VMS_NTL && VMS_NTL_FR
+  nt_route_fr(p.lg, p.sst, p.lld, p.lstart, p.ssum, p.m, p.mult, p.rscale, p.deps, p.xeps, p.tid_out, p.tw_out,
+              p.lid_out, S, reinterpret_cast<float*>(ring), warp, lane, tid, c, nb0, nb1);
+  __syncthreads();
+#elif VMS_NTL
   nt_route(p.lg, p.sst, p.lld, p.lstart, p.ssum, p.m, p.mult, p.rscale, p.deps, p.xeps, p.tid_out, p.tw_out,
            p.lid_out, S, warp, lane, tid, c, nb0, nb1);
   __syncthreads();
@@ -293,7 +429,7 @@ void run_ntl(torch::Tensor x, torch::Tensor lg, torch::Tensor rbias, torch::Tens
 VMS_PATCHES = [
     ("#ifndef VMS_G\n#define VMS_G 132\n#endif\n",
      "#ifndef VMS_G\n#define VMS_G 132\n#endif\n#ifndef VMS_NTL\n#define VMS_NTL 0\n#endif\n#ifndef VMS_NTL_NI\n#define VMS_NTL_NI 1\n#endif\n"
-     "#ifndef VMS_NTL_XN\n#define VMS_NTL_XN 2\n#endif\n", "VMS_NTL defaults (NI: noinline routing, XN: 0 none / 1 at job switch / 2 after the weight wait)"),
+     "#ifndef VMS_NTL_XN\n#define VMS_NTL_XN 2\n#endif\n#ifndef VMS_NTL_FR\n#define VMS_NTL_FR " + ARGS.get("fr", "1") + "\n#endif\n", "VMS_NTL defaults (NI: noinline routing, XN: 0 none / 1 at job switch / 2 after the weight wait)"),
     ("  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n};",
      "  __nv_bfloat16* out; long long* marks; int m; float eps; int lo;\n#if VMS_NTL\n"
      "  const float* lg; const float* rbias; const int* lstart; float* ssum; const __nv_bfloat16* xw;\n"
@@ -303,7 +439,7 @@ VMS_PATCHES = [
      "  float4 red[NRB][NW][32];\n#if VMS_NTL\n  int rid[MAXP];\n  float rtw[MAXP];\n  float rs[16];\n#endif\n};",
      "Smem: rid / rtw / rs"),
     ("__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {",
-     VMS_HELPER + VMS_ROUTE_FN + "__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {", "nt_xn + VMS_IDS / VMS_TW"),
+     VMS_HELPER + VMS_ROUTE_FN + VMS_ROUTE_FR + "__global__ void __launch_bounds__(NTL, 1) vms_kernel(Params p) {", "nt_xn + VMS_IDS / VMS_TW"),
     ("#if __CUDA_ARCH__ >= 900\n  asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n#endif\n  if (warp == 0) {\n"
      "    const int m8 = p.m * 8;",
      VMS_ROUTE_PRE + "#if __CUDA_ARCH__ >= 900\n  asm volatile(\"griddepcontrol.wait;\\n\" ::: \"memory\");\n#endif\n" + VMS_ROUTE_POST +
