@@ -56,6 +56,8 @@ struct Args {
   int dep;                     // 0: pure stream (ignore dependencies), 1: honor them
   int ilv;                     // 1: chunk c of a phase goes to CTA c % G (a moving front), 0: contiguous shares
   float cyc_per_ns;
+  unsigned long long* mk;      // R-rev-16 marks [G][mkmax][3]: issue time, land time, phase (null = off)
+  int mkmax;
 };
 
 __device__ __forceinline__ unsigned long long gtime() {
@@ -130,7 +132,7 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) conv_kernel(Args a) {
   __syncthreads();
   if (warp == NCW) {
     if (lane == 0) {                                   // producer: this CTA's share of every phase, in order
-      int slot = 0; unsigned par = 0;
+      int slot = 0; unsigned par = 0, kk = 0;
       for (int p = 0; p < c_s.nph; ++p) {
         const Phase& P = c_s.ph[p];
         if (P.route_slot >= c_s.nroute) continue;
@@ -147,6 +149,11 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) conv_kernel(Args a) {
         for (long long off = lo; off < hi; off += step) {
           const unsigned len = (unsigned)min((long long)SB, hi - off);
           mbar_wait(su32(&empty[slot]), par ^ 1u, a.err);
+          if (a.mk && kk < (unsigned)a.mkmax) {
+            unsigned long long* m = a.mk + ((long long)cta * a.mkmax + kk) * 3;
+            m[0] = gtime(); m[2] = (unsigned long long)p;
+          }
+          ++kk;
           mbar_expect_tx(su32(&full[slot]), len);
           bulk_g2s(su32(smem + slot * SB), base + off, len, su32(&full[slot]));
           if (++slot == NS) { slot = 0; par ^= 1u; }
@@ -154,7 +161,7 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) conv_kernel(Args a) {
       }
     }
   } else {
-    int slot = 0; unsigned par = 0;                    // consumers: NCW warps, one modelled body per slot
+    int slot = 0; unsigned par = 0, kc = 0;            // consumers: NCW warps, one modelled body per slot
     for (int p = 0; p < c_s.nph; ++p) {
       const Phase& P = c_s.ph[p];
       if (P.route_slot >= c_s.nroute) continue;
@@ -171,6 +178,8 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) conv_kernel(Args a) {
       for (long long off = lo; off < hi; off += step) {
         const unsigned len = (unsigned)min((long long)SB, hi - off);
         if (lane == 0) mbar_wait(su32(&full[slot]), par, a.err);
+        if (a.mk && threadIdx.x == 0 && kc < (unsigned)a.mkmax) a.mk[((long long)cta * a.mkmax + kc) * 3 + 1] = gtime();
+        ++kc;
         __syncwarp();
         if (cpk > 0) spin_cyc(cpk * len / 1024);
         __syncwarp();
@@ -182,7 +191,7 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) conv_kernel(Args a) {
         const unsigned old = atom_add_acqrel(&a.sync[CTR0 + p], 1u);
         if (old == (unsigned)G - 1u) {                 // last CTA: the dependent chain, then the flag
           a.tph[p] = gtime();
-          if (P.chain_ns > 0) spin_cyc((long long)(P.chain_ns * a.cyc_per_ns));
+          if (a.dep && P.chain_ns > 0) spin_cyc((long long)(P.chain_ns * a.cyc_per_ns));   // R-rev-16: chains only with dependencies
           if (P.write_route) {
             for (int r = 0; r < c_s.nroute; ++r) a.sync[RTE0 + r] = (unsigned)a.route_src[r];
             __threadfence();
@@ -202,6 +211,18 @@ __global__ void flush_kernel(const uint4* buf, long long n16, unsigned* sink) {
     uint4 v;   // normal-policy loads (like the judge's torch.sum flush); __ldcs (evict-first) left earlier lines in L2
     asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(buf + i));
     x ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (x == 0x9e3779b9u) *sink = x;
+}
+
+// R-rev-16: one load per `step` bytes of a region (TLB pre-touch after the flush)
+__global__ void touch_kernel(const unsigned char* base, long long bytes, long long step, unsigned* sink) {
+  const long long n = (bytes + step - 1) / step;
+  unsigned x = 0;
+  for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+    unsigned v;
+    asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(base + i * step));
+    x ^= v;
   }
   if (x == 0x9e3779b9u) *sink = x;
 }
@@ -253,10 +274,12 @@ static std::string args(int argc, char** argv, const char* k, const char* d) {
   return d;
 }
 
+struct Region { const unsigned char* p; long long bytes; };
+
 template <int NS, int SB, int NCW>
 static void run(const Build& b, Args a, int G, int reps, cudaStream_t st, const uint4* fl, long long fl16, unsigned* sink,
                 unsigned* sync, unsigned long long* tph, unsigned long long* tspan, std::vector<double>& spans,
-                std::vector<double>& ph_med) {
+                std::vector<double>& ph_med, const std::vector<Region>& touch, long long tstep, const std::string& mkout) {
   const size_t smem = (size_t)NS * SB + 2 * NS * 8;
   CK(cudaFuncSetAttribute(conv_kernel<NS, SB, NCW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
   cudaGraph_t g; cudaGraphExec_t ge;
@@ -266,6 +289,8 @@ static void run(const Build& b, Args a, int G, int reps, cudaStream_t st, const 
   CK(cudaMemsetAsync(tspan, 0xFF, 8, st));
   CK(cudaMemsetAsync(tspan + 1, 0, 8, st));
   flush_kernel<<<4 * G, 512, 0, st>>>(fl, fl16, sink);
+  if (tstep > 0)
+    for (const Region& r : touch) touch_kernel<<<16, 256, 0, st>>>(r.p, r.bytes, tstep, sink);
   conv_kernel<NS, SB, NCW><<<G, (NCW + 1) * 32, smem, st>>>(a);
   CK(cudaStreamEndCapture(st, &g));
   CK(cudaGraphInstantiate(&ge, g, 0));
@@ -280,6 +305,32 @@ static void run(const Build& b, Args a, int G, int reps, cudaStream_t st, const 
     for (int i = 0; i < b.s.nph; ++i) phs[i].push_back(hp[i] ? (double)(long long)(hp[i] - hs[0]) / 1e3 : -1.0);
   }
   for (auto& v : phs) { std::sort(v.begin(), v.end()); ph_med.push_back(v[v.size() / 2]); }
+  if (a.mk && !mkout.empty()) {   // one more replay; dump its per-CTA chunk marks relative to the first CTA entry
+    CK(cudaMemset(a.mk, 0, (size_t)G * a.mkmax * 3 * 8));
+    CK(cudaGraphLaunch(ge, st)); CK(cudaStreamSynchronize(st));
+    std::vector<unsigned long long> hm((size_t)G * a.mkmax * 3);
+    unsigned long long hs[2];
+    CK(cudaMemcpy(hm.data(), a.mk, hm.size() * 8, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hs, tspan, 16, cudaMemcpyDeviceToHost));
+    FILE* f = fopen(mkout.c_str(), "w");
+    if (f) {
+      fprintf(f, "{\"span_us\":%.3f,\"sb\":%d,\"ctas\":[", (hs[1] - hs[0]) / 1e3, SB);
+      for (int c = 0; c < G; ++c) {
+        fprintf(f, "%s[", c ? "," : "");
+        bool first = true;
+        for (int k = 0; k < a.mkmax; ++k) {
+          const unsigned long long* m = &hm[((size_t)c * a.mkmax + k) * 3];
+          if (!m[0]) break;
+          fprintf(f, "%s[%.3f,%.3f,%llu]", first ? "" : ",", ((long long)(m[0] - hs[0])) / 1e3,
+                  m[1] ? ((long long)(m[1] - hs[0])) / 1e3 : -1.0, m[2]);
+          first = false;
+        }
+        fprintf(f, "]");
+      }
+      fprintf(f, "]}\n");
+      fclose(f);
+    }
+  }
   CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
 }
 
@@ -291,6 +342,9 @@ int main(int argc, char** argv) {
   const int att = argi(argc, argv, "--att", sched[1] == '1' ? 3500 : 5500);
   const int dcons = argi(argc, argv, "--dcons", 21), vcons = argi(argc, argv, "--vcons", 21), acons = argi(argc, argv, "--acons", 21);
   const int cfg = argi(argc, argv, "--cfg", 0);
+  const int contig = argi(argc, argv, "--contig", 0), mkmax = argi(argc, argv, "--marks", 0);
+  const long long tstep = (long long)argi(argc, argv, "--touch", 0);   // bytes between pre-touch loads (0 = off)
+  const std::string mkout = args(argc, argv, "--mkout", "");
   Build b = make_sched(sched, experts, att, full_kv, argi(argc, argv, "--sbb", 1200), argi(argc, argv, "--route", 1500),
                        argi(argc, argv, "--pnorm", 1200), argi(argc, argv, "--comb", 1200), argi(argc, argv, "--norm", 1200),
                        argi(argc, argv, "--attcomb", 1200));
@@ -311,8 +365,17 @@ int main(int argc, char** argv) {
   const long long xstride = (long long)(28.31 * MB + 4095) & ~4095ll;
   unsigned char *w, *xw; uint4* fl; unsigned *sync, *err, *sink; int* rs; unsigned long long *tph, *tspan;
   const long long FL = 256ll << 20;
-  CK(cudaMalloc(&w, b.wbytes + (1 << 20))); CK(cudaMalloc(&xw, 32 * xstride)); CK(cudaMalloc(&fl, FL));
-  CK(cudaMemset(w, 1, b.wbytes + (1 << 20))); CK(cudaMemset(xw, 2, 32 * xstride)); CK(cudaMemset(fl, 3, FL));
+  const long long walign = (b.wbytes + (2 << 20) - 1) & ~((2ll << 20) - 1);
+  if (contig) {   // R-rev-16: the routed experts' slabs right behind the static weights, in one allocation
+    CK(cudaMalloc(&w, walign + (long long)b.s.nroute * xstride + (1 << 20)));
+    CK(cudaMemset(w, 1, walign + (long long)b.s.nroute * xstride + (1 << 20)));
+    xw = w + walign;
+    for (int e = 0; e < (int)b.route.size(); ++e) b.route[e] = e;
+  } else {
+    CK(cudaMalloc(&w, b.wbytes + (1 << 20))); CK(cudaMalloc(&xw, 32 * xstride));
+    CK(cudaMemset(w, 1, b.wbytes + (1 << 20))); CK(cudaMemset(xw, 2, 32 * xstride));
+  }
+  CK(cudaMalloc(&fl, FL)); CK(cudaMemset(fl, 3, FL));
   CK(cudaMalloc(&sync, NSYNC * 4)); CK(cudaMalloc(&err, 4)); CK(cudaMalloc(&sink, 4)); CK(cudaMalloc(&rs, 64 * 4));
   CK(cudaMalloc(&tph, MAXPH * 8)); CK(cudaMalloc(&tspan, 16)); CK(cudaMemset(err, 0, 4));
   CK(cudaMemcpy(rs, b.route.data(), b.route.size() * 4, cudaMemcpyHostToDevice));
@@ -323,25 +386,30 @@ int main(int argc, char** argv) {
   a.cons_cyc_per_kb[0] = free_c ? 0 : (int)(dcons * cyc_per_ns);
   a.cons_cyc_per_kb[1] = free_c ? 0 : (int)(vcons * cyc_per_ns);
   a.cons_cyc_per_kb[2] = free_c ? 0 : (int)(acons * cyc_per_ns);
+  if (mkmax > 0) CK(cudaMalloc(&a.mk, (size_t)G * mkmax * 3 * 8));
+  a.mkmax = mkmax;
+  std::vector<Region> touch;
+  touch.push_back({w, b.wbytes});
+  for (int e = 0; e < b.s.nroute; ++e) touch.push_back({xw + (long long)b.route[e] * xstride, (long long)(28.31 * MB)});
   cudaStream_t st; CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   std::vector<double> spans, ph;
   const char* cfgs[] = {"NS6xSB32K/4w", "NS8xSB24K/4w", "NS4xSB48K/4w", "NS12xSB16K/4w", "NS6xSB32K/8w", "NS6xSB32K/3w",
                         "NS12xSB16K/3w"};
   switch (cfg) {
-    case 0: run<6, 32768, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    case 1: run<8, 24576, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    case 2: run<4, 49152, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    case 3: run<12, 16384, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    case 4: run<6, 32768, 8>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    case 5: run<6, 32768, 3>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
-    default: run<12, 16384, 3>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph); break;
+    case 0: run<6, 32768, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    case 1: run<8, 24576, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    case 2: run<4, 49152, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    case 3: run<12, 16384, 4>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    case 4: run<6, 32768, 8>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    case 5: run<6, 32768, 3>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
+    default: run<12, 16384, 3>(b, a, G, reps, st, fl, FL / 16, sink, sync, tph, tspan, spans, ph, touch, tstep, mkout); break;
   }
   unsigned herr = 0; CK(cudaMemcpy(&herr, err, 4, cudaMemcpyDeviceToHost));
   std::sort(spans.begin(), spans.end());
   const double med = spans[spans.size() / 2], p10 = spans[spans.size() / 10], p90 = spans[spans.size() * 9 / 10];
-  printf("{\"ilv\":%d,\"sched\":\"%s\",\"mode\":\"%s\",\"cfg\":\"%s\",\"experts\":%d,\"att_ns\":%d,\"dcons\":%d,\"vcons\":%d,\"acons\":%d,"
+  printf("{\"touch\":%lld,\"contig\":%d,\"ilv\":%d,\"sched\":\"%s\",\"mode\":\"%s\",\"cfg\":\"%s\",\"experts\":%d,\"att_ns\":%d,\"dcons\":%d,\"vcons\":%d,\"acons\":%d,"
          "\"MB\":%.1f,\"span_us\":%.2f,\"p10\":%.2f,\"p90\":%.2f,\"TBps\":%.3f,\"at4p4_us\":%.2f,\"err\":%u,\"G\":%d,\"mhz\":%.0f,\"phase_us\":[",
-         a.ilv, sched.c_str(), mode.c_str(), cfgs[cfg], experts, att, dcons, vcons, acons, b.total_mb, med, p10, p90,
+         tstep, contig, a.ilv, sched.c_str(), mode.c_str(), cfgs[cfg], experts, att, dcons, vcons, acons, b.total_mb, med, p10, p90,
          b.total_mb / med, b.total_mb / 4.4, herr, G, cyc_per_ns * 1e3);   // MB / us = TB/s
   for (size_t i = 0; i < ph.size(); ++i) printf("%s%.2f", i ? "," : "", ph[i]);
   printf("]}\n");
