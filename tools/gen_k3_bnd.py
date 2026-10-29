@@ -10,7 +10,9 @@ writes them to scratch, one grid barrier (one-wave grid -> co-resident; bounded 
 (xor trees per 256-column block, block pairs per rank, 16 ranks in order) -> bitwise with today's sbb / SGLang boundary.
 Phase 1: every CTA reduces every token; phase 2: CTA t reduces token t, then a flag counter. The sliced unpooler (T <= 8, 1024
 GEMV columns over 64 CTAs) also owns the 28 residual-only 256-column blocks (CTA b < 28 -> block 4 + b).
-Modes per bucket at call time: BND_UNP / BND_O {bucket: 0 off, 1 rider (fused outputs to scratch, today's boundary kept), 2 fused}.
+Modes per bucket at call time: BND_UNP / BND_O {bucket: 0 off, 1 rider (fused outputs to scratch, today's boundary kept), 2 fused,
+3 rider stopped after the partial words}. Round 2 (R-bnd-0b): no grid barrier: partials are (epoch << 32 | f32) words polled
+directly (epoch = per-launch ticket taken before the GEMV), stream / weights cp.async'd before the GEMV main loop.
 """
 import ast
 import hashlib
@@ -38,17 +40,20 @@ def sub(t, old, new, count=1, what=""):
 
 
 DEV = r'''__device__ __forceinline__ uint32_t smem_u32'''
-DEV_NEW = r'''__device__ __forceinline__ unsigned bnd_ld(const unsigned* p) {
-  unsigned v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
-  return v;
+DEV_NEW = r'''__device__ __forceinline__ void bnd_ld2(const unsigned long long* p, unsigned long long& a, unsigned long long& b) {
+  asm volatile("ld.relaxed.gpu.global.v2.b64 {%0,%1}, [%2];\n" : "=l"(a), "=l"(b) : "l"(p) : "memory");
 }
-__device__ __forceinline__ void bnd_wait(const unsigned* p, unsigned target, int* err) {
-  for (unsigned it = 0; (int)(bnd_ld(p) - target) < 0; ++it)
-    if (it > (1u << 22)) {
-      if (err) atomicExch(err, 1);
-      break;
-    }
+__device__ __forceinline__ void bnd_st2(unsigned long long* p, unsigned long long a, unsigned long long b) {
+  asm volatile("st.relaxed.gpu.global.v2.b64 [%0], {%1,%2};\n" :: "l"(p), "l"(a), "l"(b) : "memory");
+}
+__device__ __forceinline__ unsigned long long bnd_pk(unsigned ep, float v) {
+  return ((unsigned long long)ep << 32) | (unsigned long long)__float_as_uint(v);
+}
+__device__ __forceinline__ bool bnd_ok(unsigned long long w, unsigned ep) { return (unsigned)(w >> 32) == ep; }
+__device__ __forceinline__ float bnd_val(unsigned long long w) { return __uint_as_float((unsigned)w); }
+__device__ __forceinline__ void bnd_cp4(void* sdst, const void* gsrc) {
+  const unsigned sa = (unsigned)__cvta_generic_to_shared(sdst);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(sa), "l"(gsrc) : "memory");
 }
 __device__ __forceinline__ void bnd_tree(float4& a) {
 #pragma unroll
@@ -67,8 +72,8 @@ ARGS_OLD = "  void* out2 = nullptr; int ldo2 = 0; long long sst2 = 0; uint32_t t
 ARGS_NEW = ARGS_OLD + r'''
   const float* bst = nullptr; void* bout = nullptr; float* bns = nullptr; float* brt = nullptr;   // BND: stream in, outputs
   const uint16_t* bpw = nullptr; const uint16_t* bqw = nullptr; const float* bal = nullptr; const float* bbt = nullptr;
-  float4* bpart = nullptr; float* brs = nullptr; unsigned* bctr = nullptr; int* berr = nullptr;
-  float bpe = 0.f, bqe = 0.f; int bgcw = 0, bisc = 0, bnob = 0;'''
+  unsigned long long* bpart = nullptr; unsigned long long* brs = nullptr; unsigned* bctr = nullptr; int* berr = nullptr;
+  float bpe = 0.f, bqe = 0.f; int bgcw = 0, bisc = 0, bnob = 0, bstop = 0;   // bpart / brs: (epoch << 32 | f32) words'''
 
 TPL_OLD = "template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int VF = 0, int CAT = 0>\n__global__"
 TPL_NEW = "template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int VF = 0, int CAT = 0, int BND = 0>\n__global__"
@@ -78,12 +83,14 @@ SMEM_NEW = SMEM_OLD + r'''  constexpr int BPH = BND & 3, BSL = (BND >> 2) & 1;
   constexpr int BNC = WR * 16, BNT = MT * 8, BNX = BNC + (BSL ? 256 : 0), BNG = BNX / 8;
   static_assert(BND == 0 || ((BPH == 1 || BPH == 2) && S == 1 && CAT == 0 && VF == 0 && OUT == 0), "BND: S 1 bf16 GD only");
   __shared__ float bnd_v[BND ? BNT : 1][BND ? BNX : 1];
-  __shared__ float bnd_r[BND ? BNT : 1][BND ? BNX : 1];
-  __shared__ float bnd_w[BND ? 4 : 1][BND ? BNX : 1];
+  __shared__ __align__(16) float bnd_r[BND ? BNT : 1][BND ? BNX : 1];
+  __shared__ __align__(16) float bnd_w[BND ? 4 : 1][BND ? BNX : 1];
+  __shared__ __align__(16) uint16_t bnd_h[BND ? 2 : 1][BND ? BNX : 1];
   __shared__ float4 bnd_g[BND ? BNT : 1][BND ? BNG : 1];
   __shared__ float4 bnd_b[(BND && BPH == 1) ? BNT : 1][BND ? 32 : 1];
   __shared__ float bnd_s[BND ? BNT : 1][2];
-  __shared__ unsigned bnd_gen;
+  __shared__ unsigned bnd_ep;
+  unsigned bep = 0;
 '''
 
 EPI_OLD = "  if constexpr (S == 1) {\n    for (int i = (int)threadIdx.x; i < NO; i += NT) store(i, cta_value(i));\n"
@@ -92,9 +99,10 @@ EPI_NEW = r'''  if constexpr (S == 1) {
       for (int i = (int)threadIdx.x; i < NO; i += NT) store(i, cta_value(i));
     } else {   // BND: the layer boundary on this CTA's columns, SGLang's arithmetic and reduction order
       const int tid = (int)threadIdx.x, bx = (int)blockIdx.x, nbx = (int)gridDim.x;
-      const int nsp = nbx * BNC / 256;            // 256-column blocks the GEMV columns cover
-      const bool hx = BSL && bx < 32 - nsp;       // sliced: also the residual-only block nsp + bx
+      constexpr int nsp = BSL ? 4 : 32, U = nsp + BSL;   // split 256-column blocks (+ the residual-only blocks' unit)
+      const bool hx = BSL && bx < 32 - nsp;
       const int c0 = bx * BNC, cx = (nsp + bx) * 256, ngo = hx ? BNG : BNC / 8;
+      if (tid == 0) bnd_ep = bep / (unsigned)nbx + 1u;
       for (int i = tid; i < NO; i += NT) {
         const float v = cta_value(i);
         const int l = i & 31, c = (i >> 5) & 3, r = i >> 7;
@@ -103,29 +111,21 @@ EPI_NEW = r'''  if constexpr (S == 1) {
       }
       if (hx)
         for (int i = tid; i < BNT * 256; i += NT) bnd_v[i >> 8][BNC + (i & 255)] = 0.f;
-      for (int j = tid; j < (hx ? BNX : BNC); j += NT) {
-        const int col = j < BNC ? c0 + j : cx + j - BNC;
-        bnd_w[0][j] = A.bpw ? __uint_as_float((uint32_t)A.bpw[col] << 16) : 1.f;
-        bnd_w[1][j] = A.bal ? A.bal[A.bgcw ? col : 0] : 1.f;
-        bnd_w[2][j] = A.bal ? A.bbt[A.bgcw ? col : 0] : 1.f;
-        bnd_w[3][j] = A.bqw ? __uint_as_float((uint32_t)A.bqw[col] << 16) : 1.f;
-      }
+      asm volatile("cp.async.wait_all;\n" ::: "memory");
       __syncthreads();
+      const unsigned ep = bnd_ep;
       for (int it = tid; it < BNT * BNG; it += NT) {   // 8-column chains (one SGLang thread's elements)
         const int t = it / BNG, g = it - t * BNG;
         if (t >= A.M || g >= ngo) continue;
-        const int j0 = g * 8, col = j0 < BNC ? c0 + j0 : cx + j0 - BNC;
-        const float4 s0 = *reinterpret_cast<const float4*>(A.bst + (size_t)t * 8192 + col);
-        const float4 s1 = *reinterpret_cast<const float4*>(A.bst + (size_t)t * 8192 + col + 4);
-        const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+        const int j0 = g * 8;
         float bs = 0.f, rs = 0.f, cs = 0.f, ss = 0.f;
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
-          const float pw = bnd_w[0][j0 + q];
+          const float pw = A.bpw ? __uint_as_float((uint32_t)bnd_h[0][j0 + q] << 16) : 1.f;
           float v = bnd_v[t][j0 + q];
           if (A.bisc) v = bnd_rbf(v * pw);
           const float mv = A.bisc ? v : v * pw;
-          const float rr = bnd_w[1][j0 + q] * sv[q];
+          const float rr = bnd_w[1][j0 + q] * bnd_r[t][j0 + q];
           const float sb = bnd_w[2][j0 + q] * mv;
           bnd_v[t][j0 + q] = v;
           bnd_r[t][j0 + q] = rr;
@@ -134,116 +134,177 @@ EPI_NEW = r'''  if constexpr (S == 1) {
           cs = fmaf(rr, sb, cs);
           ss = fmaf(sb, sb, ss);
         }
-        bnd_g[t][g] = make_float4(bs, rs, cs, ss);
-      }
-      __syncthreads();
-      float4* gp = A.bpart;   // [BNT][1024] chains of the split blocks, then [BNT][32] whole-block partials
-      for (int it = tid; it < BNT * (BNC / 8); it += NT) {
-        const int t = it / (BNC / 8), g = it - t * (BNC / 8);
-        if (t < A.M) gp[(size_t)t * 1024 + c0 / 8 + g] = bnd_g[t][g];
+        if (g < BNC / 8) {
+          unsigned long long* p = A.bpart + ((size_t)t * 1056 + c0 / 8 + g) * 4;
+          bnd_st2(p, bnd_pk(ep, bs), bnd_pk(ep, rs));
+          bnd_st2(p + 2, bnd_pk(ep, cs), bnd_pk(ep, ss));
+        } else {
+          bnd_g[t][g] = make_float4(bs, rs, cs, ss);
+        }
       }
       if (hx) {
-        for (int t = warp; t < A.M && t < BNT; t += NW) {
+        __syncthreads();
+        for (int t = warp; t < A.M && t < BNT; t += NW) {   // the SGLang warp tree of the residual-only block
           float4 a = bnd_g[t][BNC / 8 + lane];
           bnd_tree(a);
-          if (lane == 0) gp[(size_t)BNT * 1024 + t * 32 + nsp + bx] = a;
-        }
-      }
-      __syncthreads();
-      if (tid == 0) {
-        __threadfence();
-        const unsigned gen = atomicAdd(A.bctr, 1u) / (unsigned)nbx;
-        if (BPH == 1 || bx < BNT) bnd_wait(A.bctr, (gen + 1u) * (unsigned)nbx, A.berr);
-        __threadfence();
-        bnd_gen = gen;
-      }
-      __syncthreads();
-      const int ntk = BPH == 1 ? A.M : (bx < A.M ? 1 : 0);
-      for (int task = warp; task < ntk * 32; task += NW) {
-        const int b = task & 31, t = BPH == 1 ? (task >> 5) : bx;
-        float4 a;
-        if (b < nsp) {
-          a = __ldcg(gp + (size_t)t * 1024 + b * 32 + lane);
-          bnd_tree(a);
-        } else {
-          a = __ldcg(gp + (size_t)BNT * 1024 + t * 32 + b);
-        }
-        if (lane == 0) bnd_b[BPH == 1 ? t : 0][b] = a;
-      }
-      __syncthreads();
-      if (tid < ntk) {
-        const int t = BPH == 1 ? tid : bx, tq = BPH == 1 ? tid : 0;
-        float tb = 0.f, tr = 0.f, tc = 0.f, ts = 0.f;
-        for (int q = 0; q < 16; ++q) {
-          float4 m = make_float4(0.f, 0.f, 0.f, 0.f);
-          const float4 p0 = bnd_b[tq][2 * q], p1 = bnd_b[tq][2 * q + 1];
-          m.x += p0.x; m.y += p0.y; m.z += p0.z; m.w += p0.w;
-          m.x += p1.x; m.y += p1.y; m.z += p1.z; m.w += p1.w;
-          tb += m.x; tr += m.y; tc += m.z; ts += m.w;
-        }
-        const float post_rstd = rsqrtf(tb * (1.f / (float)8192) + A.bpe);
-        const float pre_sum = fmaf(post_rstd, fmaf(post_rstd, ts, 2.f * tc), tr);
-        const float pre_rstd = rsqrtf(fmaxf(pre_sum, 0.f) * (1.f / (float)8192) + A.bqe);
-        if (BPH == 1) {
-          bnd_s[t][0] = post_rstd;
-          bnd_s[t][1] = pre_rstd;
-        } else {
-          A.brs[2 * t] = post_rstd;
-          A.brs[2 * t + 1] = pre_rstd;
-        }
-      }
-      if constexpr (BPH == 2) {
-        __syncthreads();
-        if (tid == 0) {
-          if (bx < BNT) {
-            __threadfence();
-            atomicAdd(A.bctr + 1, 1u);
+          if (lane == 0) {
+            unsigned long long* p = A.bpart + ((size_t)t * 1056 + 1024 + nsp + bx) * 4;
+            bnd_st2(p, bnd_pk(ep, a.x), bnd_pk(ep, a.y));
+            bnd_st2(p + 2, bnd_pk(ep, a.z), bnd_pk(ep, a.w));
           }
-          bnd_wait(A.bctr + 1, (bnd_gen + 1u) * (unsigned)BNT, A.berr);
-          __threadfence();
-        }
-        __syncthreads();
-        for (int t = tid; t < A.M; t += NT) {
-          bnd_s[t][0] = __ldcg(A.brs + 2 * t);
-          bnd_s[t][1] = __ldcg(A.brs + 2 * t + 1);
         }
       }
-      __syncthreads();
-      for (int it = tid; it < BNT * BNG; it += NT) {
-        const int t = it / BNG, g = it - t * BNG;
-        if (t >= A.M || g >= ngo) continue;
-        const int j0 = g * 8, col = j0 < BNC ? c0 + j0 : cx + j0 - BNC;
-        const float pr = bnd_s[t][0], qr = bnd_s[t][1];
-        float nsv[8], zv[8];
-        __align__(16) __nv_bfloat16 ob[8];
+      if (!A.bstop) {
+        const int nun = BPH == 1 ? A.M * U : (bx < A.M ? U : 0);
+        for (int base = warp; base < nun; base += 4 * NW) {   // poll the self-validating partial words (no barrier)
+          unsigned long long w[4][4];
+          bool all = false;
+          for (unsigned itr = 0; !all; ++itr) {
+            bool ok = true;
 #pragma unroll
-        for (int q = 0; q < 8; ++q) {
-          float n = bnd_v[t][j0 + q] * pr;
-          if (!A.bisc) n *= bnd_w[0][j0 + q];
-          n = bnd_rbf(n);
-          const float u = fmaf(bnd_w[2][j0 + q], n, bnd_r[t][j0 + q]);
-          nsv[q] = u;
-          float z = u * qr;
-          z *= bnd_w[3][j0 + q];
-          zv[q] = z;
-          ob[q] = __float2bfloat16_rn(z);
+            for (int u = 0; u < 4; ++u) {
+              const int un = base + u * NW;
+              const int t = BPH == 1 ? un / U : bx, b = BPH == 1 ? un - (un / U) * U : un;
+              if (un < nun && (b < nsp || lane < 32 - nsp)) {
+                const unsigned long long* p = A.bpart + ((size_t)t * 1056 + (b < nsp ? b * 32 + lane : 1024 + nsp + lane)) * 4;
+                bnd_ld2(p, w[u][0], w[u][1]);
+                bnd_ld2(p + 2, w[u][2], w[u][3]);
+                ok = ok && bnd_ok(w[u][0], ep) && bnd_ok(w[u][1], ep) && bnd_ok(w[u][2], ep) && bnd_ok(w[u][3], ep);
+              }
+            }
+            all = __all_sync(0xffffffffu, ok);
+            if (!all && itr > (1u << 20)) {
+              if (lane == 0 && A.berr) atomicExch(A.berr, 1);
+              break;
+            }
+          }
+#pragma unroll
+          for (int u = 0; u < 4; ++u) {
+            const int un = base + u * NW;
+            if (un < nun) {
+              const int t = BPH == 1 ? un / U : bx, b = BPH == 1 ? un - (un / U) * U : un;
+              float4 a = make_float4(bnd_val(w[u][0]), bnd_val(w[u][1]), bnd_val(w[u][2]), bnd_val(w[u][3]));
+              if (b < nsp) {
+                bnd_tree(a);
+                if (lane == 0) bnd_b[BPH == 1 ? t : 0][b] = a;
+              } else if (lane < 32 - nsp) {
+                bnd_b[BPH == 1 ? t : 0][nsp + lane] = a;
+              }
+            }
+          }
         }
-        const size_t o = (size_t)t * 8192 + col;
-        *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(A.bout) + o) = *reinterpret_cast<const uint4*>(ob);
-        reinterpret_cast<float4*>(A.bns + o)[0] = make_float4(nsv[0], nsv[1], nsv[2], nsv[3]);
-        reinterpret_cast<float4*>(A.bns + o)[1] = make_float4(nsv[4], nsv[5], nsv[6], nsv[7]);
-        if (A.brt) {
-          reinterpret_cast<float4*>(A.brt + o)[0] = make_float4(zv[0], zv[1], zv[2], zv[3]);
-          reinterpret_cast<float4*>(A.brt + o)[1] = make_float4(zv[4], zv[5], zv[6], zv[7]);
+        __syncthreads();
+        const int ntk = BPH == 1 ? A.M : (bx < A.M ? 1 : 0);
+        if (tid < ntk) {
+          const int t = BPH == 1 ? tid : bx, tq = BPH == 1 ? tid : 0;
+          float tb = 0.f, tr = 0.f, tc = 0.f, ts = 0.f;
+          for (int q = 0; q < 16; ++q) {
+            float4 m = make_float4(0.f, 0.f, 0.f, 0.f);
+            const float4 p0 = bnd_b[tq][2 * q], p1 = bnd_b[tq][2 * q + 1];
+            m.x += p0.x; m.y += p0.y; m.z += p0.z; m.w += p0.w;
+            m.x += p1.x; m.y += p1.y; m.z += p1.z; m.w += p1.w;
+            tb += m.x; tr += m.y; tc += m.z; ts += m.w;
+          }
+          const float post_rstd = rsqrtf(tb * (1.f / (float)8192) + A.bpe);
+          const float pre_sum = fmaf(post_rstd, fmaf(post_rstd, ts, 2.f * tc), tr);
+          const float pre_rstd = rsqrtf(fmaxf(pre_sum, 0.f) * (1.f / (float)8192) + A.bqe);
+          if (BPH == 1) {
+            bnd_s[t][0] = post_rstd;
+            bnd_s[t][1] = pre_rstd;
+          } else {
+            bnd_st2(A.brs + 2 * t, bnd_pk(ep, post_rstd), bnd_pk(ep, pre_rstd));
+          }
+        }
+        if constexpr (BPH == 2) {
+          for (int t = tid; t < A.M; t += NT) {   // poll the reducers' scale words
+            unsigned long long a0 = 0, a1 = 0;
+            for (unsigned itr = 0;; ++itr) {
+              bnd_ld2(A.brs + 2 * t, a0, a1);
+              if (bnd_ok(a0, ep) && bnd_ok(a1, ep)) break;
+              if (itr > (1u << 20)) {
+                if (A.berr) atomicExch(A.berr, 1);
+                break;
+              }
+            }
+            bnd_s[t][0] = bnd_val(a0);
+            bnd_s[t][1] = bnd_val(a1);
+          }
+        }
+        __syncthreads();
+        for (int it = tid; it < BNT * BNG; it += NT) {
+          const int t = it / BNG, g = it - t * BNG;
+          if (t >= A.M || g >= ngo) continue;
+          const int j0 = g * 8, col = j0 < BNC ? c0 + j0 : cx + j0 - BNC;
+          const float pr = bnd_s[t][0], qr = bnd_s[t][1];
+          float nsv[8], zv[8];
+          __align__(16) __nv_bfloat16 ob[8];
+#pragma unroll
+          for (int q = 0; q < 8; ++q) {
+            float n = bnd_v[t][j0 + q] * pr;
+            if (!A.bisc && A.bpw) n *= __uint_as_float((uint32_t)bnd_h[0][j0 + q] << 16);
+            n = bnd_rbf(n);
+            const float u = fmaf(bnd_w[2][j0 + q], n, bnd_r[t][j0 + q]);
+            nsv[q] = u;
+            float z = u * qr;
+            if (A.bqw) z *= __uint_as_float((uint32_t)bnd_h[1][j0 + q] << 16);
+            zv[q] = z;
+            ob[q] = __float2bfloat16_rn(z);
+          }
+          const size_t o = (size_t)t * 8192 + col;
+          *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(A.bout) + o) = *reinterpret_cast<const uint4*>(ob);
+          reinterpret_cast<float4*>(A.bns + o)[0] = make_float4(nsv[0], nsv[1], nsv[2], nsv[3]);
+          reinterpret_cast<float4*>(A.bns + o)[1] = make_float4(nsv[4], nsv[5], nsv[6], nsv[7]);
+          if (A.brt) {
+            reinterpret_cast<float4*>(A.brt + o)[0] = make_float4(zv[0], zv[1], zv[2], zv[3]);
+            reinterpret_cast<float4*>(A.brt + o)[1] = make_float4(zv[4], zv[5], zv[6], zv[7]);
+          }
         }
       }
     }
 '''
 
+PRE_OLD = "  if constexpr (VF == 2) {   // the router input slice (the boundary's FP32 output), tokens >= M zero\n"
+PRE_NEW = r'''  if constexpr (BND > 0) {   // BND: epoch ticket + cp.async of this CTA's stream rows / gate / norm weights (hidden by the GEMV)
+    const int tid = (int)threadIdx.x, bx = (int)blockIdx.x;
+    constexpr int nsp = BSL ? 4 : 32;
+    const bool hx = BSL && bx < 32 - nsp;
+    const int c0 = bx * BNC, cx = (nsp + bx) * 256, nx = hx ? BNX : BNC;
+    if (tid == 0) bep = atomicAdd(A.bctr, 1u);
+    for (int i = tid; i < A.M * (nx / 4); i += NT) {
+      const int t = i / (nx / 4), j = (i - t * (nx / 4)) * 4;
+      vf_cp16(&bnd_r[t][j], A.bst + (size_t)t * 8192 + (j < BNC ? c0 + j : cx + j - BNC));
+    }
+    for (int j = tid * 4; j < nx; j += NT * 4) {
+      const int col = j < BNC ? c0 + j : cx + j - BNC;
+      if (A.bal && A.bgcw) {
+        vf_cp16(&bnd_w[1][j], A.bal + col);
+        vf_cp16(&bnd_w[2][j], A.bbt + col);
+      } else {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          if (A.bal) {
+            bnd_cp4(&bnd_w[1][j + q], A.bal);
+            bnd_cp4(&bnd_w[2][j + q], A.bbt);
+          } else {
+            bnd_w[1][j + q] = 1.f;
+            bnd_w[2][j + q] = 1.f;
+          }
+        }
+      }
+    }
+    for (int j = tid * 8; j < nx; j += NT * 8) {
+      const int col = j < BNC ? c0 + j : cx + j - BNC;
+      if (A.bpw) vf_cp16(&bnd_h[0][j], A.bpw + col);
+      if (A.bqw) vf_cp16(&bnd_h[1][j], A.bqw + col);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  }
+''' + PRE_OLD
+
 HOST_ANCHOR = "int gd_unpack_cat_raw(const void* w, const void* esc, void* out, int K, int G, int wk, int kup, uint32_t tb, uint32_t tbr,\n                      cudaStream_t st) {"
 HOST_NEW = r'''int gdb_run_raw(int64_t inst, const void* w, const void* esc, const void* x, void* out, int M, int K, int ldo, uint32_t tb,
                 int nbx, int pdl, const float* bst, void* bout, float* bns, float* brt, const void* bpw, const void* bqw,
-                const float* bal, const float* bbt, int bgcw, float bpe, float bqe, int bisc, void* bpart, float* brs,
+                const float* bal, const float* bbt, int bgcw, float bpe, float bqe, int bisc, void* bpart, void* brs,
                 unsigned* bctr, int* berr, int bnob, cudaStream_t st) {
   Args A;
   A.w = reinterpret_cast<const uint4*>(w);
@@ -256,7 +317,8 @@ HOST_NEW = r'''int gdb_run_raw(int64_t inst, const void* w, const void* esc, con
   A.bout = bout; A.bns = bns; A.brt = brt;
   A.bpw = reinterpret_cast<const uint16_t*>(bpw); A.bqw = reinterpret_cast<const uint16_t*>(bqw); A.bal = bal; A.bbt = bbt;
   A.bgcw = bgcw; A.bpe = bpe; A.bqe = bqe; A.bisc = bisc;
-  A.bpart = reinterpret_cast<float4*>(bpart); A.brs = brs; A.bctr = bctr; A.berr = berr; A.bnob = bnob;
+  A.bpart = reinterpret_cast<unsigned long long*>(bpart); A.brs = reinterpret_cast<unsigned long long*>(brs); A.bctr = bctr;
+  A.berr = berr; A.bnob = bnob & 1; A.bstop = (bnob >> 1) & 1;
   const int nz = 1;
   switch (inst) {
 @INST@
@@ -269,7 +331,7 @@ HOST_NEW = r'''int gdb_run_raw(int64_t inst, const void* w, const void* esc, con
 CPP_ANCHOR = "void gd_unpack(torch::Tensor w, torch::Tensor esc"
 CPP_NEW = r'''int gdb_run_raw(int64_t inst, const void* w, const void* esc, const void* x, void* out, int M, int K, int ldo, uint32_t tb,
                 int nbx, int pdl, const float* bst, void* bout, float* bns, float* brt, const void* bpw, const void* bqw,
-                const float* bal, const float* bbt, int bgcw, float bpe, float bqe, int bisc, void* bpart, float* brs,
+                const float* bal, const float* bbt, int bgcw, float bpe, float bqe, int bisc, void* bpart, void* brs,
                 unsigned* bctr, int* berr, int bnob, cudaStream_t st);
 void gdb_run(int64_t inst, torch::Tensor w, torch::Tensor esc, torch::Tensor x, torch::Tensor out, int64_t M, int64_t K,
              int64_t ldo, int64_t tb, int64_t nbx, int64_t pdl, torch::Tensor stream, torch::Tensor bout, torch::Tensor bns,
@@ -280,17 +342,17 @@ void gdb_run(int64_t inst, torch::Tensor w, torch::Tensor esc, torch::Tensor x, 
            reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0;
   };
   TORCH_CHECK(M >= 1 && ok2(stream, at::kFloat) && ok2(bout, at::kBFloat16) && ok2(bns, at::kFloat) &&
-              (brt.numel() == 0 || ok2(brt, at::kFloat)) && part.scalar_type() == at::kFloat && rs.scalar_type() == at::kFloat &&
+              (brt.numel() == 0 || ok2(brt, at::kFloat)) && part.scalar_type() == at::kLong && rs.scalar_type() == at::kLong &&
               ctr.scalar_type() == at::kInt && ctr.numel() >= 2 && err.scalar_type() == at::kInt &&
               (pw.numel() == 0 || pw.numel() == 8192) && (qw.numel() == 0 || qw.numel() == 8192) &&
               (al.numel() == 0 || al.numel() == 1 || al.numel() == 8192) && al.numel() == bt.numel(),
               "gdb_run: stream / outputs [M, 8192] (f32 / bf16 / f32 [/ f32]), scratch f32 / int32");
-  const int e = gdb_run_raw(inst, w.data_ptr(), esc.data_ptr(), x.data_ptr(), nob ? nullptr : out.data_ptr(), (int)M, (int)K,
+  const int e = gdb_run_raw(inst, w.data_ptr(), esc.data_ptr(), x.data_ptr(), (nob & 1) ? nullptr : out.data_ptr(), (int)M, (int)K,
                             (int)ldo, (uint32_t)tb, (int)nbx, (int)pdl, stream.data_ptr<float>(), bout.data_ptr(),
                             bns.data_ptr<float>(), brt.numel() ? brt.data_ptr<float>() : nullptr,
                             pw.numel() ? pw.data_ptr() : nullptr, qw.numel() ? qw.data_ptr() : nullptr,
                             al.numel() ? al.data_ptr<float>() : nullptr, bt.numel() ? bt.data_ptr<float>() : nullptr,
-                            al.numel() == 8192 ? 1 : 0, (float)pe, (float)qe, (int)isc, part.data_ptr(), rs.data_ptr<float>(),
+                            al.numel() == 8192 ? 1 : 0, (float)pe, (float)qe, (int)isc, part.data_ptr(), rs.data_ptr(),
                             reinterpret_cast<unsigned*>(ctr.data_ptr<int>()), err.data_ptr<int>(), (int)nob,
                             at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(e == 0, "gdb_run: inst ", inst, " CUDA error ", e, " ", cudaGetErrorString((cudaError_t)(e < 0 ? 1 : e)));
@@ -420,7 +482,7 @@ def _bnd_call(state, e, x, stream, rdt, tokens, mode):
     if (e["proj"], tokens, mode) not in _BND["seen"]:
         _BND["seen"].add((e["proj"], tokens, mode))
         print(f"[bnd] first call {e['proj']} T={tokens} mode {mode} ({e['desc']})", flush=True)
-    if mode == 1:
+    if mode in (1, 3):   # 3: rider stopped after the partial words (cost split)
         ob, nso, rto = (v[:tokens] for v in e["scr"])
         if e["r"]["slice"]:
             zb = state.get("v12_zbuf")
@@ -430,8 +492,8 @@ def _bnd_call(state, e, x, stream, rdt, tokens, mode):
         else:
             branch = torch.empty((tokens, e["r"]["N"]), dtype=torch.bfloat16, device=dev)
             ldo = e["r"]["N"]
-        _bnd_run(e, x, stream, ob, nso, rto if (e["proj"] == "o" and tokens <= ROUTER_FP32_MAX_TOKENS) else e["e"], branch, ldo, 0,
-                 tokens)
+        _bnd_run(e, x, stream, ob, nso, rto if (e["proj"] == "o" and tokens <= ROUTER_FP32_MAX_TOKENS) else e["e"], branch, ldo,
+                 0 if mode == 1 else 2, tokens)
         return ("rider", branch)
     out = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=dev)
     ns = torch.empty((tokens, HIDDEN), dtype=torch.float32, device=dev)
@@ -537,8 +599,8 @@ def _bnd_prepare(state, t0):
             continue
         T = r["T"]
         e = {"proj": proj, "inst": ids[key], "r": r, "w": wts[proj], "desc": desc, "e": torch.empty(0, device=dev),
-             "part": torch.zeros((T * (1024 + 32) * 4,), dtype=torch.float32, device=dev),
-             "rs": torch.zeros((T * 2,), dtype=torch.float32, device=dev),
+             "part": torch.zeros((T * 1056 * 4,), dtype=torch.int64, device=dev),
+             "rs": torch.zeros((T * 2,), dtype=torch.int64, device=dev),
              "ctr": torch.zeros((2,), dtype=torch.int32, device=dev), "err": torch.zeros((1,), dtype=torch.int32, device=dev),
              "scr": (torch.empty((T, HIDDEN), dtype=torch.bfloat16, device=dev), torch.empty((T, HIDDEN), dtype=torch.float32, device=dev),
                      torch.empty((T, HIDDEN), dtype=torch.float32, device=dev))}
@@ -565,6 +627,7 @@ def bnd(t, unp, o):
     c = sub(c, TPL_OLD, TPL_NEW, what="kernel template")
     c = sub(c, SMEM_OLD, SMEM_NEW, what="smem")
     c = sub(c, EPI_OLD, EPI_NEW, what="epilogue")
+    c = sub(c, PRE_OLD, PRE_NEW, what="prefetch")
     c = sub(c, "template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int CAT = 0>\n",
             "template <int OUT, int MT, int WR, int WK, int KU, int ST, int S, int MB, int XP, int CAT = 0, int BND = 0>\n", 2,
             what="launch / info templates")
