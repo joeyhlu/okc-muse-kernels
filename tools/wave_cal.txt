@@ -1,0 +1,4 @@
+muse_decode_layer kernels/lab/k3_gc_7_cal1.py
+muse_decode_layer kernels/lab/k3_gc_16_cal1.py
+muse_decode_layer kernels/lab/k3_gc_7_cal2.py
+muse_decode_layer kernels/lab/k3_gc_16_cal2.py
