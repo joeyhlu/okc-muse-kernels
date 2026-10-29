@@ -10,6 +10,7 @@ writes them to scratch, one grid barrier (one-wave grid -> co-resident; bounded 
 (xor trees per 256-column block, block pairs per rank, 16 ranks in order) -> bitwise with today's sbb / SGLang boundary.
 Phase 1: every CTA reduces every token; phase 2: CTA t reduces token t, then a flag counter. The sliced unpooler (T <= 8, 1024
 GEMV columns over 64 CTAs) also owns the 28 residual-only 256-column blocks (CTA b < 28 -> block 4 + b).
+Status: KILLED at step 0 (R-bnd-0 / 0b, notes/lab.md 2026-10-29); round-3 L2 discard + NaN-poison self-test built, never run.
 Modes per bucket at call time: BND_UNP / BND_O {bucket: 0 off, 1 rider (fused outputs to scratch, today's boundary kept), 2 fused,
 3 rider stopped after the partial words}. Round 2 (R-bnd-0b): no grid barrier: partials are (epoch << 32 | f32) words polled
 directly (epoch = per-launch ticket taken before the GEMV), stream / weights cp.async'd before the GEMV main loop.
@@ -176,6 +177,17 @@ EPI_NEW = r'''  if constexpr (S == 1) {
             if (!all && itr > (1u << 20)) {
               if (lane == 0 && A.berr) atomicExch(A.berr, 1);
               break;
+            }
+          }
+          if (BPH == 2 && all) {   // the reducer is the only reader: drop the dead partial lines (no write-back)
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+              const int un = base + u * NW;
+              if (un < nun && un < nsp && lane < 8) {
+                const char* dp = reinterpret_cast<const char*>(A.bpart + ((size_t)bx * 1056 + un * 32) * 4) + lane * 128;
+                asm volatile("discard.global.L2 [%0], 128;
+" :: "l"(dp) : "memory");
+              }
             }
           }
 #pragma unroll
@@ -549,6 +561,8 @@ def _bnd_selftest(state, e, which, b, dev):
             if br is None:
                 return False, "GD route call failed", False
             ref = _v9_bnd(which, stream, br, rdt, state, T)
+            e["part"].fill_(0x7FC00000)   # NaN-poisoned scratch (epoch 0): stale / discarded words must never be accepted
+            e["rs"].fill_(0x7FC00000)
             got = [_bnd_call(state, e, x, stream, rdt, T, 2) for _ in range(2)]
             rid = _bnd_call(state, e, x, stream, rdt, T, 1)
             torch.cuda.synchronize()
