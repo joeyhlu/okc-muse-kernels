@@ -35,8 +35,8 @@ def check_w2_layout(w, pos=None):
     for _ in range(4000):
         gr, s, lane = rng.randrange(256), rng.randrange(256), rng.randrange(32)
         g, t = lane >> 2, lane & 3
-        word = int.from_bytes(bytes(pk[gr, s, 4 * lane:4 * lane + 4].tolist()), "little")
-        sc = pk[gr, s, 128 + 2 * g:128 + 2 * g + 2].tolist()
+        word = int.from_bytes(bytes(pk[gr // 64, s, gr % 64, 4 * lane:4 * lane + 4].tolist()), "little")
+        sc = pk[gr // 64, s, gr % 64, 128 + 2 * g:128 + 2 * g + 2].tolist()
         for r in range(4):
             row = 16 * gr + g + (8 if r & 1 else 0)
             for h in range(2):
