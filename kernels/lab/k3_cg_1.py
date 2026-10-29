@@ -12113,7 +12113,7 @@ ATT1_PW = {('full', 1): True}
 ATT1_TRIG = {}
 ATT1_COMB_NW = 0
 CG_COMB_TRIG = True   # R-cg-1 (1): full-B1 combine triggers o after its wait, gate load first
-CG_PRO_PH = True   # R-cg-1 (2): FA4/VFA prologue reads positions / cos_sin / cache_loc before gdc_wait
+CG_PRO_PH = False   # R-cg-1 (2): FA4/VFA prologue reads positions / cos_sin / cache_loc before gdc_wait
 _k1fa4_compiled = {}
 _k1fa4_rope = {}
 
