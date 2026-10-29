@@ -58,6 +58,8 @@ bd = tempfile.mkdtemp(prefix="gddc_")
 fns = ["gd_run", "gd_info", "gd_unpack", "gdr_run", "gdr_info", "gdc_run", "gd_unpack_cat"]
 if "gd_marks" in mod.GD_CPP_SRC:
     fns += ["gd_marks", "gd_marks_log"]
+if "void gdb_run(" in mod.GD_CPP_SRC:   # BND (tools/gen_k3_bnd.py)
+    fns += ["gdb_run"]
 load_inline(name="gddc", cpp_sources=mod.GD_CPP_SRC, cuda_sources=cuda, functions=fns, build_directory=bd,
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", "-Xptxas=-warn-spills"] + (["-Xptxas=-v"] if os.environ.get("GDDC_V") else []),
             verbose=bool(os.environ.get("GDDC_V")))
