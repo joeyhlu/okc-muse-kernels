@@ -157,7 +157,7 @@ def apply(t, pex=0, h16=False, pvs=False, pp=False, vsm=False, lab=True):
              "  const uint32_t vst_a = vst + ((g >= 4) ? 64u : 0u), vst_b = vst + ((g >= 4) ? 0u : 64u);" + NL
              + f"  constexpr bool VSM = {vsc};" + NL
              + "  const uint32_t vslot = sa(smem) + off_adr<ST>() + (uint32_t)tid * 16u;" + NL
-             + '  if (VSM) asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(vslot), "r"(vld0), "r"(vst_a), "r"(vsel_a), "r"(0u) : "memory");' + NL,
+             + '  if (VSM) asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(vslot), "r"(vld0), "r"(vst_a), "r"(vsel_a), "r"(vsel_b) : "memory");' + NL,
              "vfa vst_a")
     old_vt = """          const uint32_t vsrc = vld0 + (uint32_t)(st_c * STAGE_BYTES);
           const uint32_t da = vst_a + (uint32_t)(buf * VT_BYTES), db = vst_b + (uint32_t)(buf * VT_BYTES);
@@ -171,11 +171,11 @@ def apply(t, pex=0, h16=False, pvs=False, pp=False, vsm=False, lab=True):
             sts32(db + 1024 * (2 * u + 1), prmt(r[2], r[3], vsel_b));
           }
 """
-    new_vt = """          if constexpr (VSM) {   // FA16-VSM: constants from this thread's smem slot (db = da ^ 64, selector b = a ^ 0x1311)
+    new_vt = """          if constexpr (VSM) {   // FA16-VSM: constants from this thread's smem slot (db = da ^ 64, selector b from the slot; the old a ^ 0x1311 was wrong, R-vfa2-1)
             uint32_t x0, x1, x2, x3;
             asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3) : "r"(vslot) : "memory");
             const uint32_t vsrc = x0 + (uint32_t)(st_c * STAGE_BYTES);
-            const uint32_t da = x1 + (uint32_t)(buf * VT_BYTES), db = da ^ 64u, sA = x2, sB = x2 ^ 0x1311u;
+            const uint32_t da = x1 + (uint32_t)(buf * VT_BYTES), db = da ^ 64u, sA = x2, sB = x3;
 #pragma unroll
             for (int u = 0; u < 2; ++u) {
               uint32_t r[4];
