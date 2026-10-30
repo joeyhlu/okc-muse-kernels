@@ -15,7 +15,7 @@
                  checks attention out, ffn out and the final stream bitwise against the module pair, else MIDR stays off.
                  Rider R7a (discard o_out) is skipped: MIDR reads o_out again in the ffn boundary.
 
-  python -I tools/midr_patches.py [--base=kernels/lab/k3_sfx_2.py] [--out=k3_midr_1] [--dry]
+  python -I tools/midr_patches.py [--base=kernels/lab/k3_sfx_2.py] [--out=k3_midr_1] [--dry] [--allow-oversize]
 """
 import hashlib
 import pathlib
@@ -187,7 +187,11 @@ def main():
         raise SystemExit("[midr_patches] line 2 is not a nonce line")
     t = patch(b, disc="--disc" in sys.argv)
     t = t.replace(bn, f"# nonce {outn.replace('_', '-')} ({base.stem} + MIDR; tools/midr_patches.py)", 1)
-    assert t.isascii() and len(t.encode()) < 1_000_000, len(t.encode())
+    assert t.isascii(), "non-ascii"
+    if len(t.encode()) >= 1_000_000:   # rider3 (991.5 KB) + MIDR = ~1,005 KB: lab A/B only until ~5.2 KB is cut from the layer
+        if "--allow-oversize" not in sys.argv:
+            raise SystemExit(f"[midr_patches] {len(t.encode())} B >= 1,000,000 (judge limit); --allow-oversize for a LAB-ONLY build")
+        print(f"[midr_patches] WARNING: {len(t.encode())} B >= 1,000,000: LAB-ONLY, not submittable", flush=True)
     assert max(len(x) for x in t.split(NL)) <= max(len(x) for x in b.split(NL))
     assert len(re.findall(r"importlib|sys\.modules", t)) == len(re.findall(r"importlib|sys\.modules", b))
     with tempfile.TemporaryDirectory() as td:
