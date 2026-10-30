@@ -28,8 +28,9 @@ STRIP = ("-DVM_WG5", "-DVM_CREG", "-DVM_PREG", "-DVM_JN", "-DVM_XSN", "-DVM_NX")
 PLDEF = {"pl3": ["-DVM_JN=64", "-DVM_XSN=64", "-DVM_NX=3", "-DVM_NSW=3"],
          "pl2": ["-DVM_JN=128", "-DVM_XSN=128", "-DVM_NX=2", "-DVM_NSW=2"]}
 W112DEF = ["-DVM_CREG=120", "-DVM_JN=112", "-DVM_XSN=112", "-DVM_NX=2"]   # producer WG kept: 512 x 120 + 128 x 32 = 65536
-KERNELS = {"w72": [(8, 0), (8, 1), (32, 0), (32, 1), (64, 0), (64, 1)],   # (N, V): V 0 inc, 1 lean
-           "w112": [(64, 0), (112, 0)], "pl3": [(8, 1), (32, 1), (64, 1)], "pl2": [(64, 1), (128, 1)]}
+KERNELS = {"w72": [(8, 0), (32, 0), (40, 0), (48, 0), (56, 0), (72, 0)],   # (N, V): V 0 inc, 1 lean
+           "w112": [(8, 0), (32, 0), (56, 0), (80, 0), (96, 0), (112, 0)],
+           "pl3": [(8, 1), (32, 1), (64, 1)], "pl2": [(64, 1), (128, 1)]}   # pl: R-w128-1 (KILL), kept for the record
 
 VPL_DEV = r"""
 namespace vm {
@@ -222,7 +223,7 @@ def gate_main(argv):
     out = pathlib.Path(argv[0])
     out.mkdir(parents=True, exist_ok=True)
     bad = 0
-    for b in ("w72", "w112", "pl3", "pl2"):
+    for b in (argv[1].split(",") if len(argv) > 1 else ("w72", "w112", "pl3", "pl2")):
         dev, host, _, defs, _ = module_src(b)
         dev = V.strip_inc(dev)
         if b in ("w72", "w112"):
@@ -273,7 +274,10 @@ def run_main(argv):
 
     log = lambda s: print(s, flush=True)  # noqa: E731
     rounds, K, warm_set = int(DRP.arg(argv, "rounds", 9)), int(DRP.arg(argv, "units", 3)), int(DRP.arg(argv, "warm-set", 8))
-    builds = str(DRP.arg(argv, "builds", "w72,w112,pl3,pl2")).split(",")
+    builds = str(DRP.arg(argv, "builds", "w72,w112")).split(",")
+    only_n = {int(v) for v in str(DRP.arg(argv, "ntoks", "0")).split(",")} - {0}
+    modes = tuple(str(DRP.arg(argv, "modes", "cold,warm")).split(","))
+    one = bool(int(DRP.arg(argv, "one", 0)))   # 1: one call per arm + sync, no timing (compute-sanitizer runs)
     out_p = ROOT / str(DRP.arg(argv, "out", "box_out/w128/run.json"))
     out_p.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -326,9 +330,9 @@ def run_main(argv):
         return s.elapsed_time(e) * 1e3
 
     res = {"G": G, "overhead_us": ov, "rounds": rounds, "stages_per_cta": nst, "attrs": {str(k): v for k, v in attrs.items()}, "rows": []}
-    for N in sorted({n for b in builds for n, _ in KERNELS[b]}):
+    for N in sorted({n for b in builds for n, _ in KERNELS[b] if not only_n or n in only_n}):
         arms = [(b, v) for b in builds for n, v in KERNELS[b] if n == N]
-        for mode in ("cold", "warm"):
+        for mode in modes:
             P = DRP.plan(N, mode, G, K, warm_set, xsrc, dev)
             npad = P["npad"]
             outs = {a: torch.full((P["n"], 512, npad), float("nan"), dtype=torch.float32, device=dev) for a in arms}
@@ -341,6 +345,13 @@ def run_main(argv):
                 e, U = P["units"][i]
                 W = DRP.dequant_rows64(w["w13"][e], w["w13_sf"][e], w["w13_gs"][e], perm[512 * U:512 * U + 512])
                 refs[i] = W @ xsrc[torch.as_tensor(P["toks"][e], dtype=torch.long, device=dev)].double().T
+            if one:
+                for a in arms:
+                    err.zero_()
+                    runs[a[0]](ws13, gsc13, P["xp"], P["unit"], P["cta"], outs[a], err, nomark, npad, G, a[1], 0, 0)
+                    torch.cuda.synchronize()
+                    log(f"[w128] one N{N} {mode} {a}: err {int(err[0])}")
+                continue
             chk = {}
             a0 = arms[0]
             for a in arms:
@@ -401,6 +412,12 @@ def run_main(argv):
     for mode in ("cold", "warm"):
         log(f"[w128] SUMMARY {mode} ns / stage / token: " + " ".join(f"N{r['N']} " + ",".join(f"{k} {1e3 * v / r['N']:.1f}" for k, v in
             r["us_per_stage"].items()) for r in res["rows"] if r["mode"] == mode))
+    for mode in modes:   # one w112 pass of n tokens vs the VML's even split into two w72 jobs of n / 2 (rounded up to 8)
+        u = {(r["N"], k): v for r in res["rows"] if r["mode"] == mode for k, v in r["us_per_stage"].items()}
+        log(f"[w128] SUMMARY {mode} us / stage: " + " ".join(
+            f"n{n} w112i {u[(n, 'w112i')]:.3f} vs 2 x w72i N{h} {2 * u[(h, 'w72i')]:.3f} ({u[(n, 'w112i')] - 2 * u[(h, 'w72i')]:+.3f})"
+            for n, h in ((80, 40), (96, 48), (112, 56)) if (n, 'w112i') in u and (h, 'w72i') in u) + " | same N w112i - w72i: " + " ".join(
+            f"N{n} {u[(n, 'w112i')] - u[(n, 'w72i')]:+.3f}" for n in (8, 32, 56) if (n, 'w112i') in u and (n, 'w72i') in u))
     log("[w128] SUMMARY us / stage-equivalent (N 128 stage / 2 vs N 64):")
     for mode in ("cold", "warm"):
         r64 = next((r for r in res["rows"] if r["N"] == 64 and r["mode"] == mode), None)
@@ -415,4 +432,4 @@ def run_main(argv):
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    sys.exit(gate_main(sys.argv[2:]) if cmd == "gate" else run_main(sys.argv[2:]))
+    sys.exit(gate_main(sys.argv[2:]) if cmd == "gate" else run_main(sys.argv[2:]))   # run [--one=1] for sanitizer passes
