@@ -7,6 +7,10 @@ included, are unchanged); (2) every decorated def re-parses from its own source 
 Triton re-read it (inspect.getblock + textwrap.dedent): an AST-identical edit can still break source-reading decorators
 (the removed --reindent left column-0 continuation lines inside @cute.kernel defs -> FA4 compile failed silently -> FA3
 fallback at v1f / v16s / v32s, +15-20 us; b26 / b27, R-ax1-4). Refuses to overwrite an existing output.
+License / provenance notices are never dropped (R-slim-1): every contiguous comment block with a line matching
+slim_patches.LIC_RE (Copyright / License / SPDX / Apache / BSD / MIT / 'Redistribution and use' / 'derived from' /
+'Permission is hereby granted' / NOTICE) is kept verbatim, and gate (3) checks that each such block of the input is present
+in the output byte-for-byte (the FlashAttention-4 BSD-3-Clause notice was dropped before this).
 """
 import ast
 import inspect
@@ -15,6 +19,9 @@ import pathlib
 import sys
 import textwrap
 import tokenize
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # python -I has no script dir on sys.path
+from slim_patches import license_missing, py_license_blocks  # noqa: E402
 
 
 def decorated_sources(t):
@@ -46,11 +53,13 @@ def main():
     t = src.read_text(encoding="utf-8")
     lines = t.splitlines(keepends=True)
     drop, cut = set(), {}
+    lic = py_license_blocks(t)
+    lic_rows = {r for a, b, _ in lic for r in range(a, b + 1)}
     for tok in tokenize.generate_tokens(io.StringIO(t).readline):
         if tok.type != tokenize.COMMENT:
             continue
         r, c = tok.start
-        if r <= keep:
+        if r <= keep or r in lic_rows:
             continue
         if lines[r - 1][:c].strip() == "":
             drop.add(r)
@@ -63,6 +72,9 @@ def main():
     out = "".join(ln for i, ln in enumerate(lines, 1) if i not in drop)
     if ast.dump(ast.parse(t)) != ast.dump(ast.parse(out)):
         sys.exit("[pyslim] AST changed; abort")
+    lost = license_missing(lic, [out])
+    if lost:
+        sys.exit(f"[pyslim] license gate FAIL: {len(lost)} notice block(s) not preserved byte-for-byte, first: {lost[0][:80]!r}; abort")
     d0, d1 = decorated_sources(t), decorated_sources(out)
     bad = [s for s in d1 if s.startswith("UNPARSABLE")]
     if d0 != d1 or bad:
@@ -70,7 +82,8 @@ def main():
     dst.write_text(out, encoding="utf-8", newline="")
     print(f"[pyslim] {src} -> {dst}: {len(t.encode())} -> {len(out.encode())} B (-{len(t.encode()) - len(out.encode())}), "
           f"{len(drop)} comment lines dropped, {len(cut)} trailing comments cut, AST identical, "
-          f"{len(d1)} decorated defs re-parse identically")
+          f"{len(d1)} decorated defs re-parse identically, {len(lic)} license notice blocks kept "
+          f"({sum(len(x[2].encode()) + 1 for x in lic)} B verbatim)")
 
 
 if __name__ == "__main__":

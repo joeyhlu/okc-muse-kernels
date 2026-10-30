@@ -13,9 +13,15 @@ Removes only text that cannot change what runs (no compression, plain top-level 
   b  top-level defs / pure constant assignments that nothing references (names, attributes, identifier-like strings
      < 300 chars, so getattr / globals().get dispatch counts), to a fixpoint from every non-def statement + the judge API.
   p  Python full-line comments, inline comments and blank lines outside strings (lines 1..keep untouched).
-Gates (abort, nothing written, on any failure): 'd' leaves every CUDA constant's C token stream unchanged (comments
-dropped, whitespace-insensitive except directive line ends); constants with __LINE__ / __FILE__ / assert( / R"( / #line
-are not touched; the Python AST equals the base's with only the removed defs gone and the slimmed constants' values
+License / provenance notices are NEVER stripped (R-slim-1): every contiguous comment block (Python '#' lines, CUDA '//' lines
+or '/* */') with a line matching LIC_RE (Copyright / License / SPDX / Apache / BSD / MIT / 'Redistribution and use' /
+'derived from' / 'Permission is hereby granted' / NOTICE) stays byte-for-byte, in d and p; an 'a' edit or a 'b' removal that
+would drop such a block is skipped for that constant / def. The FlashAttention-4 (BSD-3-Clause) notice in the b29 file had been
+dropped by p before R-slim-1.
+Gates (abort, nothing written, on any failure): the license gate (every license block of the input is present in the
+output byte-for-byte: Python blocks on the file text, CUDA blocks on the CUDA constants); 'd' leaves every CUDA constant's
+C token stream unchanged (comments dropped, whitespace-insensitive except directive line ends); constants with __LINE__ /
+__FILE__ / assert( / R"( / #line are not touched; the Python AST equals the base's with only the removed defs gone and the slimmed constants' values
 swapped; every anchor keeps its count in every constant; ascii. The SASS gate (tools/local/slim_sass.py, WSL) captures
 the sources the file hands to load_inline at runtime, base vs slim, and compiles them ('a' is proven there).
 Measured on k3_b24_v (997,861 B): -70,064 B (d -63,220, a -205, b -751, p -5,888); idempotent.
@@ -35,6 +41,97 @@ PUNCT = sorted("""<<= >>= ... -> ++ -- << >> <= >= == != && || :: ## += -= *= /=
                ->*""".split(), key=len, reverse=True)
 TOKRE = re.compile(r'(?:L|u8|u|U)?"(?:\\.|[^"\\\n])*"|(?:L|u8|u|U)?\'(?:\\.|[^\'\\\n])*\'|\.?\d(?:[eEpP][+-]|[\w.])*|'
                    r"[A-Za-z_]\w*|" + "|".join(re.escape(p) for p in PUNCT) + r"|\S")
+
+# License / provenance text (R-slim-1). MIT and NOTICE are upper-case only (words 'mit' / 'notice' occur in plain comments).
+LIC_RE = re.compile(r"(?i:copyright|licen[sc]e|spdx|apache|\bbsd\b|redistribution and use|derived from|"
+                    r"permission is hereby granted)|\bMIT\b|\bNOTICE\b")
+
+
+def count_overlap(hay, needle):
+    n, k = 0, hay.find(needle)
+    while k >= 0:
+        n += 1
+        k = hay.find(needle, k + 1)
+    return n
+
+
+def py_license_blocks(t):
+    """[(first_row, last_row, text)] (1-based rows) for every Python comment block that carries license / provenance text:
+    a run of consecutive full-line '#' comments with a matching line (the whole run), or a trailing comment that matches
+    (its physical line). text = the physical lines joined by newlines, i.e. the bytes that must survive."""
+    lines = t.split("\n")
+    full, inline = {}, {}
+    for tok in tokenize.generate_tokens(io.StringIO(t).readline):
+        if tok.type == tokenize.COMMENT:
+            r, c = tok.start
+            (full if not lines[r - 1][:c].strip() else inline)[r] = tok.string
+    blocks = []
+    rows = sorted(full)
+    i = 0
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[j + 1] == rows[j] + 1:
+            j += 1
+        if any(LIC_RE.search(full[r]) for r in rows[i:j + 1]):
+            blocks.append((rows[i], rows[j]))
+        i = j + 1
+    blocks += [(r, r) for r, s in inline.items() if LIC_RE.search(s)]
+    return [(a, b, "\n".join(lines[a - 1:b])) for a, b in sorted(blocks)]
+
+
+def c_license_blocks(v):
+    """[(first_line, last_line, text)] (0-based lines) for every CUDA comment block of the constant value `v` that carries
+    license / provenance text: a run of consecutive full-line comments ('//' lines, '/* */' spans; a continued '//' comment
+    included) with a matching line, or a comment trailing / followed by code that matches (its physical lines)."""
+    import bisect
+    lines = v.split("\n")
+    starts = [0]
+    for ln in lines:
+        starts.append(starts[-1] + len(ln) + 1)
+    n, i, spans = len(v), 0, []
+    while i < n:
+        c = v[i]
+        if c in "\"'":   # string / char literal (same rule as c_decomment)
+            j = i + 1
+            while j < n and v[j] != c and v[j] != "\n":
+                j += 2 if v[j] == "\\" else 1
+            i = j + 1
+        elif v.startswith("//", i):
+            j = v.find("\n", i)
+            j = n if j < 0 else j
+            while j < n and v[j - 1] == "\\":   # a backslash-newline continues the comment
+                k = v.find("\n", j + 1)
+                j = n if k < 0 else k
+            spans.append((i, j))
+            i = j
+        elif v.startswith("/*", i):
+            j = v.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            spans.append((i, j))
+            i = j
+        else:
+            i += 1
+    groups = []   # [first_line, last_line, [comment texts], pure?]
+    for a, b in spans:
+        l0, l1 = bisect.bisect_right(starts, a) - 1, bisect.bisect_right(starts, max(b - 1, a)) - 1
+        eol = v.find("\n", b)
+        pure = not v[starts[l0]:a].strip() and not v[b:n if eol < 0 else eol].strip()
+        if pure and groups and groups[-1][3] and groups[-1][1] + 1 == l0:
+            groups[-1][1] = l1
+            groups[-1][2].append(v[a:b])
+        else:
+            groups.append([l0, l1, [v[a:b]], pure])
+    return [(g[0], g[1], "\n".join(lines[g[0]:g[1] + 1])) for g in groups if any(LIC_RE.search(s) for s in g[2])]
+
+
+def license_missing(blocks, texts):
+    """Block texts (py_license_blocks / c_license_blocks of the input) that are not present, with their input multiplicity,
+    as whole lines in `texts` (each text wrapped in newlines). [] = every block preserved byte-for-byte."""
+    hay = "".join("\n" + x + "\n" for x in texts)
+    want = {}
+    for b in blocks:
+        want[b[2]] = want.get(b[2], 0) + 1
+    return [txt for txt, k in want.items() if count_overlap(hay, "\n" + txt + "\n") < k]
 
 
 # ---------------------------------------------------------------- C token streams (the SASS-neutrality proof on text)
@@ -275,6 +372,7 @@ def dead_defs(tree):
 # ---------------------------------------------------------------- p: Python comments / blank lines
 def strip_python(t, keep):
     lines = t.splitlines(keepends=True)
+    lic_rows = {r for a, b, _ in py_license_blocks(t) for r in range(a, b + 1)}   # R-slim-1: notices stay verbatim
     in_str = set()
     cut = {}   # row -> col of an inline comment
     code_rows = set()
@@ -289,7 +387,7 @@ def strip_python(t, keep):
             code_rows.update(range(r0, r1 + 1))
     out = []
     for r, ln in enumerate(lines, 1):
-        if r <= keep or r in in_str:
+        if r <= keep or r in in_str or r in lic_rows:
             out.append(ln)
             continue
         if r in cut:
@@ -393,14 +491,17 @@ def build(t, opts, log=print):
             fixed = fixed_macros(cur, dash_d, all_cuda)
             if fixed:
                 nv, nlines = drop_dead_ifs(cur, fixed)
-                if nlines and not literal_counts_ok(cur, nv, lits):
+                if nlines and license_missing(c_license_blocks(cur), [nv]):
+                    report.append((name, "a skipped: would drop a license notice"))
+                elif nlines and not literal_counts_ok(cur, nv, lits):
                     stats["a"] += len(cur.encode()) - len(nv.encode())
                     used = sorted(x for x in fixed if re.search(r"^\s*#\s*(el)?if\b.*\b%s\b" % x, cur, re.M))
                     report.append((name, f"a: -{nlines} lines, -{len(cur.encode()) - len(nv.encode())} B; fixed {used}"))
                     cur = nv
         after_ifs = cur
         if opts.cuda:
-            prot = set()
+            lic = {k for a, b, _ in c_license_blocks(cur) for k in range(a, b + 1)}   # R-slim-1: notices stay verbatim
+            prot = set(lic)
             for _ in range(4):
                 nv = strip_cuda(cur, prot)
                 moved = literal_counts_ok(cur, nv, lits)
@@ -413,8 +514,10 @@ def build(t, opts, log=print):
             if c_tokens(nv) != c_tokens(cur):
                 raise SystemExit(f"[slim] {name}: token stream changed by the comment strip; abort")
             stats["d"] += len(cur.encode()) - len(nv.encode())
-            if prot:
-                report.append((name, f"d: {len(prot)} anchor lines kept verbatim"))
+            if prot - lic:
+                report.append((name, f"d: {len(prot - lic)} anchor lines kept verbatim"))
+            if lic:
+                report.append((name, f"d: {len(lic)} license-notice lines kept verbatim"))
             cur = nv
         if cur != v:
             new_vals[name] = (n, quote, cur, after_ifs)
@@ -422,7 +525,17 @@ def build(t, opts, log=print):
     edits = []
     for name, (n, quote, nv, _) in new_vals.items():
         edits.append((n.lineno, n.end_lineno, f"{name} = {quote}{nv}{quote[-3:]}"))
-    dead_idx = dead_defs(tree) if opts.dead else []
+    lic_py = py_license_blocks(t)
+    lic_c = [b for n in cuda_nodes for b in c_license_blocks(n.value.value)]
+    dead_idx = []
+    for i in (dead_defs(tree) if opts.dead else []):
+        n = tree.body[i]
+        lo = min([d.lineno for d in getattr(n, "decorator_list", [])] + [n.lineno])
+        in_c = isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)             and bool(c_license_blocks(n.value.value))
+        if in_c or any(a <= n.end_lineno and lo <= b for a, b, _ in lic_py):
+            report.append((getattr(n, "name", None) or n.targets[0].id, "b kept: carries a license notice"))
+            continue
+        dead_idx.append(i)
     for i in dead_idx:
         n = tree.body[i]
         lo = min([d.lineno for d in getattr(n, "decorator_list", [])] + [n.lineno])
@@ -456,6 +569,13 @@ def build(t, opts, log=print):
                 raise SystemExit(f"[slim] token gate FAIL in {n.targets[0].id}")
     if not t2.isascii() and t.isascii():
         raise SystemExit("[slim] ascii gate FAIL")
+    out_c = [g.value.value for i, g in zip([i for i in range(len(tree.body)) if i not in set(dead_idx)], got.body)
+             if is_cuda_const(tree.body[i])]   # output values of the input's CUDA constants (the AST gate pins the pairing)
+    lost = license_missing(lic_py, [t2]) + license_missing(lic_c, out_c)
+    if lost:
+        raise SystemExit(f"[slim] license gate FAIL: {len(lost)} notice block(s) not preserved byte-for-byte, first: {lost[0][:80]!r}")
+    stats["lic"] = len(lic_py) + len(lic_c)
+    stats["lic_b"] = sum(len(b[2].encode()) + 1 for b in lic_py + lic_c)
     return t2, stats, report
 
 
@@ -485,7 +605,8 @@ def main():
     dst.write_text(t2, encoding="utf-8", newline="")
     print(f"[slim] {src} -> {dst}: {n0} -> {n1} B (-{n0 - n1}); by category: CUDA comments/whitespace d -{stats['d']}, "
           f"dead #if a -{stats['a']}, dead defs b -{stats['b']}, Python comments/blank p -{stats['p']}; gates ast / tokens / "
-          f"literals / ascii PASS; {'under' if n1 < LIMIT else 'OVER'} {LIMIT} B by {abs(LIMIT - n1)}")
+          f"literals / ascii / license PASS ({stats['lic']} notice blocks, {stats['lic_b']} B kept verbatim); "
+          f"{'under' if n1 < LIMIT else 'OVER'} {LIMIT} B by {abs(LIMIT - n1)}")
     return 0
 
 
