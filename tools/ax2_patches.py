@@ -67,6 +67,9 @@ KERN_OLD = "template <int ST>\n__global__ void __launch_bounds__(256, 2) va1_mai
 KERN_NEW = ("template <int ST, int VX = 0>\n__global__ void __launch_bounds__(256, 2) va1_main(const Params p) {\n"
             "  constexpr bool IX = (VX & 1) != 0, EP = (VX & 2) != 0, SK = (VX & 4) != 0;   // ax2\n"
             "  constexpr bool TX = (VX & 32) != 0, EP2 = (VX & 64) != 0;\n"
+            "  constexpr int PFT = (VX & 256) ? 8 : ((VX & 128) ? 4 : 0);\n"
+            "  constexpr int NWT = (VX & 512) ? 0 : ((VX & 1024) ? 1 : -1);\n"
+            "  constexpr bool LT = (VX & 2048) != 0;\n"
             "  constexpr bool TL = (VX & 16) != 0;\n"
             "  if constexpr (TL) { if (threadIdx.x == 0) ax_stamp(p, 0); }\n")
 
@@ -139,6 +142,45 @@ PROD_NEW = PROD_OLD + r"""    if constexpr (IX) {   // ax2 IX: indices from the 
         seg_next();
         for (int m = 0; m < AX_PD; ++m) fill(m);
       }
+      if constexpr (PFT > 0) {   // ax2 PF: PDL launch only, pre-wait: L2 bulk prefetch of this CTA's tiles [ST, ST + PFT) (old keys)
+        if (p.use_rope && ch == 0) {
+          int pb = bf - 1, px = 0, pnt = 0, pk0 = 0, pce = 0;
+          auto pnext = [&]() {
+            for (++pb; pb < B && sV[pb] < v1; ++pb) {
+              const int a0 = max(v0 - sV[pb], 0), a1 = min(v1 - sV[pb], sN[pb]), ae = min(a1, sN[pb] - 1);
+              if (a1 > a0 && ae > a0) { pk0 = a0; pce = ae; pnt = (ae - a0 + TILE - 1) / TILE; px = 0; return; }
+            }
+            pb = B;
+          };
+          pnext();
+          for (int t = 0; t < ST && pb < B; ++t) if (++px >= pnt) pnext();
+          int pgv[PFT][4], psv[PFT][4];
+#pragma unroll
+          for (int t = 0; t < PFT; ++t) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const int pos = pk0 + px * TILE + r0 + 16 * k;
+              psv[t][k] = pos;
+              pgv[t][k] = (pb < B && pos < pce) ? __ldg(p.page_table + (size_t)pb * p.pt_stride + (pos >> psh)) : -1;
+            }
+            if (pb < B && ++px >= pnt) pnext();
+          }
+#pragma unroll
+          for (int t = 0; t < PFT; ++t)
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+              if (pgv[t][k] >= 0) {
+                const size_t go = (size_t)((pgv[t][k] << psh) | (psv[t][k] & pm)) * rowB;
+#if __CUDA_ARCH__ >= 900
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" ::"l"(kc + go) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;\n" ::"l"(vc + go) : "memory");
+#else
+                asm volatile("prefetch.global.L2 [%0];\n" ::"l"(kc + go));
+                asm volatile("prefetch.global.L2 [%0];\n" ::"l"(vc + go));
+#endif
+              }
+        }
+      }   // PF end
       for (int b = bf; b < B && sV[b] < v1; ++b) {
         const int k0 = max(v0 - sV[b], 0), k1 = min(v1 - sV[b], sN[b]), cend = min(k1, sN[b] - 1);
         if (k1 <= k0 || cend <= k0) continue;
@@ -155,6 +197,11 @@ PROD_NEW = PROD_OLD + r"""    if constexpr (IX) {   // ax2 IX: indices from the 
             pg[k] = (pos < cend) ? ring[sb + (pos >> psh)] : -1;
           }
           asm volatile("{\n.reg .b64 s;\nmbarrier.arrive.shared.b64 s, [%0];\n}\n" ::"r"(va_sa(ifree + s)) : "memory");
+#if __CUDA_ARCH__ >= 900
+          if constexpr (NWT >= 0) {   // NW / W1 (lab): K/V of tile NWT and later only after the PDL wait (pre-wait gather capped)
+            if (n == NWT && p.use_rope) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+          }
+#endif
           const int st = n % ST;
           if (n >= ST) va_wait(empt + st, ((n / ST) - 1) & 1);
           uint8_t* stg = smem + st * STAGE_BYTES;
@@ -170,6 +217,9 @@ PROD_NEW = PROD_OLD + r"""    if constexpr (IX) {   // ax2 IX: indices from the 
           if (filler) fill(n + AX_PD);
         }
       }
+#if __CUDA_ARCH__ >= 900
+      if constexpr (LT) { if (p.use_rope) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }   // LT (lab): late trigger
+#endif
       asm volatile("cp.async.wait_all;\n" ::: "memory");
       return;
     }
@@ -489,9 +539,15 @@ def _notl(block):
     return "\n".join(ln for ln in block.split("\n") if "(TL)" not in ln and "bool TL" not in ln)
 
 
-def patch(src, vx, st, lab, reps, slim=False):
+def patch(src, vx, st, lab, reps, slim=False, extra=()):
     global CONSTS, SMEM_NEW, INIT_NEW, PROD_NEW, RED_NEW, CNT_NEW, PARAMS_NEW, FWD_NEW, KERN_NEW
+    live_vx, vx = vx, vx
+    for _st, _vx in extra:
+        vx |= _vx
     if slim:
+        PROD_NEW = _feature(PROD_NEW, vx & 384, "      if constexpr (PFT > 0) {", "      }   // PF end\n")
+        if not vx & 384:
+            KERN_NEW = KERN_NEW.replace("  constexpr int PFT = (VX & 256) ? 8 : ((VX & 128) ? 4 : 0);\n", "")
         KERN_NEW, PROD_NEW, CNT_NEW = _notl(KERN_NEW), _notl(PROD_NEW), _notl(CNT_NEW)
         i0, i1 = SMEM_NEW.find("__device__ __forceinline__ void ax_stamp"), SMEM_NEW.find("}\n", SMEM_NEW.find("= t;\n")) + 2
         SMEM_NEW = SMEM_NEW[:i0] + SMEM_NEW[i1:]
@@ -507,6 +563,12 @@ def patch(src, vx, st, lab, reps, slim=False):
                 raise SystemExit("[ax2_patches] fc block")
             INIT_NEW = INIT_NEW.replace(fc_old, "      const int fc = 32;\n")
             INIT_NEW = _feature(INIT_NEW, False, "#if __CUDA_ARCH__ >= 900\n      if constexpr (TX)", "#endif\n")
+        if not vx & 1536:   # no NW / W1
+            PROD_NEW = _feature(PROD_NEW, False, "#if __CUDA_ARCH__ >= 900\n          if constexpr (NWT >= 0) {", "#endif\n")
+            KERN_NEW = KERN_NEW.replace("  constexpr int NWT = (VX & 512) ? 0 : ((VX & 1024) ? 1 : -1);\n", "")
+        if not vx & 2048:   # no LT
+            PROD_NEW = _feature(PROD_NEW, False, "#if __CUDA_ARCH__ >= 900\n      if constexpr (LT)", "#endif\n")
+            KERN_NEW = KERN_NEW.replace("  constexpr bool LT = (VX & 2048) != 0;\n", "")
         if not vx & 64:   # no EP2: the ship gate load and fence
             RED_NEW = _feature(RED_NEW, False, "    uint4 ax_g = make_uint4(0u, 0u, 0u, 0u);\n", "8 * gu_));\n    }\n")
     s = src
@@ -526,6 +588,10 @@ def patch(src, vx, st, lab, reps, slim=False):
             break
     else:
         raise SystemExit("[ax2_patches] epilogue fence / counter anchor not found")
+    if not slim or vx & 2048:   # LT: the top-of-kernel trigger moves to the producer's end
+        s = _rep(s, '  if (p.use_rope) asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");   // use_rope = PDL: o proj may start\n',
+                 '  if (!LT && p.use_rope) asm volatile("griddepcontrol.launch_dependents;\\n" ::: "memory");   // use_rope = PDL: o proj may start\n',
+                 "VA1 trigger")
     ep2 = not slim or bool(vx & 64)
     if ep2:
         s = _rep(s, GATE_OLD, GATE_NEW if not slim else _strip(GATE_NEW), "EP2 gate")
@@ -554,7 +620,7 @@ def patch(src, vx, st, lab, reps, slim=False):
              "cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1::va1_main<ST, VX>, 256, k1::va_smem<ST, VX>())", "va_go occupancy")
     if s.count("k1::va1_main<ST>") or s.count("k1::va_smem<ST>()"):
         raise SystemExit("[ax2_patches] unpatched va_go reference left")
-    arms = list(lab) + ([(st, vx)] if vx else [])
+    arms = list(lab) + list(extra) + ([(st, live_vx)] if live_vx else [])
     # dispatch after va_go's definition (before k1_occupancy)
     s = _rep(s, "int64_t k1_occupancy(int64_t L, int64_t ST) {\n", dispatch_src(arms) + "int64_t k1_occupancy(int64_t L, int64_t ST) {\n",
              "dispatch before k1_occupancy")
@@ -572,7 +638,7 @@ def patch(src, vx, st, lab, reps, slim=False):
     if not slim:
         s = _rep(s, old_ret, old_ret.replace("    return out\n", "    if AX2_LAB:\n        _ax2_lab(qkv, data, cfg, G, max(1, int(VA1_SEGK if segk is None else segk)))\n    return out\n"),
                  "_va1_run lab hook")
-    blk = PY_SLIM.format(vx=vx, st=st) if slim else py_block(vx, st, lab, reps)
+    blk = PY_SLIM.format(vx=live_vx, st=st) if slim else py_block(live_vx, st, lab, reps)
     s = _rep(s, "\ndef _va1_try(qkv, data, cfg, state):\n", blk + "\ndef _va1_try(qkv, data, cfg, state):\n", "py block")
     ws_line = ("        _VA1_WS[str(dev)] = ws = (z(VA1_ROWS, 64), z(VA1_ROWS), _k1_inv_freq(0.0, dev),\n"
                "                                  torch.zeros(VA1_ROWS // 16, dtype=torch.int32, device=dev))\n")
@@ -594,7 +660,8 @@ def main():
     slim = ARGS.get("slim", "0" if lab else "1") == "1"
     if slim and lab:
         raise SystemExit("[ax2_patches] --slim has no lab arms")
-    s = patch(src, vx, st, lab, reps, slim)
+    extra = [tuple(int(x) for x in a.split(":")) for a in ARGS.get("extra", "").split(",") if a]   # ST:VX built, not live
+    s = patch(src, vx, st, lab, reps, slim, extra)
     lines = s.split("\n")
     for i in range(min(3, len(lines))):
         if lines[i].startswith("# nonce"):
