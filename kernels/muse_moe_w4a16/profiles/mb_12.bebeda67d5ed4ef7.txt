@@ -1,0 +1,54 @@
+okc run bebeda67d5ed4ef7 on muse_moe_w4a16
+submission  <repo>/kernels/muse_moe_w4a16/mb_12.py
+status      ok
+passed      true
+speedup     2.3016876668429944
+speedup_ci  [2.2671623518403496 2.336212981845639]
+score_us    5842.886588711676
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               79.71      28.08   2.839x      11.42  
+bs=16 load=decode 16 sharding=ep8                            189.79      94.69   2.004x      52.52  
+bs=32 load=decode 32 sharding=ep8                            206.10     124.10   1.661x      70.76  
+bs=8 load=verify 1 sharding=ep8                              142.26      64.85   2.194x      37.32  
+bs=128 load=verify 16 sharding=ep8                           462.34     182.08   2.539x     101.34  
+bs=256 load=verify 32 sharding=ep8                           615.81     218.01   2.825x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+vms::vms_kernel(vms::Params)                                      23.6 µs 100.0%      1
+total                                                             23.6 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+vms::vms_kernel(vms::Params)                                      79.6 µs 100.0%      1
+total                                                             79.6 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+vm::vm_main(vm::Args)                                            118.2 µs  96.7%      1
+vm::vm_fin(vm::Args)                                               4.1 µs   3.3%      1
+total                                                            122.3 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+vms::vms_kernel(vms::Params)                                      70.4 µs 100.0%      1
+total                                                             70.4 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+vm::vm_main(vm::Args)                                            154.2 µs  83.9%      1
+vm::vm_fin(vm::Args)                                              29.5 µs  16.1%      1
+total                                                            183.7 µs
+GPU busy (kernels overlap: PDL or streams)                       161.6 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+vm::vm_main(vm::Args)                                            209.7 µs  91.0%      1
+vm::vm_fin(vm::Args)                                              20.6 µs   9.0%      1
+total                                                            230.3 µs
+GPU busy (kernels overlap: PDL or streams)                       215.6 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
