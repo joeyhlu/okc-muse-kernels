@@ -295,6 +295,9 @@ def run_main(argv):
             attrs[(b, n, v)] = list(attr_fn(n, v, 0))
         log(f"[w128] built {b}; (regs, local B, smem, thr, NS, NX, XS) " + " ".join(f"N{n}V{v} {attrs[(b, n, v)]}" for n, v in KERNELS[b]))
     del srcs
+    if only_n and not any(n in only_n for b in builds for n, _ in KERNELS[b]):   # build-only pass (fills the extension cache)
+        log(f"[w128] build-only pass done ({time.time() - t0:.0f} s)")
+        return 0
     dev = "cuda"
     G = torch.cuda.get_device_properties(0).multi_processor_count
     prob = J.load_problem(ROOT / "problems/muse_moe_w4a16")
