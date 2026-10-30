@@ -25,6 +25,9 @@ NEW_RMAP = "if ((VM_FF || blockIdx.x == 0) && e < e1) A.rmap[e] = r;   // R-vff:
 OLD_MAIN = "__global__ void __launch_bounds__(NTH, 1) vm_main(const Args A) {\n"
 NEW_MAIN = r"""#if VM_FF
 static_assert(VM_BRED && VM_FTR && !VM_DP && NCW == 16, "VM_FF: BRED / FTR static-plan builds with 16 consumer warps");
+#ifndef VM_FF_LW
+#define VM_FF_LW 0   // 1 = norm weights reloaded per chunk (fewer live registers)
+#endif
 #ifndef VM_FF_NI
 #define VM_FF_NI 0   // 1 = ff_tail not inlined
 #endif
@@ -53,9 +56,11 @@ for (int j = g0 >> 8; j <= (g1 - 1) >> 8; ++j) red_release_add(doneB + j, min(g1
 }
 const int half = tid >> 8, ht = tid & 255, warp = ht >> 5, lane = tid & 31;
 FfS& F = *reinterpret_cast<FfS*>(smem + half * 512);
+#if !VM_FF_LW
 float4 w4[4];
 #pragma unroll
 for (int m = 0; m < 4; ++m) w4[m] = __ldg(reinterpret_cast<const float4*>(A.nw + 1024 * m + 4 * ht));
+#endif
 const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll 1
 for (;;) {
@@ -95,8 +100,13 @@ v[jj][m] = (r >= 0) ? __ldcg(reinterpret_cast<const float4*>(A.y + (size_t)r * K
 for (int jj = 0; jj < FF_CH; ++jj)
 #pragma unroll
 for (int m = 0; m < 4; ++m) {
-v[jj][m].x = bf16r(v[jj][m].x) * w4[m].x; v[jj][m].y = bf16r(v[jj][m].y) * w4[m].y;
-v[jj][m].z = bf16r(v[jj][m].z) * w4[m].z; v[jj][m].w = bf16r(v[jj][m].w) * w4[m].w;
+#if VM_FF_LW
+const float4 wm = __ldg(reinterpret_cast<const float4*>(A.nw + 1024 * m + 4 * ht));   // L1 hit after the first chunk
+#else
+const float4 wm = w4[m];
+#endif
+v[jj][m].x = bf16r(v[jj][m].x) * wm.x; v[jj][m].y = bf16r(v[jj][m].y) * wm.y;
+v[jj][m].z = bf16r(v[jj][m].z) * wm.z; v[jj][m].w = bf16r(v[jj][m].w) * wm.w;
 }
 float ss[FF_CH];
 #pragma unroll
