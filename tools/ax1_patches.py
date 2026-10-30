@@ -48,9 +48,13 @@ def slim_cuda(src):
     return "\n".join(out) + "\n"
 
 
-def plan(spec, ntiles_hint):
-    ct, st, nc = (int(x[2:]) for x in spec.split(":"))
-    return ct, st, nc
+def plan(spec, ntiles_hint):   # ct5:st3:nc8[:pf0:tg0:pw1] (tiles per split, ring, copies, L2 prefetch, trigger, pre-wait gather)
+    v = dict(pf=0, tg=0, pw=1)
+    out = []
+    for x in spec.split(":"):
+        k = x.rstrip("0123456789")
+        v[k] = int(x[len(k):])
+    return v["ct"], v["st"], v["nc"], v["pf"], v["tg"], v["pw"]
 
 
 def block(args):
@@ -70,6 +74,10 @@ def block(args):
         f"AX1_SPLITS = {{1: {-(-1251 // plans[1][0])}, 8: {-(-1251 // plans[8][0])}}}",
         f"AX1_ST = {{1: {plans[1][1]}, 8: {plans[8][1]}}}",
         f"AX1_NC = {{1: {plans[1][2]}, 8: {plans[8][2]}}}",
+        f"AX1_PF = {{1: {plans[1][3]}, 8: {plans[8][3]}}}",
+        f"AX1_TRIG = {{1: {plans[1][4]}, 8: 0}}",
+        f"AX1_PREW = {{1: {plans[1][5]}, 8: 1}}",
+        "AX1_L1 = None",
         "AX1_PDL = True",
         "AX1_TUNE = False",
         f"AX1_SELF_TEST = {SELF_TEST}",
@@ -206,7 +214,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="kernels/lab/k3_rider3_1.py")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--l1", default="ct5:st3:nc8")
+    ap.add_argument("--l1", default="ct4:st2:nc8:pf0:tg2:pw1")   # R-ax1-2/3: ring 2 (36 KB) + entry trigger (o GD co-resides), 313 CTAs: d1f -2.0 us in-layer
     ap.add_argument("--l8", default="ct5:st3:nc8")
     ap.add_argument("--route", default="1")   # q_len 8 is opt-in: board tune 0a7fa113 has it 0.35 us behind the FA4 chain
     ap.add_argument("--check", action="store_true")

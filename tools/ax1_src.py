@@ -22,7 +22,7 @@ AX1_CPP_SRC = r"""
 void ax1_forward(torch::Tensor qkv, torch::Tensor seqlens, torch::Tensor cloc, torch::Tensor pt, torch::Tensor kc,
                  torch::Tensor vc, torch::Tensor wo, torch::Tensor wl, torch::Tensor cnt, torch::Tensor out,
                  int64_t L, int64_t chunk, int64_t nsplit, int64_t nc, double sc2, double qks, double eps,
-                 int64_t st, int64_t pdl);
+                 int64_t st, int64_t pdl, int64_t pf, torch::Tensor prof, int64_t trig, int64_t prew);
 std::vector<int64_t> ax1_info(int64_t L, int64_t st);
 """
 
@@ -60,6 +60,10 @@ struct Params {
   float sc2;                  // sm_scale * log2(e)
   float qks;                  // qk_scale_factor
   float eps;
+  int pf;                     // 1: L2-prefetch the tail's lines early (workspace copy, ticket, gate rows)
+  int trig;                   // q_len 1: launch_dependents 0 after the main loop, 1 right after the wait, 2 at entry
+  int prew;                   // q_len 1: 1 = page indices / K,V copies issued before griddepcontrol.wait, 0 = after it
+  long long* prof;            // lab: [grid][8] %globaltimer stamps (nullptr in normal runs)
 };
 
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -105,6 +109,9 @@ __device__ __forceinline__ int atom_acqrel(int* a, int v) {
   asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n" : "=r"(old) : "l"(a), "r"(v) : "memory");
   return old;
 }
+__device__ __forceinline__ void pfl2(const void* a) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a)); }
+__device__ __forceinline__ long long gtime() { long long v; asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(v)); return v; }
+#define AX1P(k) do { if (p.prof != nullptr && threadIdx.x == 0) p.prof[(size_t)blockIdx.x * 8 + (k)] = gtime(); } while (0)
 __device__ __forceinline__ void pdl_wait() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;\n" ::: "memory");
@@ -146,6 +153,9 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
   const int s = blockIdx.x;
   const int start = s * p.chunk, end = min(p.W, start + p.chunk);
   const int ntiles = (end - start + TILE - 1) / TILE;
+  AX1P(0);
+  if (p.trig == 2) pdl_go();   // the next kernel (o GEMV) may launch and prefetch its weights during this one
+  if (!p.prew) pdl_wait();     // (no gather before the predecessor is done: no bandwidth contention with it)
 
   auto issue_idx = [&](int y) {
     if (tid < TILE && y < ntiles) {
@@ -161,8 +171,14 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
 #pragma unroll
   for (int y = ST - 1; y < 2 * ST - 2; ++y) issue_idx(y);
   cpc();
+  if (p.pf && warp == 1) {   // the tail's lines (this CTA's workspace copy, its l, the ticket) toward L2: no cold red / atomic
+    const int cpy = s & (p.nc - 1);
+    pfl2(p.wo + ((size_t)cpy * 16) * 64 + lane * 32);
+    if (lane == 0) { pfl2(p.wl + cpy * 16); pfl2(p.cnt); }
+  }
   cpw<1>();
   __syncthreads();
+  AX1P(1);
   const int seq = misc[0] - 1;                 // cached keys; position seq is the block's new key
   const int kend = min(end, seq + 1);          // keys this split attends
   const int cend = min(end, seq);              // cached keys this split reads
@@ -198,6 +214,8 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
   }
 
   pdl_wait();   // qkv is the preceding kernel's output: nothing above reads it
+  if (p.trig == 1) pdl_go();
+  if (p.pf && warp == 2 && lane < 16) pfl2(p.qkv + (HQ + 2 * HKV) * 64 + lane * 64);   // gate rows (for the last CTA)
   // ---- query: thread -> head tid >> 3, dims 8 (tid & 7) .. + 7: bf16(rms(q) * qk_scale) * sm_scale * log2e in f16
   {
     const int r = tid >> 3, c8 = (tid & 7) * 8;
@@ -267,6 +285,7 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
   for (int n = 0; n < 8; ++n) { o[n][0] = 0.f; o[n][1] = 0.f; o[n][2] = 0.f; o[n][3] = 0.f; }
   float m = ninf(), l = 0.f;
   const int vrow = 8 * ((lane >> 3) & 1) + (lane & 7);   // ldmatrix row of this lane (key within a 16-key step)
+  AX1P(2);
   const int vch = hk * 4 + (lane >> 4);                   // + 2 cc: chunk of this lane's matrix
 
 #pragma unroll 1
@@ -337,7 +356,8 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
       }
     }
   }
-  pdl_go();
+  AX1P(3);
+  if (p.trig == 0) pdl_go();
   l += __shfl_xor_sync(FULL, l, 1);
   l += __shfl_xor_sync(FULL, l, 2);
   cpw<0>();
@@ -370,6 +390,7 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
   __syncthreads();
   if (tid == 0) misc[1] = (atom_acqrel(p.cnt, 1) == p.nsplit - 1) ? 1 : 0;
   __syncthreads();
+  AX1P(4);
   if (misc[1] == 0) return;
   // ---- last CTA: sum the copies, normalize, bf16, RMSNorm * sigmoid(gate), store; zero the workspace
   const uint4 graw = __ldcg(reinterpret_cast<const uint4*>(p.qkv + (HQ + 2 * HKV) * 64 + r * 64 + 8 * part));
@@ -420,6 +441,7 @@ __global__ void __launch_bounds__(NTHR, 2) fb1_l1(const __grid_constant__ Params
   }
   *reinterpret_cast<uint4*>(p.out + r * 64 + 8 * part) = ov;
   if (tid == 0) p.cnt[0] = 0;
+  AX1P(5);
 }
 
 // ======================= q_len 8: FP8 wgmma (sm_90a; the core of our FX-S kernel, kernels/lab/fxs_src.py) =======================
@@ -498,6 +520,9 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
   const int s = blockIdx.x;
   const int start = s * p.chunk, end = min(p.W, start + p.chunk);
   const int ntiles = (end - start + TILE - 1) / TILE;
+  const int rpc = (128 + p.nsplit - 1) / p.nsplit;
+  const int rlo = min(128, s * rpc), rhi = min(128, rlo + rpc);   // output rows this CTA finalizes
+  AX1P(0);
 
   auto issue_idx = [&](int y) {
     if (tid < TILE && y < ntiles) {
@@ -512,8 +537,14 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
 #pragma unroll
   for (int y = ST - 1; y < 2 * ST - 2; ++y) issue_idx(y);
   cpc();
+  if (p.pf && s < p.nc) {   // copy s's lines (32 KB + l) toward L2 by CTA s; CTA 0 the counters
+    pfl2(p.wo + ((size_t)s * 128) * 64 + tid * 32);
+    if (tid < 4) pfl2(p.wl + s * 128 + tid * 32);
+    if (s == 0 && tid == 4) pfl2(p.cnt + 4);
+  }
   cpw<1>();
   __syncthreads();
+  AX1P(1);
   const int seq = misc[0] - L;                 // cached keys; positions seq .. seq + 7 are the block's new keys
   const int kend = min(end, seq + L);
   const int cend = min(end, seq);
@@ -553,6 +584,7 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
   pdl_wait();
   // the barrier epoch AFTER the wait: a back-to-back (PDL) launch of this kernel must see the previous one's bump
   const int ep = (tid == 0) ? __ldcg(p.cnt + 6) : 0;
+  if (p.pf && tid < rhi - rlo) pfl2(p.qkv + (size_t)((rlo + tid) >> 4) * p.sq + (HQ + 2 * HKV) * 64 + ((rlo + tid) & 15) * 64);
   {   // warp = token: q RMSNorm -> bf16 -> e4m3 (the FA4 prologue's rounding); new K (RMSNorm) / V -> e4m3
     const int jt = warp;
     const __nv_bfloat16* xr = p.qkv + (size_t)jt * p.sq;
@@ -625,37 +657,52 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
   const uint32_t vst_a = vst + ((g >= 4) ? 64u : 0u), vst_b = vst + ((g >= 4) ? 0u : 64u);
   const int lim0 = seq + 2 * w, lim1 = lim0 + 1;   // key pos visible to row g / g + 8 iff pos <= lim
 
-#pragma unroll 1
-  for (int i = 0; i < ntiles; ++i) {
-    const int st = i % ST, buf = i & 1;
+  // ---- software pipeline: QK(i + 1) and V^T(i + 1) are issued while PV(i) runs (one acquire per tile, in order)
+  auto acquire = [&](int j) {   // tile j landed (all threads); the next copies go into the stage tile j - 1 freed
     cpw<ST - 2>();
     fpa();
     __syncthreads();
-    if (i + ST - 1 < ntiles) issue_kv(i + ST - 1, true);
-    issue_idx(i + 2 * ST - 2);
+    if (j + ST - 1 < ntiles) issue_kv(j + ST - 1, true);
+    issue_idx(j + 2 * ST - 2);
     cpc();
-    float sc[32];
-    const uint32_t kl = klo + (uint32_t)(st * (TB >> 4));
+  };
+  float sc[32];
+  auto qk_issue = [&](int j) {
+    const uint32_t kl = klo + (uint32_t)((j % ST) * (TB >> 4));
     wgf();
     wg_qk(sc, HI64 | qlo, HI128 | kl, 0);
     wg_qk(sc, HI64 | (qlo + 2u), HI128 | (kl + 2u), 1);
     wgc();
-    {   // this tile's V (head h) -> key-permuted V^T (buffer buf) while QK runs
-      const uint32_t vsrc = vld0 + (uint32_t)(st * TB);
-      const uint32_t da = vst_a + (uint32_t)(buf * VTB), db = vst_b + (uint32_t)(buf * VTB);
+  };
+  auto vt_build = [&](int j) {   // tile j's V (head h) -> key-permuted V^T, buffer j & 1
+    const uint32_t vsrc = vld0 + (uint32_t)((j % ST) * TB);
+    const uint32_t da = vst_a + (uint32_t)((j & 1) * VTB), db = vst_b + (uint32_t)((j & 1) * VTB);
 #pragma unroll
-      for (int u = 0; u < 2; ++u) {
-        uint32_t r[4];
-        ldsm4t(r, u ? (vsrc ^ 32u) : vsrc);
-        sts32(da + 1024 * (2 * u), __byte_perm(r[0], r[1], vsel_a));
-        sts32(db + 1024 * (2 * u), __byte_perm(r[0], r[1], vsel_b));
-        sts32(da + 1024 * (2 * u + 1), __byte_perm(r[2], r[3], vsel_a));
-        sts32(db + 1024 * (2 * u + 1), __byte_perm(r[2], r[3], vsel_b));
-      }
+    for (int u = 0; u < 2; ++u) {
+      uint32_t r[4];
+      ldsm4t(r, u ? (vsrc ^ 32u) : vsrc);
+      sts32(da + 1024 * (2 * u), __byte_perm(r[0], r[1], vsel_a));
+      sts32(db + 1024 * (2 * u), __byte_perm(r[0], r[1], vsel_b));
+      sts32(da + 1024 * (2 * u + 1), __byte_perm(r[2], r[3], vsel_a));
+      sts32(db + 1024 * (2 * u + 1), __byte_perm(r[2], r[3], vsel_b));
     }
-    wgw0();
+  };
+  uint32_t pa[2][4] = {{0u, 0u, 0u, 0u}, {0u, 0u, 0u, 0u}};
+  AX1P(2);
+  if (ntiles > 0) {
+    acquire(0);
+    qk_issue(0);
+    vt_build(0);
+  }
+#pragma unroll 1
+  for (int i = 0; i < ntiles; ++i) {
+    wgw0();   // QK(i) and (committed before it) PV(i - 1) done
 #pragma unroll
     for (int e = 0; e < 32; ++e) AX1_RF(sc[e]);
+#pragma unroll
+    for (int e = 0; e < 36; ++e) AX1_RF(acc[e]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) AX1_RR(pa[e >> 2][e & 3]);   // (PV(i - 1)'s A registers stay reserved until here)
     const int t0 = start + i * TILE;
     if (t0 + TILE - 1 > lim0) {   // tiles reaching the block's own keys (or past the range): causal mask
 #pragma unroll
@@ -683,7 +730,6 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
     for (int t = 0; t < 9; ++t) { acc[4 * t] *= a0; acc[4 * t + 1] *= a0; acc[4 * t + 2] *= a1; acc[4 * t + 3] *= a1; }
     cr0 = n0; cr1 = n1;
     const float u0 = (n0 == ninf()) ? 0.f : n0, u1 = (n1 == ninf()) ? 0.f : n1;
-    uint32_t pa[2][4];
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk) {   // P = e4m3(2^(s ssc - u)) of keys 32 kk .. +31, in the PV A-fragment (key-permuted) order
       const float* sv = sc + 16 * kk;
@@ -696,17 +742,25 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
     for (int e = 0; e < 36; ++e) AX1_RF(acc[e]);
 #pragma unroll
     for (int e = 0; e < 8; ++e) AX1_RR(pa[e >> 2][e & 3]);
-    fpa();                    // V^T (st.shared) -> async proxy
-    barn(1 + h, 128);         // all 4 warps' V^T rows written
-    const uint32_t vl = vtlo + (uint32_t)(buf * (VTB >> 4));
+    fpa();                    // V^T(i) (st.shared) -> async proxy
+    barn(1 + h, 128);         // all 4 warps' V^T(i) rows written
+    const uint32_t vl = vtlo + (uint32_t)((i & 1) * (VTB >> 4));
     wgf();
     wg_pv(acc, pa[0], HI64 | vl);
     wg_pv(acc, pa[1], HI64 | (vl + 2u));
     wgc();
-    wgw0();
-#pragma unroll
-    for (int e = 0; e < 36; ++e) AX1_RF(acc[e]);
+    if (i + 1 < ntiles) {     // meanwhile: the next tile's copies, QK and V^T (buffer (i + 1) & 1: PV(i - 1) done above)
+      acquire(i + 1);
+      qk_issue(i + 1);
+      vt_build(i + 1);
+    }
   }
+  wgw0();
+#pragma unroll
+  for (int e = 0; e < 36; ++e) AX1_RF(acc[e]);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) AX1_RR(pa[e >> 2][e & 3]);
+  AX1P(3);
   pdl_go();
   {   // o 2^off, l 2^off -> copy s % nc (lanes tig, tig ^ 1 swap so each lane adds 4 consecutive dims)
     const int cp = s & (p.nc - 1);
@@ -732,8 +786,6 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
       red1(p.wl + cp * 128 + R1, acc[34] * f1);
     }
   }
-  const int rpc = (128 + p.nsplit - 1) / p.nsplit;
-  const int rlo = min(128, s * rpc), rhi = min(128, rlo + rpc);
   __syncthreads();
   if (tid == 0) {
     int* c = p.cnt + 4 + (ep & 1);
@@ -755,6 +807,7 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
     misc[1] = go && (rlo < rhi);
   }
   __syncthreads();
+  AX1P(4);
   if (!misc[1]) return;
   const int part = tid & 7;
   for (int rb = rlo; rb < rhi; rb += NTH8 / 8) {
@@ -808,6 +861,7 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
     }
     if (act) *reinterpret_cast<uint4*>(p.out + (size_t)j * (HQ * 64) + hh * 64 + 8 * part) = ov;
   }
+  AX1P(5);
 #endif
 }
 
@@ -885,7 +939,7 @@ static std::vector<int64_t> info1() {
 void ax1_forward(torch::Tensor qkv, torch::Tensor seqlens, torch::Tensor cloc, torch::Tensor pt, torch::Tensor kc,
                  torch::Tensor vc, torch::Tensor wo, torch::Tensor wl, torch::Tensor cnt, torch::Tensor out,
                  int64_t L, int64_t chunk, int64_t nsplit, int64_t nc, double sc2, double qks, double eps,
-                 int64_t st, int64_t pdl) {
+                 int64_t st, int64_t pdl, int64_t pf, torch::Tensor prof, int64_t trig, int64_t prew) {
   TORCH_CHECK(L == 1 || L == 8, "ax1: q_len 1 / 8");
   TORCH_CHECK(qkv.size(0) == L, "ax1: batch 1");
   TORCH_CHECK(chunk % 64 == 0 && chunk > 0 && nsplit > 0 && nc > 0 && nc <= 8 && (nc & (nc - 1)) == 0, "ax1: plan");
@@ -909,6 +963,11 @@ void ax1_forward(torch::Tensor qkv, torch::Tensor seqlens, torch::Tensor cloc, t
   P.sc2 = (float)sc2;
   P.qks = (float)qks;
   P.eps = (float)eps;
+  P.pf = (int)pf;
+  P.trig = (int)trig;
+  P.prew = (int)prew;
+  TORCH_CHECK(prof.numel() == 0 || prof.numel() >= nsplit * 8, "ax1: stamp buffer");
+  P.prof = prof.numel() ? reinterpret_cast<long long*>(prof.data_ptr<int64_t>()) : nullptr;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (L == 1 && st == 2) ax1::launch1<2>(P, pdl != 0, stream);
   else if (L == 1 && st == 3) ax1::launch1<3>(P, pdl != 0, stream);
@@ -930,6 +989,10 @@ AX1_SPLITS = {1: 252, 8: 252}         # target CTAs (2 / SM at 132 SMs, 21/22 he
 AX1_NC = {1: 8, 8: 8}                 # workspace copies
 AX1_ST = {1: 3, 8: 3}                 # cp.async ring stages
 AX1_PDL = True
+AX1_PF = {1: 0, 8: 0}                 # L2 prefetch of the tail's lines (workspace copy, ticket, gate rows)
+AX1_TRIG = {1: 0, 8: 0}               # q_len 1: launch_dependents after the loop (0) / after the wait (1) / at entry (2)
+AX1_PREW = {1: 1, 8: 1}               # q_len 1: indices + first K/V copies before griddepcontrol.wait (1) or after (0)
+AX1_L1 = None                         # q_len 1 plan override [ct, st, nc, pf, trig, prew] (A/B harness: one module global)
 AX1_SELF_TEST = ((1, 3000, 701, False, 0), (1, 80000, 702, True, 0), (1, 10, 703, False, 0), (1, 1, 704, False, 0),
                  (1, 64, 705, False, 0), (1, 127, 706, False, 37), (1, 20000, 707, False, 300), (1, 200000, 708, False, 0),
                  (8, 3000, 711, False, 0), (8, 80000, 712, True, 0), (8, 10, 713, False, 0), (8, 1, 714, False, 0),
@@ -967,17 +1030,23 @@ def _ax1_plan(width, ns):
     return chunk, -(-width // chunk)
 
 
-def _ax1_call(qkv, data, cfg, ns=None, nc=None, st=None, pdl=None):
+def _ax1_call(qkv, data, cfg, ns=None, nc=None, st=None, pdl=None, pf=None, prof=None, trig=None, prew=None):
     L = cfg["q_len"]
     dev = qkv.device
     wo, wl, cnt = _ax1_ws(dev)
     pt = data["page_table"]
+    if L == 1 and AX1_L1 is not None and ns is None:
+        ct, st, nc, pf, trig, prew = (int(v) for v in AX1_L1)
+        ns = -(-((pt.shape[1] + 63) // 64) // ct)
     chunk, nsplit = _ax1_plan(pt.shape[1], ns or AX1_SPLITS[L])
     out = torch.empty((L, 16 * 64), dtype=torch.bfloat16, device=dev)
     _AX1["mod"].ax1_forward(qkv, data["cache_seqlens"], data["cache_loc"], pt, data["k_cache"].view(torch.uint8),
                             data["v_cache"].view(torch.uint8), wo, wl, cnt, out, L, chunk, nsplit, int(nc or AX1_NC[L]),
                             float(cfg["sm_scale"] * 1.4426950408889634), float(cfg["qk_scale_factor"]), 1e-5,
-                            int(st or AX1_ST[L]), 1 if (AX1_PDL if pdl is None else pdl) else 0)
+                            int(st or AX1_ST[L]), 1 if (AX1_PDL if pdl is None else pdl) else 0,
+                            int(AX1_PF[L] if pf is None else pf),
+                            prof if prof is not None else torch.empty(0, dtype=torch.int64, device=dev),
+                            int(AX1_TRIG[L] if trig is None else trig), int(AX1_PREW[L] if prew is None else prew))
     return out
 
 
@@ -1074,9 +1143,10 @@ def _ax1_self_test(dev, verbose=True, only=None):
 
 
 AX1_TUNE = True                       # prepare-time plan pick on a synthetic scored-shape input (A23)
-AX1_TUNE_CT = {1: (3, 4, 5, 6, 8), 8: (5, 6, 7, 8, 10)}   # tiles per split
-AX1_TUNE_ST = {1: (2, 3, 4), 8: (3, 4)}   # ring depth: in flight per CTA = (ST - 1) x 16 KB
-AX1_TUNE_NC = {1: (4, 8), 8: (8,)}
+AX1_TUNE_ARMS = {   # (tiles per split, ring stages: (ST - 1) x 16 KB in flight per CTA, copies, L2 prefetch)
+    1: ((3, 2, 8, 0), (3, 2, 8, 1), (4, 3, 8, 0), (4, 3, 8, 1), (4, 3, 4, 1), (5, 3, 8, 0), (5, 3, 8, 1), (6, 3, 8, 1)),
+    8: ((5, 3, 8, 0), (5, 3, 8, 1), (5, 4, 8, 0), (5, 4, 8, 1), (6, 3, 8, 1), (8, 3, 8, 1), (10, 3, 8, 1)),
+}
 AX1_TUNE_CTX = 80000
 AX1_TUNE_ROUNDS = 25
 
@@ -1089,17 +1159,13 @@ def _ax1_tune(state, dev, L):
     x = d["qkv"].view(L, -1)
     tiles = (d["page_table"].shape[1] + 63) // 64
     cands = {}
-    occ = {st: int(_AX1["mod"].ax1_info(L, st)[3]) for st in AX1_TUNE_ST[L]}
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    for ct in AX1_TUNE_CT[L]:
-        for st in AX1_TUNE_ST[L]:
-            ns = -(-tiles // ct)
-            if ns > occ[st] * sms and (L == 8 or ns > 2 * occ[st] * sms):   # (q_len 8: resident grid; q_len 1: <= 2 waves)
-                continue
-            for nc in AX1_TUNE_NC[L]:
-                if nc != AX1_NC[L] and st != 3:
-                    continue
-                cands[f"ax1 ct{ct} st{st} nc{nc}"] = (lambda ns=ns, st=st, nc=nc: _ax1_call(x, d, d["config"], ns=ns, st=st, nc=nc))
+    for ct, st, nc, pf in AX1_TUNE_ARMS[L]:
+        ns = -(-tiles // ct)
+        if L == 8 and ns > int(_AX1["mod"].ax1_info(L, st)[3]) * sms:   # (q_len 8: the grid must be resident)
+            continue
+        cands[f"ax1 ct{ct} st{st} nc{nc} pf{pf}"] = (lambda ns=ns, st=st, nc=nc, pf=pf:
+                                                     _ax1_call(x, d, d["config"], ns=ns, st=st, nc=nc, pf=pf))
     if state.get("fa4v6") and K1FA4_STATE.get("ready"):
         cands["fa4 chain"] = lambda: _v18_fa4_core(x, d)
     graphs = {}
@@ -1125,16 +1191,45 @@ def _ax1_tune(state, dev, L):
     med = {n: sorted(v)[len(v) // 2] for n, v in ts.items()}
     del graphs, flush
     best = min((n for n in med if n.startswith("ax1")), key=lambda n: med[n])
-    ct, st, nc = (int(w[2:]) for w in best.split()[1:])
+    ct, st, nc, pf = (int(w[2:]) for w in best.split()[1:])
     AX1_SPLITS[L] = -(-tiles // ct)
     AX1_ST[L] = st
     AX1_NC[L] = nc
+    AX1_PF[L] = pf
     if "fa4 chain" in med and med["fa4 chain"] < med[best]:
         AX1_ROUTE[L] = False
     print(f"[ax1] tune L{L} ctx{AX1_TUNE_CTX} (median us, raw replay incl. graph overhead): "
           + ", ".join(f"{n} {med[n]:.2f}" for n in sorted(med, key=lambda n: med[n]))
-          + f" -> {best} (splits {AX1_SPLITS[L]}, stages {st}, copies {nc}), route {'AX1' if AX1_ROUTE[L] else 'FA4 chain'}", flush=True)
+          + f" -> {best} (splits {AX1_SPLITS[L]}, stages {st}, copies {nc}, pf {pf}), route {'AX1' if AX1_ROUTE[L] else 'FA4 chain'}", flush=True)
     return med
+
+
+def _ax1_stamps(dev, L, reps=5):
+    """Per-phase %globaltimer stamps of the chosen plan on the scored shape (cold L2 before each call), us from the
+    earliest CTA entry: medians over reps of (min / p50 / max over CTAs) per stamp; the finalize-end stamp is the last
+    CTA's (q_len 1) or the finalizers' (q_len 8)."""
+    flush = torch.empty(64 << 20, dtype=torch.float32, device=dev).fill_(1.0)
+    d = _ax1_case(L, AX1_TUNE_CTX, 950 + L, False, 0, dev)
+    x = d["qkv"].view(L, -1)
+    _, nsplit = _ax1_plan(d["page_table"].shape[1], AX1_SPLITS[L])
+    names = ("entry", "seq", "loop0", "loopend", "ticket", "fin")
+    rows = []
+    for _ in range(reps):
+        prof = torch.zeros(nsplit * 8, dtype=torch.int64, device=dev)
+        flush.sum()
+        _ax1_call(x, d, d["config"], prof=prof)
+        torch.cuda.synchronize(dev)
+        st = prof.view(nsplit, 8)[:, :6].double()
+        base = st[:, 0].min()
+        q = []
+        for k in range(6):
+            v = st[:, k][st[:, k] > 0] - base
+            q.append((float(v.min()), float(v.median()), float(v.max())) if v.numel() else (0.0, 0.0, 0.0))
+        rows.append(q)
+    med = [[sorted(r[k][j] for r in rows)[len(rows) // 2] / 1000.0 for j in range(3)] for k in range(6)]
+    print(f"[ax1] stamps L{L} (splits {nsplit}, st {AX1_ST[L]}, nc {AX1_NC[L]}, pf {AX1_PF[L]}; us min / p50 / max over CTAs): "
+          + ", ".join(f"{n} {a:.2f}/{b:.2f}/{c:.2f}" for n, (a, b, c) in zip(names, med)), flush=True)
+    del flush
 
 
 def _ax1_prepare(state, t0):
@@ -1163,6 +1258,7 @@ def _ax1_prepare(state, t0):
             for L in sorted(k for k, v in AX1_ROUTE.items() if v):
                 try:
                     _ax1_tune(state, dev, L)
+                    _ax1_stamps(dev, L)
                 except Exception as ex:
                     print(f"[ax1] tune q_len {L} skipped: {ex!r}"[:600], flush=True)
         print(f"[ax1] LIVE: B = 1 full q_len {sorted(k for k, v in AX1_ROUTE.items() if v)}, splits {AX1_SPLITS}, copies {AX1_NC}, "
