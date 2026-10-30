@@ -486,6 +486,14 @@ __device__ __forceinline__ uint32_t pk4(float a, float b, float c, float d) {   
       : "=r"(r) : "f"(a), "f"(b), "f"(c), "f"(d));
   return r;
 }
+__device__ __forceinline__ uint32_t pk4h(float a, float b, float c, float d) {   // e4m3(2^a .. 2^d) via ex2.f16x2, a in the low byte
+  uint32_t r;
+  asm("{\n.reg .b32 h0, h1;\n.reg .b16 lo, hi;\ncvt.rn.f16x2.f32 h0, %2, %1;\ncvt.rn.f16x2.f32 h1, %4, %3;\n"
+      "ex2.approx.f16x2 h0, h0;\nex2.approx.f16x2 h1, h1;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 lo, h0;\ncvt.rn.satfinite.e4m3x2.f16x2 hi, h1;\nmov.b32 %0, {lo, hi};\n}\n"
+      : "=r"(r) : "f"(a), "f"(b), "f"(c), "f"(d));
+  return r;
+}
 #define AX1_RF(x) asm volatile("" : "+f"(x))
 #define AX1_RR(x) asm volatile("" : "+r"(x))
 #define AX1_D32(d) "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]),"+f"(d[4]),"+f"(d[5]),"+f"(d[6]),"+f"(d[7]),"+f"(d[8]),"+f"(d[9]),"+f"(d[10]),"+f"(d[11]),"+f"(d[12]),"+f"(d[13]),"+f"(d[14]),"+f"(d[15]),"+f"(d[16]),"+f"(d[17]),"+f"(d[18]),"+f"(d[19]),"+f"(d[20]),"+f"(d[21]),"+f"(d[22]),"+f"(d[23]),"+f"(d[24]),"+f"(d[25]),"+f"(d[26]),"+f"(d[27]),"+f"(d[28]),"+f"(d[29]),"+f"(d[30]),"+f"(d[31])
@@ -504,7 +512,7 @@ __device__ __forceinline__ void wg_pv(float (&d)[36], const uint32_t (&a)[4], ui
 }
 #endif
 
-template <int ST>
+template <int ST, bool EXH>
 __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params p) {
 #if AX1_SM90
   using Y = Lay8<ST>;
@@ -523,6 +531,7 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
   const int rpc = (128 + p.nsplit - 1) / p.nsplit;
   const int rlo = min(128, s * rpc), rhi = min(128, rlo + rpc);   // output rows this CTA finalizes
   AX1P(0);
+  if (p.trig == 2) pdl_go();   // the next kernel (o GEMV) may launch and prefetch during this one
 
   auto issue_idx = [&](int y) {
     if (tid < TILE && y < ntiles) {
@@ -537,6 +546,19 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
 #pragma unroll
   for (int y = ST - 1; y < 2 * ST - 2; ++y) issue_idx(y);
   cpc();
+  uint32_t qr[HQ], nr[4] = {0u, 0u, 0u, 0u};
+  auto load_q = [&]() {   // warp = token: 16 q heads + k0 k1 v0 v1 (one 4-B word per lane each)
+    const __nv_bfloat16* xr = p.qkv + (size_t)warp * p.sq;
+#pragma unroll
+    for (int hd = 0; hd < HQ; ++hd) qr[hd] = __ldcg(reinterpret_cast<const unsigned int*>(xr + hd * 64) + lane);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) nr[k] = __ldcg(reinterpret_cast<const unsigned int*>(xr + (HQ + k) * 64) + lane);
+  };
+  if (!p.prew) {
+    pdl_wait();
+    if (p.trig == 1) pdl_go();
+    load_q();
+  }
   if (p.pf && s < p.nc) {   // copy s's lines (32 KB + l) toward L2 by CTA s; CTA 0 the counters
     pfl2(p.wo + ((size_t)s * 128) * 64 + tid * 32);
     if (tid < 4) pfl2(p.wl + s * 128 + tid * 32);
@@ -581,22 +603,17 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
     *reinterpret_cast<uint4*>(sm + Y::OFF_VT + (tid >> 5) * VTB + 4096 + (tid & 31) * 16) =
         make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
 
-  pdl_wait();
+  if (p.prew) {
+    pdl_wait();
+    if (p.trig == 1) pdl_go();
+    load_q();
+  }
   // the barrier epoch AFTER the wait: a back-to-back (PDL) launch of this kernel must see the previous one's bump
   const int ep = (tid == 0) ? __ldcg(p.cnt + 6) : 0;
   if (p.pf && tid < rhi - rlo) pfl2(p.qkv + (size_t)((rlo + tid) >> 4) * p.sq + (HQ + 2 * HKV) * 64 + ((rlo + tid) & 15) * 64);
   {   // warp = token: q RMSNorm -> bf16 -> e4m3 (the FA4 prologue's rounding); new K (RMSNorm) / V -> e4m3
     const int jt = warp;
-    const __nv_bfloat16* xr = p.qkv + (size_t)jt * p.sq;
-    uint32_t qr[HQ];
-#pragma unroll
-    for (int hd = 0; hd < HQ; ++hd) qr[hd] = __ldcg(reinterpret_cast<const unsigned int*>(xr + hd * 64) + lane);
     const bool mine = seq + L > start && seq < end;   // this CTA holds some new key
-    uint32_t nr[4] = {0u, 0u, 0u, 0u};
-    if (mine) {
-#pragma unroll
-      for (int k = 0; k < 4; ++k) nr[k] = __ldcg(reinterpret_cast<const unsigned int*>(xr + (HQ + k) * 64) + lane);   // k0 k1 v0 v1
-    }
     const int c = lane >> 3, bo = (2 * lane) & 15;
 #pragma unroll
     for (int hd = 0; hd < HQ; ++hd) {
@@ -733,6 +750,13 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk) {   // P = e4m3(2^(s ssc - u)) of keys 32 kk .. +31, in the PV A-fragment (key-permuted) order
       const float* sv = sc + 16 * kk;
+      if constexpr (EXH) {   // (exponent rounded to f16 first: <= 2^-11 relative, far below e4m3's 2^-4)
+        pa[kk][0] = pk4h(fmaf(sv[0], ssc, -u0), fmaf(sv[1], ssc, -u0), fmaf(sv[4], ssc, -u0), fmaf(sv[5], ssc, -u0));
+        pa[kk][1] = pk4h(fmaf(sv[2], ssc, -u1), fmaf(sv[3], ssc, -u1), fmaf(sv[6], ssc, -u1), fmaf(sv[7], ssc, -u1));
+        pa[kk][2] = pk4h(fmaf(sv[8], ssc, -u0), fmaf(sv[9], ssc, -u0), fmaf(sv[12], ssc, -u0), fmaf(sv[13], ssc, -u0));
+        pa[kk][3] = pk4h(fmaf(sv[10], ssc, -u1), fmaf(sv[11], ssc, -u1), fmaf(sv[14], ssc, -u1), fmaf(sv[15], ssc, -u1));
+        continue;
+      }
       pa[kk][0] = pk4(ex2(fmaf(sv[0], ssc, -u0)), ex2(fmaf(sv[1], ssc, -u0)), ex2(fmaf(sv[4], ssc, -u0)), ex2(fmaf(sv[5], ssc, -u0)));
       pa[kk][1] = pk4(ex2(fmaf(sv[2], ssc, -u1)), ex2(fmaf(sv[3], ssc, -u1)), ex2(fmaf(sv[6], ssc, -u1)), ex2(fmaf(sv[7], ssc, -u1)));
       pa[kk][2] = pk4(ex2(fmaf(sv[8], ssc, -u0)), ex2(fmaf(sv[9], ssc, -u0)), ex2(fmaf(sv[12], ssc, -u0)), ex2(fmaf(sv[13], ssc, -u0)));
@@ -761,7 +785,7 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
 #pragma unroll
   for (int e = 0; e < 8; ++e) AX1_RR(pa[e >> 2][e & 3]);
   AX1P(3);
-  pdl_go();
+  if (p.trig == 0) pdl_go();
   {   // o 2^off, l 2^off -> copy s % nc (lanes tig, tig ^ 1 swap so each lane adds 4 consecutive dims)
     const int cp = s & (p.nc - 1);
     const int R0 = (2 * w) * 16 + 8 * h + g, R1 = R0 + 16;
@@ -865,14 +889,14 @@ __global__ void __launch_bounds__(NTH8, 2) fb1_l8(const __grid_constant__ Params
 #endif
 }
 
-template <int ST>
+template <int ST, bool EXH>
 static void launch8(const Params& P, bool pdl, cudaStream_t stream) {
   constexpr int SM = Lay8<ST>::SMEM;
   static int cap = 0;
   if (cap == 0) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(fb1_l8<ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(fb1_l8<ST, EXH>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
     int occ = 0, dev = 0, nsm = 0;
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fb1_l8<ST>, NTH8, SM));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fb1_l8<ST, EXH>, NTH8, SM));
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
     cap = occ * nsm;
@@ -888,17 +912,17 @@ static void launch8(const Params& P, bool pdl, cudaStream_t stream) {
   at[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = at;
   cfg.numAttrs = pdl ? 1 : 0;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fb1_l8<ST>, P));
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fb1_l8<ST, EXH>, P));
 }
 
-template <int ST>
+template <int ST, bool EXH>
 static std::vector<int64_t> info8() {
   constexpr int SM = Lay8<ST>::SMEM;
   cudaFuncAttributes fa;
-  C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, fb1_l8<ST>));
-  C10_CUDA_CHECK(cudaFuncSetAttribute(fb1_l8<ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, fb1_l8<ST, EXH>));
+  C10_CUDA_CHECK(cudaFuncSetAttribute(fb1_l8<ST, EXH>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
   int occ = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fb1_l8<ST>, NTH8, SM));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fb1_l8<ST, EXH>, NTH8, SM));
   return {(int64_t)fa.numRegs, (int64_t)fa.localSizeBytes, (int64_t)SM, (int64_t)occ};
 }
 
@@ -972,13 +996,18 @@ void ax1_forward(torch::Tensor qkv, torch::Tensor seqlens, torch::Tensor cloc, t
   if (L == 1 && st == 2) ax1::launch1<2>(P, pdl != 0, stream);
   else if (L == 1 && st == 3) ax1::launch1<3>(P, pdl != 0, stream);
   else if (L == 1 && st == 4) ax1::launch1<4>(P, pdl != 0, stream);
-  else if (L == 8 && st == 3) ax1::launch8<3>(P, pdl != 0, stream);
-  else if (L == 8 && st == 4) ax1::launch8<4>(P, pdl != 0, stream);
-  else TORCH_CHECK(false, "ax1: stages 3 / 4");
+  else if (L == 8 && st == 2) ax1::launch8<2, false>(P, pdl != 0, stream);
+  else if (L == 8 && st == 3) ax1::launch8<3, false>(P, pdl != 0, stream);
+  else if (L == 8 && st == 4) ax1::launch8<4, false>(P, pdl != 0, stream);
+  else if (L == 8 && st == 12) ax1::launch8<2, true>(P, pdl != 0, stream);
+  else if (L == 8 && st == 13) ax1::launch8<3, true>(P, pdl != 0, stream);
+  else if (L == 8 && st == 14) ax1::launch8<4, true>(P, pdl != 0, stream);
+  else TORCH_CHECK(false, "ax1: stages 2 / 3 / 4 (+ 10: q_len 8 f16x2 exponentials)");
 }
 
 std::vector<int64_t> ax1_info(int64_t L, int64_t st) {
-  if (L == 8) return st == 3 ? ax1::info8<3>() : ax1::info8<4>();
+  if (L == 8) return st == 2 ? ax1::info8<2, false>() : st == 3 ? ax1::info8<3, false>() : st == 4 ? ax1::info8<4, false>()
+                   : st == 12 ? ax1::info8<2, true>() : st == 13 ? ax1::info8<3, true>() : ax1::info8<4, true>();
   return st == 2 ? ax1::info1<2>() : st == 3 ? ax1::info1<3>() : ax1::info1<4>();
 }
 """
@@ -993,6 +1022,8 @@ AX1_PF = {1: 0, 8: 0}                 # L2 prefetch of the tail's lines (workspa
 AX1_TRIG = {1: 0, 8: 0}               # q_len 1: launch_dependents after the loop (0) / after the wait (1) / at entry (2)
 AX1_PREW = {1: 1, 8: 1}               # q_len 1: indices + first K/V copies before griddepcontrol.wait (1) or after (0)
 AX1_L1 = None                         # q_len 1 plan override [ct, st, nc, pf, trig, prew] (A/B harness: one module global)
+AX1_EXH = {1: 0, 8: 0}                # q_len 8: P exponentials as ex2.f16x2 (one MUFU op per 2 values)
+AX1_L8 = None                         # q_len 8 plan override [ct, st, nc, pf, trig, prew, exh]
 AX1_SELF_TEST = ((1, 3000, 701, False, 0), (1, 80000, 702, True, 0), (1, 10, 703, False, 0), (1, 1, 704, False, 0),
                  (1, 64, 705, False, 0), (1, 127, 706, False, 37), (1, 20000, 707, False, 300), (1, 200000, 708, False, 0),
                  (8, 3000, 711, False, 0), (8, 80000, 712, True, 0), (8, 10, 713, False, 0), (8, 1, 714, False, 0),
@@ -1035,15 +1066,19 @@ def _ax1_call(qkv, data, cfg, ns=None, nc=None, st=None, pdl=None, pf=None, prof
     dev = qkv.device
     wo, wl, cnt = _ax1_ws(dev)
     pt = data["page_table"]
+    exh = AX1_EXH[L]
     if L == 1 and AX1_L1 is not None and ns is None:
         ct, st, nc, pf, trig, prew = (int(v) for v in AX1_L1)
+        ns = -(-((pt.shape[1] + 63) // 64) // ct)
+    if L == 8 and AX1_L8 is not None and ns is None:
+        ct, st, nc, pf, trig, prew, exh = (int(v) for v in AX1_L8)
         ns = -(-((pt.shape[1] + 63) // 64) // ct)
     chunk, nsplit = _ax1_plan(pt.shape[1], ns or AX1_SPLITS[L])
     out = torch.empty((L, 16 * 64), dtype=torch.bfloat16, device=dev)
     _AX1["mod"].ax1_forward(qkv, data["cache_seqlens"], data["cache_loc"], pt, data["k_cache"].view(torch.uint8),
                             data["v_cache"].view(torch.uint8), wo, wl, cnt, out, L, chunk, nsplit, int(nc or AX1_NC[L]),
                             float(cfg["sm_scale"] * 1.4426950408889634), float(cfg["qk_scale_factor"]), 1e-5,
-                            int(st or AX1_ST[L]), 1 if (AX1_PDL if pdl is None else pdl) else 0,
+                            int(st or AX1_ST[L]) + (10 * int(exh) if L == 8 else 0), 1 if (AX1_PDL if pdl is None else pdl) else 0,
                             int(AX1_PF[L] if pf is None else pf),
                             prof if prof is not None else torch.empty(0, dtype=torch.int64, device=dev),
                             int(AX1_TRIG[L] if trig is None else trig), int(AX1_PREW[L] if prew is None else prew))
@@ -1242,7 +1277,7 @@ def _ax1_prepare(state, t0):
         if _PT1["errors"].get("ax1"):
             raise RuntimeError(f"build failed: {_PT1['errors']['ax1']}")
         mod = _ax1_build()
-        info = {(L, st): list(mod.ax1_info(L, st)) for L in (1, 8) for st in ((2, 3, 4) if L == 1 else (3, 4))}
+        info = {(L, st): list(mod.ax1_info(L, st)) for L in (1, 8) for st in ((2, 3, 4) if L == 1 else (2, 3, 4, 13))}
         worst = 0.0
         for L in sorted(k for k, v in AX1_ROUTE.items() if v):
             try:

@@ -186,8 +186,31 @@ def slim_layer(t):
     return t2
 
 
+def cute_sources_ok(t):
+    """CuTe DSL re-parses each @cute.kernel / @cute.jit function from inspect.getsource + textwrap.dedent: any
+    reformatting that leaves a less-indented line inside a decorated def (e.g. pyslim --reindent's column-0 parameter
+    lines) breaks the FA4 v6 compile -> FA3 fallback at v1f / v16s / v32s (+15-20 us; b26 / b27, R-ax1-4)."""
+    import inspect
+    import textwrap
+    lines = t.splitlines(True)
+    ok = bad = 0
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith("@cute.kernel") or s.startswith("@cute.jit"):
+            try:
+                ast.parse(textwrap.dedent("".join(inspect.getblock(lines[i:]))))
+                ok += 1
+            except SyntaxError:
+                bad += 1
+    return ok, bad
+
+
 def gate(t, cuda):
     ast.parse(t)
+    cok, cbad = cute_sources_ok(t)
+    print(f"[ax1_patches] CuTe DSL sources re-parse: {cok} ok, {cbad} FAIL")
+    if cbad:
+        return False
     n = len(t.encode())
     print(f"[ax1_patches] gates: ast ok, ascii {t.isascii()}, {n} B ({'OK' if n < LIMIT else 'OVER'} the {LIMIT} B cap by "
           f"{abs(LIMIT - n)} B)")
@@ -197,7 +220,7 @@ def gate(t, cuda):
         dev = dev.replace(inc, "")
     dev = dev.replace("C10_CUDA_CHECK(", "(").replace("TORCH_CHECK(", "(void)(")
     dev += "".join(f"\ntemplate __global__ void ax1::{k}<{s}>(const __grid_constant__ ax1::Params);"
-                   for k, s in (("fb1_l1", 2), ("fb1_l1", 3), ("fb1_l1", 4), ("fb1_l8", 3), ("fb1_l8", 4))) + "\n"
+                   for k, s in (("fb1_l1", 2), ("fb1_l1", 3), ("fb1_l1", 4), ("fb1_l8", "3, false"), ("fb1_l8", "3, true"), ("fb1_l8", "2, true"))) + "\n"
     tmp.write_text(dev, newline="\n")
     wsl = "<repo>/" + tmp.relative_to(ROOT).as_posix()
     r = subprocess.run(["wsl", "-d", "Ubuntu", "-u", "root", "--", "bash", "<repo>/tools/local/cudaenv.sh",
