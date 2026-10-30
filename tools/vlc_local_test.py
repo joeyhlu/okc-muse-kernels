@@ -3,7 +3,8 @@
   sm86=1: RTX 3070 (cp.async ring, NS 2): LC vs the base build on 14 routings x 3 calls (FP32-reference and vs-base tolerances as R-vaq: the ship's ss atomics are order-nondeterministic; err 0, generation
           counter ctr[0] == calls and arrivals ctr[1] == calls x G) and 6 changed-input CUDA-graph replays at T 1 / 8 / 16.
     MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root -- bash "<repo>/tools/local/cudaenv.sh" \
-        python "<repo>/tools/vlc_local_test.py" [sm90=1] [sm86=1] [src=mb_25]
+        python "<repo>/tools/vlc_local_test.py" [sm90=1] [sm86=1] [src=mb_25] [patch=vlc] [arms=LC=1,LC=1+FX=1]
+  (sm86 runs the first arm; this is a local test tool, never part of a submission)
 """
 import hashlib
 import pathlib
@@ -15,7 +16,7 @@ sys.path.insert(0, str(ROOT / "problems/muse_moe_w4a16"))
 sys.path.insert(0, str(ROOT / "kernels/lab"))
 sys.path.insert(0, str(ROOT / "tools"))
 import vaq_local_test as T  # noqa: E402
-import vlc_patches as P  # noqa: E402
+import importlib.util  # noqa: E402
 import vsh_patches as P0  # noqa: E402
 
 SHIP = ["-DVMS_NS=3", "-DVMS_RO=1"]
@@ -27,7 +28,11 @@ def main():
     q = "MB_LV_CUDA = r'''"
     a = s.index(q) + len(q)
     src0 = s[a:s.index("'''", a)]
+    spec = importlib.util.spec_from_file_location("vpatch", ROOT / f"tools/{opt.get('patch', 'vlc')}_patches.py")   # vlc | vhp | ...
+    P = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(P)
     src = P.apply(src0)
+    arms = [a.split('+') for a in opt.get('arms', 'LC=1,LC=1+FX=1').split(',')]   # each arm: '+'-joined NAME=VAL defines
     _, cpp = P0.layer_src(ROOT / "kernels/lab/k3_b23_1.py")
     ok = True
     if int(opt.get("sm90", 1)):
@@ -38,7 +43,8 @@ def main():
             ok &= same
             print(f"[vlc] sm_90a base: {' | '.join(ln0)}", flush=True)
             print(f"[vlc] sm_90a patched at defaults: SASS {'IDENTICAL' if same else 'DIFFERS'}", flush=True)
-            for nm, d in (("lc1", ["-DVMS_LC=1"]), ("lc1fx1", ["-DVMS_LC=1", "-DVMS_FX=1"])):
+            for d in ([f"-DVMS_{x}" for x in a] for a in arms):
+                nm = "".join(x[6:].replace("=", "") for x in d).lower()
                 rc, ln, b = T.sm90(src, SHIP + d, td, nm)
                 spill = [x for x in ln if "spill" in x]
                 good = rc == 0 and all(" 0 bytes spill stores" in x and " 0 bytes spill loads" in x for x in spill)
@@ -59,7 +65,7 @@ def main():
             tag = hashlib.sha1((sx + " ".join(fl)).encode()).hexdigest()[:10]
             return load_inline(name=f"{name}_{tag}", cpp_sources=cpp, cuda_sources=sx, functions=["run", "attrs"], extra_cuda_cflags=fl)
         m0 = build(src0, [], "vlc_b0")
-        m1 = build(src, ["-DVMS_LC=1"], "vlc_lc1")
+        m1 = build(src, [f"-DVMS_{x}" for x in arms[0]], "vlt_" + "".join(arms[0]).replace("=", "").lower())
         print(f"[vlc] sm_86 attrs base {list(m0.attrs())} lc1 {list(m1.attrs())}", flush=True)
         w = make_weights(dev)
         pk = V.prepack(w, log=lambda s_: None)
