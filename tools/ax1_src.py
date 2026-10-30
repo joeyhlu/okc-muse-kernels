@@ -1024,6 +1024,7 @@ AX1_PREW = {1: 1, 8: 1}               # q_len 1: indices + first K/V copies befo
 AX1_L1 = None                         # q_len 1 plan override [ct, st, nc, pf, trig, prew] (A/B harness: one module global)
 AX1_EXH = {1: 0, 8: 0}                # q_len 8: P exponentials as ex2.f16x2 (one MUFU op per 2 values)
 AX1_L8 = None                         # q_len 8 plan override [ct, st, nc, pf, trig, prew, exh]
+AX1_Q8 = None                         # q_len 8 route override (None: AX1_ROUTE[8])
 AX1_SELF_TEST = ((1, 3000, 701, False, 0), (1, 80000, 702, True, 0), (1, 10, 703, False, 0), (1, 1, 704, False, 0),
                  (1, 64, 705, False, 0), (1, 127, 706, False, 37), (1, 20000, 707, False, 300), (1, 200000, 708, False, 0),
                  (8, 3000, 711, False, 0), (8, 80000, 712, True, 0), (8, 10, 713, False, 0), (8, 1, 714, False, 0),
@@ -1086,7 +1087,10 @@ def _ax1_call(qkv, data, cfg, ns=None, nc=None, st=None, pdl=None, pf=None, prof
 
 
 def _ax1_wanted(qkv, data, cfg, state):
-    if not (AX1_ENABLE and state.get("ax1") and _AX1["mod"] is not None and AX1_ROUTE.get(cfg["q_len"])):
+    on = AX1_ROUTE.get(cfg["q_len"])
+    if cfg["q_len"] == 8 and AX1_Q8 is not None:   # (scalar A/B override: JSON variants cannot carry int dict keys)
+        on = on and AX1_Q8
+    if not (AX1_ENABLE and state.get("ax1") and _AX1["mod"] is not None and on):
         return False
     pt = data["page_table"]
     return (cfg["batch"] == 1 and not cfg["window"] and cfg["page_size"] == 1 and cfg["kv_scale"] == 1.0

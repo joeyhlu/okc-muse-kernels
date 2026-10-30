@@ -48,13 +48,14 @@ def slim_cuda(src):
     return "\n".join(out) + "\n"
 
 
-def plan(spec, ntiles_hint):   # ct5:st3:nc8[:pf0:tg0:pw1] (tiles per split, ring, copies, L2 prefetch, trigger, pre-wait gather)
-    v = dict(pf=0, tg=0, pw=1)
-    out = []
+def plan(spec, ntiles_hint):   # ct5:st3:nc8[:pf0:tg0:pw1:ex0] (tiles / split, ring, copies, L2 prefetch, trigger, pre-wait gather, f16x2 exps)
+    v = dict(pf=0, tg=0, pw=1, ex=0)
     for x in spec.split(":"):
         k = x.rstrip("0123456789")
+        if k not in ("ct", "st", "nc", "pf", "tg", "pw", "ex"):
+            sys.exit(f"[ax1_patches] plan key {k!r} in {spec!r}")
         v[k] = int(x[len(k):])
-    return v["ct"], v["st"], v["nc"], v["pf"], v["tg"], v["pw"]
+    return v["ct"], v["st"], v["nc"], v["pf"], v["tg"], v["pw"], v["ex"]
 
 
 def block(args):
@@ -75,9 +76,12 @@ def block(args):
         f"AX1_ST = {{1: {plans[1][1]}, 8: {plans[8][1]}}}",
         f"AX1_NC = {{1: {plans[1][2]}, 8: {plans[8][2]}}}",
         f"AX1_PF = {{1: {plans[1][3]}, 8: {plans[8][3]}}}",
-        f"AX1_TRIG = {{1: {plans[1][4]}, 8: 0}}",
-        f"AX1_PREW = {{1: {plans[1][5]}, 8: 1}}",
+        f"AX1_TRIG = {{1: {plans[1][4]}, 8: {plans[8][4]}}}",
+        f"AX1_PREW = {{1: {plans[1][5]}, 8: {plans[8][5]}}}",
+        f"AX1_EXH = {{1: 0, 8: {plans[8][6]}}}",
         "AX1_L1 = None",
+        "AX1_L8 = None",
+        "AX1_Q8 = None",
         "AX1_PDL = True",
         "AX1_TUNE = False",
         f"AX1_SELF_TEST = {SELF_TEST}",
@@ -93,6 +97,12 @@ def block(args):
     text = ("AX1_CPP_SRC = r\"\"\"" + ns["AX1_CPP_SRC"] + "\"\"\"\n\nAX1_CUDA_SRC = r\"\"\"\n" + cuda + "\"\"\"\n\n"
             + "\n".join(consts) + "\n\n\n" + "\n\n\n".join(py) + "\n\n\n")
     assert "AX1_TUNE:" not in text and "_ax1_tune" not in text
+    # static gate: every AX1_* / _AX1 global the block's functions read is defined by the block itself
+    defined = {c.split(" = ", 1)[0] for c in consts} | {"AX1_CPP_SRC", "AX1_CUDA_SRC"}
+    used = {n.id for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Name) and (n.id.startswith("AX1_") or n.id == "_AX1")}
+    missing = sorted(used - defined)
+    if missing:
+        sys.exit(f"[ax1_patches] block uses undefined globals {missing}")
     return text, cuda
 
 
