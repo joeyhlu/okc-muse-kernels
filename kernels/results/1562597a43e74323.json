@@ -1,0 +1,76 @@
+{
+ "board": "muse_moe_w4a16",
+ "call_id": "kc-1562597a43e74323",
+ "cluster": "sfo3",
+ "content_hash": "0deff05e8c6425448771380c07483a0c8f97f12661a2363bbe643c747d25f7f6",
+ "created_at": 1793384810.2712805,
+ "dedicated": false,
+ "duplicate_of": null,
+ "finished_at": 1793385744.4939358,
+ "id": "1562597a43e74323",
+ "mode": "check",
+ "output": {
+  "log": "<repo>/kernels/muse_moe_w4a16/profiles/mb_16.1562597a43e74323.log"
+ },
+ "payload_ref": "muse_moe_w4a16/0deff05e8c6425448771380c07483a0c8f97f12661a2363bbe643c747d25f7f6.py",
+ "result": {
+  "checks": {
+   "flagged": [],
+   "ok": true,
+   "rejected": []
+  },
+  "error": null,
+  "evaluator": {
+   "code_sha256": "afcead6a6ff090aa50fe9bc907f0fa8f4ba73d95fa92af93ec260b5e8ff00f00",
+   "files": {
+    "challenge/checks.py": "9a046c3c38db28b325dcd1557baecdf6bc9ef941d2175f9a900ba4c230bb8055",
+    "challenge/nvfp4.py": "cfdf37c7bc14b10f7353aba7d4632f4767401b92b4b073941a8030d9a961aaaf",
+    "configs/muse-spark-open.yaml": "98f07230e4e64fe91b7c76d9a3ce04948053c043d494d5f1fae56cfe2de033af",
+    "harness/eval.py": "0051a1bfac67a9f1fad06086b306653c6643b2bb253e15a794aa672312f070a9",
+    "harness/runner.py": "c905e5c80264c6d27620b6fc7d55b162dccdb8ed7282f8a513a4d2e6f2f226f2",
+    "harness/static_checks.py": "c5588b69e9e86229459a525c61b30096f6f13ff2add6cadf98f272c4ac8ca0c2",
+    "harness/worker.py": "950437610f57ddffbc1176b65d9c2ae909c47bf67b1e3fe0716a81946986f568",
+    "problems/muse_moe_w4a16/baseline.py": "4fc48bd9cdfd749863c93a2dbf4e556e0c38fb04acc4fa48a53ef34cbf6c92a1",
+    "problems/muse_moe_w4a16/reference.py": "a7e0b4fa86aa477a4e7bb5745b2b258954d72636b6da153bd239a717927cba44",
+    "problems/muse_moe_w4a16/task.yml": "cc6870087c1a115e69f40093478553e0a03c1b3e92f527c2e55c4115e2db42ad"
+   },
+   "image": "localhost:30500/kc/judge@sha256:9a7f287b80d772c6f636bbcb57422c619fe326e2aabc53803b85007bca93f68e"
+  },
+  "flags": [],
+  "gpu": "H200",
+  "log_tail": "[mb] v16: G=132 prepack 1s builds bf2=60s lv=54s lvaq=54s lvf1=54s s3=54s w112=73s w72=62s xw6=54s errors none\n[mb] build lv ('lvms',): regs/local/smem/G/NS [143, 0, 129408, 132, 3]\n[mb] build lvaq ('lvms', ('-DVMS_AQ=1',)): regs/local/smem/G/NS [143, 0, 129408, 132, 3]\n[mb] build lvf1 ('lvms', ('-DVMS_FX=1',)): regs/local/smem/G/NS [143, 0, 129408, 132, 3]\n[mb] build xw6 ('vms', 3, 16, 1152, 0, 6): regs/local/smem/G/NS [154, 0, 211584, 132, 3]\n[mb] build s3 ('vms', 3, 16, 0): regs/local/smem/G/NS [149, 0, 129408, 132, 3]\n[mb] b1 ref lv; r = arm / ref per routing (lower is faster), mean +- se\n[mb] b1 lvf1       brd    31.9 r0.9890+-0.0021 n6 | lay    31.0 r0.9979+-0.0002 n2\n[mb] b1 lvaq       brd    32.1 r0.9956+-0.0039 n6 | lay    31.0 r0.9984+-0.0039 n2\n[mb] b1 lv         brd    32.3 r1.0000+-0.0000 n6 | lay    31.0 r1.0000+-0.0000 n2\n[mb] b1 marks brd lvf1: route 1793384913969214.2/1793384913969216.0 gather 1793384913969213.2/1793384913969215.0 Aend 1793384913969206.2/1793384913969207.2 end 1793384913969207.2/1793384913969208.2 Bwait 1793384913969217.0/1793384913969217.0 Xwait 0.0/0.0\n[mb] b8 ref lv; r = arm / ref per routing (lower is faster), mean +- se\n[mb] b8 lvf1       brd    60.5 r0.9925+-0.0052 n6 | lay    64.5 r1.0010+-0.0041 n6\n[mb] b8 lvaq       brd    60.8 r0.9972+-0.0049 n6 | lay    64.5 r1.0025+-0.0031 n6\n[mb] b8 lv         brd    60.9 r1.0000+-0.0000 n6 | lay    64.4 r1.0000+-0.0000 n6\n[mb] b8 marks brd lvf1: route 1793384914131507.2/1793384914131509.0 gather 1793384914131506.8/1793384914131508.0 Aend 1793384914131488.8/1793384914131490.2 end 1793384914131489.2/1793384914131491.2 Bwait 1793384914131509.8/1793384914131510.0 Xwait 0.0/0.0\n[mb] b16 ref lv; r = arm / ref per routing (lower is faster), mean +- se\n[mb] b16 lv         brd    93.5 r1.0000+-0.0000 n6 | lay    71.2 r1.0000+-0.0000 n6\n[mb] b16 lvaq       brd    94.0 r1.0057+-0.0018 n6 | lay    71.8 r1.0077+-0.0016 n6\n[mb] b16 s3         brd    95.2 r1.0192+-0.0017 n6 | lay    72.2 r1.0142+-0.0060 n6\n[mb] b16 marks brd lv: route 1793384914277411.8/1793384914277413.8 gather 1793384914277410.8/1793384914277412.8 Aend 1793384914277384.0/1793384914277386.0 end 1793384914277384.8/1793384914277387.0 Bwait 1793384914277414.2/1793384914277414.8 Xwait 0.0/0.0\n[mb] b16 marks lay lv: route 1793384914284084.8/1793384914284086.2 gather 1793384914284083.8/1793384914284085.2 Aend 1793384914284059.8/1793384914284061.2 end 1793384914284060.0/1793384914284062.0 Bwait 1793384914284087.0/1793384914284087.2 Xwait 0.0/0.0\n[mb] b16 marks brd s3: route 1.3/1.3 first 3.8/5.7 bw0 52.7/54.7 bw1 55.0/56.1 comp 80.5/82.4 hA 53.1/55.1 hend 81.4/83.3 bar 84.1/84.2 fin 84.3/85.4\n[mb] b16 marks lay s3: route 1.3/1.3 first 3.3/4.9 bw0 49.1/50.6 bw1 51.1/52.0 comp 74.2/76.3 hA 49.5/50.9 hend 75.1/77.1 bar 77.8/77.8 fin 78.1/79.0\n[mb] b32 ref bf2:193:L; r = arm / ref per routing (lower is faster), mean +- se\n[mb] b32 bf2:193:L  brd   131.3 r1.0000+-0.0000 n16 | lay    76.5 r1.0000+-0.0000 n6\n[mb] b32 w72:193:L  brd   132.3 r1.0072+-0.0019 n16 | lay    78.5 r1.0292+-0.0090 n6\n[mb] b32 marks brd bf2:193:L: route 2.0/2.2 gather 3.4/6.6 Aend 85.0/89.8 end 123.6/128.6 Bwait 2.9/12.2 Xwait 0.0/1.9\n[mb] b32 marks lay bf2:193:L: route 2.1/2.4 gather 3.5/7.4 Aend 53.6/57.3 end 77.2/81.4 Bwait 4.4/11.8 Xwait 0.2/1.6\n",
+  "machine": {
+   "gpu_after": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "580.159.03",
+    "name": "NVIDIA H200",
+    "power.draw": 151.33,
+    "power.limit": 700,
+    "temperature.gpu": 40
+   },
+   "gpu_before": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "580.159.03",
+    "name": "NVIDIA H200",
+    "power.draw": 135.85,
+    "power.limit": 700,
+    "temperature.gpu": 33
+   },
+   "node": "n-jilerexm7jzqtha3u5ugsjopko"
+  },
+  "passed": false,
+  "records": [],
+  "returncode": -9,
+  "score_us": null,
+  "speedup": null,
+  "speedup_ci": null,
+  "status": "timeout"
+ },
+ "started_at": 1793384822.5056605,
+ "status": "done",
+ "team": "joeyhlu"
+}
