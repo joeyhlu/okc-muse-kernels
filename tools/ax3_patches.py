@@ -740,6 +740,33 @@ def _lean_py(py):
     return NL.join(out)
 
 
+def _patch_q8(src, q8, lean):
+    ns = {}
+    exec(compile((ROOT / "tools" / "ax3q_src.py").read_text(encoding="utf-8"), "ax3q_src.py", "exec"), ns)
+    cuda = ns["AX3Q_CUDA_SRC"]
+    py = (ns["AX3Q_PY"].replace("@Q8ROUTE@", repr(q8["route"])).replace("@Q8ARMS@", repr(q8.get("arms", {})))
+          .replace("@Q8TRIG@", repr(q8.get("trig", 1))).replace("@Q8SWEEP@", "True" if q8.get("sweep") else "False"))
+    if q8.get("sweep"):
+        py += ns["AX3Q_SWEEP_PY"]
+    if lean:
+        cuda = _lean_cuda(cuda)
+        py = _lean_py(py)
+    assert '"""' not in cuda and '"""' not in ns["AX3Q_CPP_SRC"]
+    blk = ('AX3Q_CPP_SRC = r"""' + ns["AX3Q_CPP_SRC"] + '"""' + NL + NL + 'AX3Q_CUDA_SRC = r"""' + cuda + '"""' + NL + NL + py)
+    src = _sub_once(src, NL + 'def _ks1_run(qkv, data, state):', NL + blk + 'def _ks1_run(qkv, data, state):', "q8 block")
+    src = _sub_once(src, "    if o is None and _vfa_wanted(qkv, data, cfg, state):" + NL,
+                    "    if o is None and _ax3q_wanted(qkv, data, cfg, state):" + NL
+                    + "        o = _ax3q_try(qkv, data, cfg, state)" + NL
+                    + "        o = o.view(tokens, hq * d) if o is not None else None" + NL
+                    + "    if o is None and _vfa_wanted(qkv, data, cfg, state):" + NL, "q8 route")
+    src = _sub_once(src, "    _vfa_prepare(state, t0)" + NL, "    _vfa_prepare(state, t0)" + NL + "    _ax3q_prepare(state, t0)" + NL,
+                    "q8 prepare")
+    pj = "        jobs.append((\"vfa\", _vfa_build))" + NL
+    if src.count(pj) == 1:   # (layer) the nvcc build in the PT1 prefetch pool, beside VFA
+        src = src.replace(pj, pj + "    if AX3Q_ENABLE:" + NL + "        jobs.append((\"ax3q\", _ax3q_build))" + NL)
+    return src
+
+
 def _sub_once(src, old, new, what):
     n = src.count(old)
     if n != 1:
@@ -747,7 +774,7 @@ def _sub_once(src, old, new, what):
     return src.replace(old, new)
 
 
-def patch(src, insts, route, sweep, nonce, lean=False, ks3pf=None):
+def patch(src, insts, route, sweep, nonce, lean=False, ks3pf=None, q8=None):
     cu_insts = " ".join(f"AX3_X({n}, {v})" for n, v in insts)
     # 1. C++ declarations
     src = _sub_once(src, 'std::vector<int64_t> ks3_info(int64_t NS);' + NL + '"""',
@@ -791,6 +818,9 @@ def patch(src, insts, route, sweep, nonce, lean=False, ks3pf=None):
         src = _sub_once(src, 'VSL_KS3_INSTS = ((16, 1),)', 'VSL_KS3_INSTS = ' + repr(tuple(ks3pf['insts'])), 'VSL_KS3_INSTS')
         if ks3pf.get('route16'):
             src = _sub_once(src, "(16, 1): ('ks3', 16, 1)}", "(16, 1): " + repr(tuple(ks3pf['route16'])) + "}", 'VSL_ROUTE d16')
+    # 7c. AX3Q (--q8): one-launch verify sliding (q_len 8), own module, route before VFA / FA4 in the attention dispatch
+    if q8 is not None:
+        src = _patch_q8(src, q8, lean)
     # 8. nonce (line 2)
     lines = src.split(NL)
     if len(lines) > 1 and lines[1].startswith("# nonce"):
@@ -809,6 +839,7 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--nonce", default=None)
     ap.add_argument("--ks3pf", default=None, help="KS3 rider: {'insts': ((16, 1), (16, 5)), 'route16': ('ks3', 16, 5)}")
+    ap.add_argument("--q8", default=None, help="AX3Q: {'route': {16: (8, 3), 32: (4, 3)}, 'arms': {...}, 'trig': 1, 'sweep': True}")
     ap.add_argument("--lean", action="store_true", help="layer size budget: no comments / lab marks in the added code")
     a = ap.parse_args()
     insts = tuple(tuple(x) for x in ast.literal_eval(a.insts))
@@ -821,7 +852,8 @@ def main():
     src = base.read_text(encoding="utf-8")
     nonce = a.nonce or (f"{out.stem} ({base.stem} + AX3 4-warp pipelined sliding decode B16/32, tools/ax3_patches.py; "
                         f"route {route}, insts {insts}{', sweep' if a.sweep else ''})")
-    res = patch(src, insts, route, a.sweep, nonce, a.lean, ast.literal_eval(a.ks3pf) if a.ks3pf else None)
+    res = patch(src, insts, route, a.sweep, nonce, a.lean, ast.literal_eval(a.ks3pf) if a.ks3pf else None,
+                ast.literal_eval(a.q8) if a.q8 else None)
     out.write_bytes(res.encode("utf-8"))
     compile(res, str(out), "exec")
     print(f"ax3_patches: {base.name} -> {out} ({len(res)} B, +{len(res) - len(src)} B); route {route}; insts {insts}; "
