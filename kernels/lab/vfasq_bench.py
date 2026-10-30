@@ -173,7 +173,7 @@ def main():
                 run(d, dg, ws, o)
             g.replay()
             torch.cuda.synchronize()
-            graphs[name] = (g, ws)
+            graphs[name] = (g, ws, o)   # keep o alive: a freed captured output was reused as a later arm's ws (R-vfaws-1)
         names = [n for n, _ in ARMS]
         times = {n: [] for n in names}
         for r in range(a.reps):
@@ -181,7 +181,7 @@ def main():
             for n in names[k:] + names[:k]:
                 times[n].append(timer.time_replay(graphs[n][0]) - ovh)
         med = {n: statistics.median(v) for n, v in times.items()}
-        dirty = [n for n, (g, ws) in graphs.items() if not clean(ws)]
+        dirty = [n for n, (g, ws, _) in graphs.items() if not clean(ws)]
         rec = {"keys": keys, "tiles_per_cta": tiles, "median_us": med, "all_us": times, "dirty_ws": dirty,
                "d_sq": (med["sq"] + med["sq_b"] - med["ship"] - med["ship_b"]) / 2, "d_ctrl": med["ship_b"] - med["ship"],
                "d_nc_sq": med["nc_sq"] - (med["nc_ship"] + med["nc_ship_b"]) / 2, "d_nc_ctrl": med["nc_ship_b"] - med["nc_ship"]}
