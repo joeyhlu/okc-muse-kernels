@@ -87,12 +87,10 @@ def gs1w(r, npend):
 def keys_for(cu):
     r = region(cu)
     out = {
-        "nodq": edit(r, [(DQ, DQ_NO)]),
         "nomma": edit(r, [(MMA, MMA_NO)]),
         "mk": edit(r, [(WAIT_W, MK_A + WAIT_W + MK_B), (WAIT_X, WAIT_X + MK_C), (STAGE_END, "prev = xs;\n++seq;\n" + MK_END + "};\n")]),
         "gs1": edit(r, [("constexpr int GS = OKC_WGSGS;\n", "constexpr int GS = 1;\n"), (FCI, FCI1)]),
-        "gs1w2": gs1w(r, 2),
-    }   # sk96 / sk192 (WG de-phasing) and gs1w3 dropped before the burst: R-vap-0's split-WG test already measured the coupling as a
+    }   # R-hovl-1b: nodq (ptxas C7512: wgmma serialized) and gs1w2 (C7511: a 3-deep wgmma pipeline does not fit 96 regs) dropped   # sk96 / sk192 (WG de-phasing) and gs1w3 dropped before the burst: R-vap-0's split-WG test already measured the coupling as a
         # per-SM resource, not lockstep; gs1w3 adds nothing gs1w2 does not test (notes/study/moe128_fable.md s5)
     for k, n in out.items():
         check(n != r, f"{k}: no change")
@@ -109,6 +107,11 @@ def main():
     names = tuple(keys)
     HK.ALL_KEYS = HK.KEYS + names
     s2 = HK.apply(s, base.stem, "lab", "", keys=names)
+    seq_old = ("    ths = [threading.Thread(target=one, args=(k,)) for k in HYBK_KEYS]" + NL + "    for th in ths:" + NL
+               + "        th.start()" + NL + "    for th in ths:" + NL + "        th.join()" + NL)
+    seq_new = ("    for k in HYBK_KEYS:   # R-hovl-1b: sequential builds (the first burst's container froze: 5 extra parallel nvcc)"
+               + NL + "        one(k)" + NL)
+    s2 = sub(s2, seq_old, seq_new, "sequential hybk build")
     lines = s2.split(NL)
     lines[1] = (f"# nonce k3-hovl-ab ({base.stem} + R-hovl lab: HYBK {'/'.join(names)} switchable, off by default; "
                 "tools/hovl_patches.py over tools/hybk_patches.py)")
