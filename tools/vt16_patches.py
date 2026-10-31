@@ -21,26 +21,22 @@ import sys
 DEF_ANCHOR = "#ifndef VMS_G\n"
 DEFS = ("#ifndef VMS_T16\n#define VMS_T16 0   // R-vt16: 1 = 16-token jobs (2 n-tiles per unit), weighted unit split\n#endif\n"
         "#ifndef VMS_WT1\n#define VMS_WT1 20   // R-vt16: split weight of a 1-tile unit\n#endif\n"
-        "#ifndef VMS_WT2\n#define VMS_WT2 26   // R-vt16: split weight of a 2-tile unit (> 8 tokens)\n#endif\n")
+        "#ifndef VMS_WT2\n#define VMS_WT2 30   // R-vt16: split weight of a 2-tile unit (> 8 tokens)\n#endif\n")
 O_SMEM = "  float4 red[NRB][NW][32];\n};\n"
 N_SMEM = ("  float4 red[NRB][NW][32];\n#if VMS_T16\n  float4 red2[NRB][NW][32];   // R-vt16: tile-2 partials\n"
-          "  uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane\n#endif\n};\n")
+          "  uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane\n"
+          "  int jW[MAXJ + 1];             // R-vt16: per-unit weight prefix over jobs (jW[j] = sum of w_k, k < j)\n#endif\n};\n")
 O_SPLITFN = "__device__ __forceinline__ uint32_t scd(uint32_t w, uint32_t sel, uint32_t k16) {\n"
 N_SPLITFN = r"""#if VMS_T16
-__device__ __forceinline__ int t16_split(const Smem& S, int njobs, int per, long long x) {   // R-vt16: weight -> unit index
-  long long acc = 0;
-  for (int j = 0; j < njobs; ++j) {
-    const int w = S.jC[j] > 8 ? VMS_WT2 : VMS_WT1;
-    const long long seg = (long long)per * w;
-    if (x < acc + seg) return j * per + (int)((x - acc) / w);
-    acc += seg;
-  }
-  return njobs * per;
+__device__ __forceinline__ int t16_split(const Smem& S, int njobs, int per, int x) {   // R-vt16: weight -> unit index (bin search)
+  int lo = 0, hi = njobs;   // largest j <= njobs with per * jW[j] <= x
+  while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (per * S.jW[mid] <= x) lo = mid; else hi = mid - 1; }
+  if (lo >= njobs) return njobs * per;
+  return lo * per + (x - per * S.jW[lo]) / (S.jW[lo + 1] - S.jW[lo]);
 }
-__device__ __forceinline__ long long t16_wpre(const Smem& S, int per, int v) {   // R-vt16: weight of the units before index v
-  long long acc = 0;
-  for (int j = 0; j < v / per; ++j) acc += (long long)per * (S.jC[j] > 8 ? VMS_WT2 : VMS_WT1);
-  return acc + (long long)(v % per) * (S.jC[v / per] > 8 ? VMS_WT2 : VMS_WT1);
+__device__ __forceinline__ int t16_wpre(const Smem& S, int per, int v) {   // R-vt16: weight of the units before index v
+  const int j = v / per;
+  return per * S.jW[j] + (v - j * per) * (S.jW[j + 1] - S.jW[j]);
 }
 #endif
 __device__ __forceinline__ uint32_t scd(uint32_t w, uint32_t sel, uint32_t k16) {
@@ -50,6 +46,23 @@ N_NJ = ("#if VMS_T16\n    int inc = tot, nj = (tot + 15) >> 4, jinc = nj;   // R
 O_JOBS = "    for (int k = 0; k < nj; ++k) { S.jE[joff + k] = lane; S.jS[joff + k] = off + 8 * k; S.jC[joff + k] = min(8, tot - 8 * k); }\n"
 N_JOBS = ("#if VMS_T16\n    for (int k = 0; k < nj; ++k) { S.jE[joff + k] = lane; S.jS[joff + k] = off + 16 * k; S.jC[joff + k] = min(16, tot - 16 * k); }\n"
           "#else\n" + O_JOBS + "#endif\n")
+O_NJOBS = "    if (lane == 31) S.njobs = jinc;\n    __syncwarp();\n"
+N_NJOBS = (O_NJOBS + "#if VMS_T16\n"
+           "    {   // R-vt16: per-job unit weights and their prefix jW[] (jobs <= 64: two 32-lane segments), once per CTA\n"
+           "      const int nJ = __shfl_sync(0xffffffffu, jinc, 31);\n"
+           "      int s0 = lane < nJ ? (S.jC[lane] > 8 ? VMS_WT2 : VMS_WT1) : 0;\n"
+           "      int s1 = lane + 32 < nJ ? (S.jC[lane + 32] > 8 ? VMS_WT2 : VMS_WT1) : 0;\n"
+           "#pragma unroll\n"
+           "      for (int d = 1; d < 32; d <<= 1) {\n"
+           "        const int u0 = __shfl_up_sync(0xffffffffu, s0, d), u1 = __shfl_up_sync(0xffffffffu, s1, d);\n"
+           "        if (lane >= d) { s0 += u0; s1 += u1; }\n"
+           "      }\n"
+           "      const int h0 = __shfl_sync(0xffffffffu, s0, 31);\n"
+           "      if (lane == 0) S.jW[0] = 0;\n"
+           "      S.jW[lane + 1] = s0;\n"
+           "      S.jW[lane + 33] = h0 + s1;\n"
+           "    }\n"
+           "#endif\n")
 O_PLAN = ("  const int njobs = S.njobs;\n"
           "  const int NA = njobs * RBA, NN = njobs * (RBA + RBB);\n"
           "  const int a0 = c * NA / G, a1 = (c + 1) * NA / G;\n"
@@ -58,11 +71,10 @@ O_PLAN = ("  const int njobs = S.njobs;\n"
           "  const int nA = a1 - a0, N = t1 - t0;\n")
 N_PLAN = ("#if VMS_T16\n"
           "  const int njobs = S.njobs;\n"
-          "  int WJ = 0;   // R-vt16: per-unit weights summed over jobs (A list: 512 units / job, B: 256)\n"
-          "  for (int j = 0; j < njobs; ++j) WJ += S.jC[j] > 8 ? VMS_WT2 : VMS_WT1;\n"
-          "  const int a0 = t16_split(S, njobs, RBA, (long long)RBA * WJ * c / G), a1 = t16_split(S, njobs, RBA, (long long)RBA * WJ * (c + 1) / G);\n"
+          "  const int WJ = S.jW[njobs];   // R-vt16: per-unit weights summed over jobs (A list: 512 units / job, B: 256)\n"
+          "  const int a0 = t16_split(S, njobs, RBA, RBA * WJ * c / G), a1 = t16_split(S, njobs, RBA, RBA * WJ * (c + 1) / G);\n"
           "  // B starts where this CTA's total (A + B) weight share begins: the ship's b0 = t0 - a0 coupling in weight space\n"
-          "  const long long T0 = (long long)(RBA + RBB) * WJ * c / G, T1 = (long long)(RBA + RBB) * WJ * (c + 1) / G;\n"
+          "  const int T0 = (RBA + RBB) * WJ * c / G, T1 = (RBA + RBB) * WJ * (c + 1) / G;\n"
           "  const int b0 = t16_split(S, njobs, RBB, T0 - t16_wpre(S, RBA, a0)), b1 = t16_split(S, njobs, RBB, T1 - t16_wpre(S, RBA, a1));\n"
           "  const int nA = a1 - a0, N = nA + (b1 - b0);\n"
           "#else\n" + O_PLAN + "#endif\n")
@@ -194,7 +206,7 @@ N_BEPI = (O_BEPI + "#if VMS_T16\n"
           "#endif\n")
 
 PATCHES = [("defines", DEF_ANCHOR, DEFS + DEF_ANCHOR, 1), ("smem", O_SMEM, N_SMEM, 1), ("split fn", O_SPLITFN, N_SPLITFN, 1),
-           ("nj", O_NJ, N_NJ, 1), ("jobs", O_JOBS, N_JOBS, 1), ("plan", O_PLAN, N_PLAN, 1), ("x decl", O_XDECL, N_XDECL, 1),
+           ("nj", O_NJ, N_NJ, 1), ("jobs", O_JOBS, N_JOBS, 1), ("njobs", O_NJOBS, N_NJOBS, 1), ("plan", O_PLAN, N_PLAN, 1), ("x decl", O_XDECL, N_XDECL, 1),
            ("x load", O_XLOAD, N_XLOAD, 1), ("consumer", O_CONS, N_CONS, 1), ("red write", O_RED, N_RED, 2),
            ("helper red", O_HRED, N_HRED, 1), ("A epilogue", O_AEPI, N_AEPI, 1), ("B epilogue", O_BEPI, N_BEPI, 1)]
 
