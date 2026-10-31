@@ -38,10 +38,22 @@ CFGS = [
     ("unp_T32_M16", "unpooler", (4, 2, 4, 16, 1, 1, 0), 16), ("unp_T32_M1", "unpooler", (4, 2, 4, 16, 1, 1, 0), 1),
     ("o_T1", "o", (1, 1, 8, 2, 2, 1, 6), 1), ("o_T16", "o", (2, 2, 4, 4, 2, 1, 6), 16), ("o_T32", "o", (4, 1, 4, 4, 1, 1, 0), 32),
 ]
+# --xh=1 (tools/gdxh_patches.py): XP bit 8 = token-half X; the same routes with the bit set, plus the M = 1 probe of the MT 4 ones
+XH_CFGS = [
+    ("qkv_T32x", "qkv", (4, 1, 4, 8, 1, 4, 8), 32), ("qkv_T32x_M1", "qkv", (4, 1, 4, 8, 1, 4, 8), 1), ("qkv_T16x", "qkv", (2, 1, 4, 8, 1, 4, 8), 16),
+    ("pool_T32x", "pooler", (4, 1, 8, 16, 1, 1, 8), 32), ("pool_T32x_M1", "pooler", (4, 1, 8, 16, 1, 1, 8), 1),
+    ("unp_T32x", "unpooler", (4, 2, 4, 16, 1, 1, 8), 32), ("unp_T32x_M1", "unpooler", (4, 2, 4, 16, 1, 1, 8), 1), ("unp_T16x", "unpooler", (2, 2, 4, 16, 2, 1, 14), 16),
+    ("o_T32x", "o", (4, 1, 4, 4, 1, 1, 8), 32),
+]
 
 
 def main():
     ns = G.extract(G.LAYER)
+    if ARGS.get("xh", "0") == "1":
+        sys.path.insert(0, str(ROOT / "tools"))
+        import gdxh_patches  # noqa: E402
+        ns["GD_CUDA_SRC"] = gdxh_patches.patch(ns["GD_CUDA_SRC"])
+        CFGS.extend(XH_CFGS)
     dev = "cuda"
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if ARGS.get("synthetic", "0") == "1":
@@ -103,7 +115,7 @@ def main():
 
     empty_med, _ = timed_graph(lambda: None)
     print(f"[gdncu] empty graph {empty_med:.2f} us, {sms} SMs, mode {MODE}", flush=True)
-    packs, rows = {}, []
+    packs, rows, ys = {}, [], {}
     for tag, proj, rt, M in CFGS:
         if (proj, rt) not in kmap:
             continue
@@ -131,6 +143,11 @@ def main():
             continue
         refo = x.double() @ W[proj].double().T
         rel = float((y.double() - refo).norm() / refo.norm())
+        yk, bit = (proj, M, tuple(rt[:6])), ""
+        if rt[6] & 8 and yk in ys:   # token-half X (XP bit 8): same geometry, same accumulation order -> the output must be bitwise the shipped one
+            bit = f" bitwise={bool(torch.equal(y, ys[yk]))}"
+        elif not rt[6] & 8:
+            ys[yk] = y.clone()
         mb = pk["w"].numel() * 4 / 1e6
         if MODE == "ncu":
             torch.cuda.synchronize()
@@ -145,10 +162,10 @@ def main():
         med, mn = timed_graph(run)
         net = med - empty_med
         row = {"tag": tag, "proj": proj, "rt": rt, "M": M, "regs": inf[0], "lmem": inf[1], "occ": inf[2], "ctas": ctas, "net_us": round(net, 2),
-               "min_us": round(mn - empty_med, 2), "TBs_p12": round(mb / net, 2) if net > 0 else 0, "MB": round(mb, 1), "rel": rel}
+               "min_us": round(mn - empty_med, 2), "TBs_p12": round(mb / net, 2) if net > 0 else 0, "MB": round(mb, 1), "rel": rel, "bit": bit.strip()}
         rows.append(row)
         print(f"[gdncu] {tag:13s} {proj:8s} {str(rt):22s} M={M:2d}: net {net:6.2f} us (min {mn - empty_med:6.2f}) {mb / net:.2f} TB/s P12 ({mb:.1f} MB) "
-              f"regs {inf[0]} lmem {inf[1]} occ {inf[2]} ctas {ctas} rel {rel:.1e}", flush=True)
+              f"regs {inf[0]} lmem {inf[1]} occ {inf[2]} ctas {ctas} rel {rel:.1e}{bit}", flush=True)
     if MODE != "ncu":
         OUT.parent.mkdir(parents=True, exist_ok=True)
         OUT.write_text(json.dumps({"empty_us": empty_med, "rows": rows}, indent=1))
@@ -158,6 +175,9 @@ def main():
             ts = [(t, by[f"{pj}_{t}"]) for t in ("T1", "T16", "T32") if f"{pj}_{t}" in by]
             pr = [(m, by[f"{pj}_T32_{m}"]) for m in ("M16", "M8", "M1") if f"{pj}_T32_{m}" in by]
             print(f"[gdncu] SUMMARY {pj:5s}: shipped " + ", ".join(f"{t} {v:.2f}" for t, v in ts) + " | MT4 route fed " + ", ".join(f"{m} {v:.2f}" for m, v in pr), flush=True)
+            xv = [(t, by[f"{pj}_{t}"]) for t in ("T16x", "T32x", "T32x_M1") if f"{pj}_{t}" in by]
+            if xv:
+                print(f"[gdncu] SUMMARY {pj:5s}: XH " + ", ".join(f"{t} {v:.2f}" for t, v in xv), flush=True)
 
 
 if __name__ == "__main__":
