@@ -23,6 +23,27 @@ HIX = [f for f in ARGS.get("hix", "").split(",") if f]   # extra defines for the
 NL = chr(10)
 
 
+# ship mode: the T16 module (calls with 9-16 tokens) is self-tested on its own before VMS's cases; a failure drops only the T16
+# module (the ship VMS module then serves every T <= 16), instead of turning VMS off through the shared self-test below it
+T16_SELF_TEST = r'''        if VMS_HI_ON and st["vms"].get("mod_hi") is not None:
+            for bs, seed, dist in ((12, 61, "skewed"), (16, 62, "normal"), (16, 63, "hot8"), (16, 64, "skewed"), (9, 65, "skewed")):
+                d = _k2a36_synth_inputs(bs, seed, dev, "hot8") if dist == "hot8" else _k2a_self_test_inputs(bs, seed, dev, dist)
+                if dist == "hot8":
+                    d["topk_ids"] = torch.where(d["topk_ids"] < K2A_E_LOC, d["topk_ids"], torch.full_like(d["topk_ids"], -1))
+                ref = _k2a_ref_fp32(d, w)
+                o = _vms_call(st, d["hidden_states"].contiguous(), d["topk_ids"], d["topk_weights"])
+                torch.cuda.synchronize()
+                tot, row = _k2a_rel_err(o, ref)
+                errf = int(st["vms"]["ctr"][2])
+                if not (tot < 1.0e-2 and row < 5.0e-2 and not errf and bool(torch.isfinite(o.float()).all())):
+                    print(f"[vms] T16 module self-test bs={bs} {dist}: rel {tot:.3e} row {row:.3e} err={errf} -> T16 OFF", flush=True)
+                    st["vms"]["mod_hi"] = None
+                    break
+            else:
+                print("[vms] T16 module (9-16 tokens) self-test ok", flush=True)
+'''
+
+
 def _rep(s, old, new, n=1):
     assert s.count(old) == n, (old[:80], s.count(old))
     return s.replace(old, new)
@@ -34,8 +55,9 @@ def main():
     b = s.index('"""', a)
     s = s[:a] + PT.apply(s[a:b]) + s[b:]
     fl = '    flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=3", "-DVMS_RO=1", "-Xptxas=-warn-spills", "-gencode=arch=compute_90a,code=sm_90a"]\n'
-    if MODE == "ship":
-        pass   # ship = the A/B file with VMS_HI_ON = True (T16 module for > 8 tokens)
+    if MODE == "ship":   # ship = VMS_HI_ON True + a T16-only prepare self-test that drops the T16 module (not VMS) on a failure
+        anchor = "        good = True" + NL + "        for bs, seed, dist in VMS_SELF_TEST_CASES:" + NL
+        s = _rep(s, anchor, T16_SELF_TEST + anchor)
     if True:
         s = _rep(s, '_VMS = {"mod": None, "G": None}\n',
                  '_VMS = {"mod": None, "G": None, "mod_hi": None}\nVMS_HI_ON = {ON}   # R-vt16-1: True = the T16 VMS module for calls with > 8 tokens\n')
@@ -67,6 +89,28 @@ def main():
         s = s.replace("@M2L@", ", ".join(f'"{f}"' for f in (M2 or [f"-DVMS_LPAD={PAD}"])))
         s = s.replace("@M2K@", repr(sorted({f.split("=")[0] for f in (M2 or [f"-DVMS_LPAD={PAD}"])})))
     s = s.replace("{ON}", "True" if MODE == "ship" else "False").replace("@WT2@", WT2)
+    if MODE == "ship":   # the T16 module compiles in a thread next to the ship module (prepare: ~max, not the sum, of two nvcc runs)
+        i0 = s.index('    mod = load_inline(name=f"k3_vms_{tag}"')
+        i1 = s.index('    _VMS["mod_hi"] = load_inline(', i0)
+        i2 = s.index("extra_cuda_cflags=fl_hi)" + NL, i1) + len("extra_cuda_cflags=fl_hi)" + NL)
+        blk = s[i0:i2]
+        base_ld = blk[:blk.index('    _VMS["G"] = G' + NL)]
+        hi_def = blk[blk.index("    fl_hi = "):blk.index('    _VMS["mod_hi"] = load_inline(')]
+        hi_ld = blk[blk.index('    _VMS["mod_hi"] = load_inline('):]
+        new = (hi_def + "    import threading" + NL + NL
+               + "    def _hi_build():   # R-vt16: a failed T16 build leaves the ship module at every T" + NL
+               + "        try:" + NL
+               + "".join("        " + ln + NL for ln in hi_ld.rstrip(NL).split(NL))
+               + "        except Exception as ex:  # noqa: BLE001" + NL
+               + '            _VMS["mod_hi"] = None' + NL
+               + '            print(f"[vms] T16 module build failed {ex!r}: ship VMS module at every T", flush=True)' + NL
+               + "    th_hi = threading.Thread(target=_hi_build, daemon=True)" + NL
+               + "    th_hi.start()" + NL
+               + base_ld + "    th_hi.join()" + NL
+               + '    _VMS["G"] = G' + NL + '    _VMS["mod"] = mod' + NL)
+        s = s[:i0] + new + s[i2:]
+    if ARGS.get("nonce"):   # line 2 of the output
+        L = s.split(NL); L[1] = "# nonce " + ARGS["nonce"]; s = NL.join(L)
     tmp = OUT.with_name(OUT.stem + "_unslim.py")
     tmp.write_text(s, encoding="utf-8", newline=NL)
     r = subprocess.run([sys.executable, "-I", str(ROOT / "tools/slim_patches.py"), f"--base={tmp}", f"--out={OUT}"],
