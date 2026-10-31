@@ -3952,7 +3952,6 @@ def _v11_k2a33_prepare(weights, t0):
     _vms_prepare(st, w, dev)
     _vml_prepare(st, w, dev)
     _hyb_prepare(st, w, dev)
-    _hyblo_prepare(st, w, dev)
     print(f"[v8] K2A v3.3 buckets {ok} in {time.time() - t1:.1f}s; route {V11_K2A33_ROUTE}", flush=True)
     return {"st": st, "ok": ok}
 def _sk1_prepare(st, w, dev):
@@ -10847,6 +10846,8 @@ def prepare(weights):
     _ax1_prepare(state, t0)
     torch.cuda.synchronize()
     _pt1_join_all()
+    if state.get("k2a33") is not None:   # R-hyblo ship: after every guard-timed prepare step (lab R-hyblo-1 waited inside K2A33 and pushed HYA / G2 / KS1 / SBB1 / VG-F / SU1 / GD past their prepare-time guards on a cold pod)
+        _hyblo_prepare(state["k2a33"]["st"], {k: weights[k] for k in ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs")} | {"post_norm_w": weights["post_expert_norm"]}, weights["w13"].device)
     builds = " ".join(f"{k}={v:.0f}s" for k, v in _K3_BUILD_S.items()) or "none"
     print(f"[k3] attention={'HYA' if state.get('hya') else 'r1-FA3'} experts={'K2A v3.3' if state.get('k2a33') is not None else 'K2A v3.1' if state.get('k2a31') is not None else 'K2A v3' if state.get('k2a3') is not None else ('K2A' if state['k2a'] is not None else 'r1-Marlin')}"
           f" (USE_K2A={USE_K2A}); nvcc {builds};"

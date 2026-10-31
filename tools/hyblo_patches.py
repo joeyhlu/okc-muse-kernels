@@ -262,6 +262,9 @@ ROUTE_N = ('    data = {"hidden_states": x, "topk_ids": local_ids, "topk_weights
            '    if VMS_ENABLE and st.get("vms_ok") and x.shape[0] <= VMS_MAXT:\n')
 PREP_A = '    _hyb_prepare(st, w, dev)\n    print(f"[v8] K2A v3.3 buckets'
 PREP_N = '    _hyb_prepare(st, w, dev)\n    _hyblo_prepare(st, w, dev)\n    print(f"[v8] K2A v3.3 buckets'
+PREP_SA = '    _ax1_prepare(state, t0)\n    torch.cuda.synchronize()\n    _pt1_join_all()\n'
+PREP_SN = PREP_SA + ('    if state.get("k2a33") is not None:   # R-hyblo ship: after every guard-timed prepare step (lab R-hyblo-1 waited inside K2A33 and pushed HYA / G2 / KS1 / SBB1 / VG-F / SU1 / GD past their prepare-time guards on a cold pod)\n'
+                     '        _hyblo_prepare(state["k2a33"]["st"], {k: weights[k] for k in ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs")} | {"post_norm_w": weights["post_expert_norm"]}, weights["w13"].device)\n')
 PT1_A = '    if HYB_ENABLE:\n        jobs.append(("hyb", _hyb_build))\n'
 PT1_N = PT1_A + '    if HYBLO_ENABLE:\n        jobs.append(("hyblo", _hyblo_build))\n'
 CALL_A = "def _v11_k2a33_call(x, local_ids, topk_weights, st):\n"
@@ -318,7 +321,7 @@ def apply(s, ship=None, base_name="k3_hh_3tekv"):
     s = NL.join(lines)
     s = sub(s, CALL_A, build_lab(h0s, fns, ship) + CALL_A, "lab block")
     s = sub(s, ROUTE_A, ROUTE_N, "route hook")
-    s = sub(s, PREP_A, PREP_N, "prepare call")
+    s = sub(s, PREP_SA, PREP_SN, "prepare call (ship: end of prepare)") if ship else sub(s, PREP_A, PREP_N, "prepare call")
     s = sub(s, PT1_A, PT1_N, "PT1 job")
     return s
 
@@ -332,9 +335,10 @@ def gates(path, s):
     d = pyslim.decorated_sources(s)
     bad = [x for x in d if x.startswith("UNPARSABLE")]
     check(not bad, f"decorated defs that do not re-parse: {bad[:2]}")
-    for a in ("def _hyblo_prepare(", 'jobs.append(("hyblo", _hyblo_build))', "    _hyblo_prepare(st, w, dev)\n",
+    for a in ("def _hyblo_prepare(", 'jobs.append(("hyblo", _hyblo_build))',
               "        o = _hyblo_route(x, local_ids, topk_weights)\n", "THIRD_PARTY_NOTICES += _HYBLO_NOTICE\n"):
         check(s.count(a) == 1, f"missing {a!r}")
+    check(s.count("_hyblo_prepare(") == 2, "one _hyblo_prepare def + one call")
     print(f"hyblo_patches: gates OK on {path.name}: {n:,} B ({LIMIT - n:,} B under the cap), {len(d)} decorated defs re-parse")
 
 
