@@ -1,0 +1,208 @@
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# HHX (R-dense-probe, 2026-10-31): the layer's dense engines that the Oct 28 board file (vd_1) never had, as extra candidates.
+#   * dg1 : the layer's DG1 BF16 bulk-copy + wgmma skinny GEMM at m = 32 (qkv_gate, o), verbatim from kernels/lab/k3_hh_3tkv.py
+#   * pins: the layer's cuBLASLt pins (dpin: algorithm id 66 with explicit tile / custom option / cluster, NN or batched
+#           layouts, built by lt_plan_b / lt_make) at m = 128 / 256. The tile / custom / cluster words follow the Apache-2.0
+#           public file of alygg77 (okc-muse-spark-kernels, commit 6cae49a6; their NOTICE: vjeux, Nathen Fernandes (MIT),
+#           Matsvei); they are data (algorithm configuration words), not code.
+# Every candidate is verified with the judge metric against FP64 (+ bitwise repeat) and timed cold-L2 in a CUDA graph against the
+# route that vd_1's search picked; it replaces that route only if it is >= 3 % faster. Every skip is printed.
+# ----------------------------------------------------------------------------------------------------------------
+
+HHX_ENABLE = True
+HHX_LT_WS = 32 << 20
+HHX_DG1_INSTS = [(32, 1, 1), (32, 2, 1)]
+# (layer, m) -> [(T, nwg, mt, s)]: the layer's DG1_GEOMETRY for ('qkv', 32) and ('o', 32); pooler / unpooler at 32 reuse the cat / qkv geometries (untested shapes)
+HHX_DG1 = @HHX_DG1@
+# (layer, m) -> [(9-word cuBLASLt config, nn, batch, tag)]; nn = 1: the weight is stored [K, N] (a lossless transpose)
+HHX_PINS = @HHX_PINS@
+_HHX = {"lt": None, "dg1": None, "lt_err": None, "dg1_err": None, "threads": [], "wt": {}, "dg1w": {}, "ws": None}
+
+
+def _hhx_lt_flags():
+    import glob
+    import os
+    from torch.utils.cpp_extension import CUDA_HOME
+    dirs = [os.path.join(CUDA_HOME, d) for d in ("lib64", "lib", os.path.join("targets", "x86_64-linux", "lib"))] if CUDA_HOME else []
+    tdir = os.path.dirname(torch.__file__)
+    dirs += glob.glob(os.path.join(os.path.dirname(tdir), "nvidia", "*", "lib")) + [os.path.join(tdir, "lib")]
+    for d in dirs:
+        libs = sorted(glob.glob(os.path.join(d, "libcublasLt.so*")))
+        if libs:
+            lib = "-lcublasLt" if any(x.endswith("libcublasLt.so") for x in libs) else "-l:" + os.path.basename(libs[-1])
+            return ["-L" + d, lib, "-Wl,-rpath," + d]
+    return ["-lcublasLt"]
+
+
+def _hhx_build_lt():
+    from torch.utils.cpp_extension import load_inline
+    t0 = time.time()
+    flags = _hhx_lt_flags()
+    try:
+        _HHX["lt"] = load_inline(name="hhx_lt_" + hashlib.sha1((HHX_LT_CPP + " ".join(flags)).encode()).hexdigest()[:10],
+                                 cpp_sources=HHX_LT_CPP, functions=["lt_plan", "lt_plan_b", "lt_cfg", "lt_make", "lt_run"],
+                                 extra_ldflags=flags, with_cuda=True, verbose=False)
+        print(f"[hhx] built the pin cuBLASLt module in {time.time() - t0:.1f}s", flush=True)
+    except Exception as ex:  # noqa: BLE001
+        _HHX["lt_err"] = f"{str(ex)[-600:]} (flags {flags})"
+
+
+def _hhx_build_dg1():
+    from torch.utils.cpp_extension import load_inline
+    t0 = time.time()
+    try:
+        cuda = dg1_cuda_src(list(HHX_DG1_INSTS))
+        tag = hashlib.sha1((DG1_CPP_SRC + cuda).encode()).hexdigest()[:10]
+        _HHX["dg1"] = load_inline(name=f"hhx_dg1_{tag}", cpp_sources=DG1_CPP_SRC, cuda_sources=cuda,
+                                  functions=["dg1_run", "dg1_info"],
+                                  extra_cuda_cflags=["-O3", "-lineinfo", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
+        print(f"[hhx] built DG1 ({len(HHX_DG1_INSTS)} instances) in {time.time() - t0:.1f}s", flush=True)
+    except Exception as ex:  # noqa: BLE001
+        _HHX["dg1_err"] = str(ex)[-800:]
+
+
+def _hhx_start(dev):
+    """Builds in background threads (Hopper only), joined where the candidates are used."""
+    if not HHX_ENABLE or torch.cuda.get_device_capability(dev)[0] < 9:
+        return
+    for fn in (_hhx_build_lt, _hhx_build_dg1):
+        th = threading.Thread(target=fn)
+        th.start()
+        _HHX["threads"].append(th)
+
+
+def _hhx_join():
+    for th in _HHX["threads"]:
+        th.join()
+    _HHX["threads"] = []
+
+
+def _hhx_pin_cands(state, layer, m, w, x, probes, ref, dev):
+    """Pinned cuBLASLt candidates of (layer, m): kind 'lt' routes of the pin module, verified; [] when none applies."""
+    out = []
+    if not HHX_ENABLE or (layer, m) not in HHX_PINS:
+        return out
+    _hhx_join()
+    mod = _HHX["lt"]
+    if mod is None:
+        print(f"[hhx] pins {layer}/m{m}: module unavailable ({_HHX['lt_err']})", flush=True)
+        return out
+    if _HHX["ws"] is None:
+        _HHX["ws"] = torch.empty((HHX_LT_WS,), dtype=torch.uint8, device=dev)
+    n, k = LAYERS[layer]
+    for cfg, nn, bt, tag in HHX_PINS[(layer, m)]:
+        desc = f"pin{tag}{'nn' if nn else ''}b{bt}"
+        try:
+            wl = w
+            if nn:
+                if layer not in _HHX["wt"]:
+                    _HHX["wt"][layer] = w.t().contiguous()
+                wl = _HHX["wt"][layer]
+            code = int(mod.lt_plan_b(m, n, k, 0, nn, bt, HHX_LT_WS, 32))
+            pid, cnt = code >> 8, code & 255
+            ai = next((i for i in range(cnt) if tuple(mod.lt_cfg(pid, i)) == tuple(cfg)), None)
+            if ai is None:
+                ai = int(mod.lt_make(pid, list(cfg), HHX_LT_WS))
+                if ai < 0 or tuple(mod.lt_cfg(pid, ai)) != tuple(cfg):
+                    print(f"[hhx] pins {layer}/m{m} {desc}: config {tuple(cfg)} rejected by cuBLASLt -> skipped", flush=True)
+                    continue
+            r = {"kind": "lt", "mod": mod, "pid": pid, "ai": ai, "w": wl, "w2": None, "ws": _HHX["ws"], "router": False,
+                 "desc": desc, "align": 16 if nn else 256}
+            if x.data_ptr() % r["align"]:
+                print(f"[hhx] pins {layer}/m{m} {desc}: test x not {r['align']}-B aligned -> skipped", flush=True)
+                continue
+            got = _lt_call(r, x, n)
+            got2 = _lt_call(r, x, n)
+            torch.cuda.synchronize()
+            ok, msg = _check(got, x, w, probes, False, ref, 5e-3)
+            ok = ok and bool(torch.equal(got, got2))
+            print(f"[hhx] pins {layer}/m{m} {desc} (lt{ai}{'' if ai < cnt else ' built'}): {msg} -> {'candidate' if ok else 'REJECTED'}", flush=True)
+            if ok:
+                out.append(r)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[hhx] pins {layer}/m{m} {desc}: FALLBACK {repr(ex)[:200]}", flush=True)
+    return out
+
+
+def _hhx_dg1_route(layer, m, w, dev, geo):
+    mod = _HHX["dg1"]
+    T, nwg, mt, s = geo
+    kid = HHX_DG1_INSTS.index((T, nwg, mt))
+    info = [int(v) for v in mod.dg1_info(kid, s)]
+    n, k = w.shape
+    if n % info[3] or m > T or k % 64:
+        print(f"[hhx] dg1 {layer}/m{m}: geometry {geo} does not fit W {tuple(w.shape)} -> skipped", flush=True)
+        return None
+    if layer not in _HHX["dg1w"]:
+        _HHX["dg1w"][layer] = dg1_pack(w)
+    return {"kind": "dg1", "mod": mod, "kid": kid, "w": _HHX["dg1w"][layer], "err": torch.zeros(4, dtype=torch.int32, device=dev),
+            "S": s, "T": T, "N": n, "K": k, "desc": f"dg1_{T}.{nwg}.{mt}s{s}(bm{info[3]},r{info[5]})"}
+
+
+def _hhx_dg1_phase(state, timer, floor, dev):
+    """DG1 at m = 32 against the route vd_1 picked (GV, or SGLang's call when none beat it); every geometry of a shape is a candidate."""
+    summary = []
+    if not HHX_ENABLE or torch.cuda.get_device_capability(dev)[0] < 9:
+        return summary
+    _hhx_join()
+    if _HHX["dg1"] is None:
+        print(f"[hhx] dg1 module unavailable ({_HHX['dg1_err']}) -> no dg1 routes", flush=True)
+        return summary
+    for (layer, m) in sorted(HHX_DG1):
+        n, k = LAYERS[layer]
+        w = state[layer]
+        live = []
+        for geo in HHX_DG1[(layer, m)]:
+            try:
+                r = _hhx_dg1_route(layer, m, w, dev, geo)
+                if r is None:
+                    continue
+                good = True
+                for outl in (False, True):
+                    for mm in (m, m - 3):
+                        x, probes = _test_input(mm, k, 5150 + mm + int(outl), dev, outl)
+                        got = _route_call(r, x, n, layer)
+                        got2 = _route_call(r, x, n, layer)
+                        torch.cuda.synchronize()
+                        ok, msg = _check(got, x, w, probes, False, None, 5e-3)
+                        ok = ok and bool(torch.equal(got, got2)) and int(r["err"][0]) == 0
+                        if not ok:
+                            print(f"[hhx] dg1 {layer}/m{m} {r['desc']} SELF-TEST FAIL m={mm} outl={outl}: {msg}", flush=True)
+                            good = False
+                            break
+                    if not good:
+                        break
+                if good:
+                    live.append(r)
+            except Exception as ex:  # noqa: BLE001
+                print(f"[hhx] dg1 {layer}/m{m} {geo}: FALLBACK {repr(ex)[:200]}", flush=True)
+        if not live:
+            continue
+        try:
+            x, _ = _test_input(m, k, 4242 + m, dev)
+            inc = state["exact"].get((layer, m)) or state["routes"].get((layer, _bucket(layer, m)))
+            gs = [timer.graph(lambda: _stock(x, layer, n, state))]
+            if inc is not None:
+                gs.append(timer.graph(lambda: _route_call(inc, x, n, layer)))
+            for r in live:
+                gs.append(timer.graph(lambda r=r: _route_call(r, x, n, layer)))
+            tt = timer.times(gs, GV_REPS)
+            timer.release()
+            sgl = max(tt[0] - floor, 0.1)
+            off = 2 if inc is not None else 1
+            inc_t = max(tt[1] - floor, 0.1) if inc is not None else sgl
+            cand = " | ".join(f"{r['desc']} {max(t - floor, 0.1):.2f}" for r, t in zip(live, tt[off:]))
+            print(f"[hhx] T {layer} m={m}: sgl {sgl:.2f} | vd_1 route {inc['desc'] if inc is not None else 'SGLang'} {inc_t:.2f} | {cand}", flush=True)
+            bi = min(range(len(live)), key=lambda i: tt[off + i])
+            bt = max(tt[off + bi] - floor, 0.1)
+            if bt <= 0.97 * inc_t:
+                state["exact"][(layer, m)] = live[bi]
+                summary.append(f"{layer}/m{m}: dg1 {live[bi]['desc']} x{sgl / bt:.3f}")
+            else:
+                summary.append(f"{layer}/m{m}: dg1 not adopted (best x{sgl / bt:.3f} vs incumbent x{sgl / inc_t:.3f})")
+        except Exception as ex:  # noqa: BLE001
+            print(f"[hhx] dg1 {layer}/m{m}: timing FALLBACK {repr(ex)[:200]}", flush=True)
+    return summary
+
