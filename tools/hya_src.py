@@ -15,7 +15,7 @@ block (route, workspace handling, self-test, prepare) is team joeyhlu's own code
 # the shapes in HYA_ROUTE (first, before AX1 / KS1) and as the general fallback after AX1 / KS1 (HYA_DEFAULT).
 # kv_scale != 1 and unsupported layouts take the r1 path (SGLang FA3). _hya_plan / _hya_launch: derived from vjeux's
 # _plan / _launch (github.com/vjeux/okc-2026 f35a41ee, Apache-2.0), modified as HYA M2 / M3 in _HYA_NOTICE.
-_HYA = {"mod": None, "ws": {}, "inv": {}, "sms": {}, "build_s": 0.0, "seen": set()}
+_HYA = {"mod": None, "ws": {}, "inv": {}, "sms": {}, "build_s": 0.0, "seen": set(), "mk": False}
 
 
 def _hya_build():
@@ -34,26 +34,27 @@ def _hya_build():
 
 
 def _hya_ws(n_rows, dev):
-    # vjeux's persistent FP32 accumulators (the kernel's last CTA zeroes them again); HYA M3: never allocated inside a
-    # CUDA-graph capture (a capture records the zero fill instead of running it): the call then declines (r1 path)
-    key = str(dev)
-    ws = _HYA["ws"].get(key)
-    if ws is None or ws[0].numel() < n_rows * 64:
-        if torch.cuda.is_current_stream_capturing():
-            return None
+    # vjeux's persistent FP32 accumulators (the kernel's last CTA zeroes them again). HYA M3: made ONCE, in prepare, at the
+    # largest size any routed shape can ask for (HYA_WS_ROWS: B 512 x q_len 8 x 16 rows at one copy; B 1 plans use <= 8
+    # copies x 128 rows), and never reallocated or freed afterwards: a CUDA graph captured earlier keeps the raw
+    # pointers, so a grown-and-freed buffer would be a use-after-free on its replays. A call that needs more rows (or
+    # comes before prepare made the buffers) declines: the r1 path takes it.
+    ws = _HYA["ws"].get(str(dev))
+    if ws is None and _HYA["mk"]:
         n = max(n_rows, HYA_WS_ROWS)
-        ws = _HYA["ws"][key] = (torch.zeros(n * 64, dtype=torch.float32, device=dev),
-                                torch.zeros(n, dtype=torch.float32, device=dev),
-                                torch.zeros(n, dtype=torch.int32, device=dev))
+        ws = _HYA["ws"][str(dev)] = (torch.zeros(n * 64, dtype=torch.float32, device=dev),
+                                     torch.zeros(n, dtype=torch.float32, device=dev),
+                                     torch.zeros(n, dtype=torch.int32, device=dev))
+    if ws is None or ws[1].numel() < n_rows:
+        return None
     return ws
 
 
 def _hya_inv_freq(theta, dev):
+    # RoPE tables: made in prepare only (thetas 0 and ROPE_THETA); any other theta at call time declines (r1 path)
     key = (float(theta), str(dev))
     t = _HYA["inv"].get(key)
-    if t is None:
-        if torch.cuda.is_current_stream_capturing():
-            return None
+    if t is None and _HYA["mk"]:
         if theta:
             t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=dev).float() / 64))
         else:
@@ -295,14 +296,17 @@ def _hya_prepare(state, t0):
         if _PT1["errors"].get("hya"):
             raise RuntimeError(f"build failed: {_PT1['errors']['hya']}")
         _hya_build()
+        _HYA["mk"] = True
         _hya_ws(HYA_WS_ROWS, dev)
         for theta in (0.0, ROPE_THETA):
             _hya_inv_freq(theta, dev)
+        _HYA["mk"] = False
         worst = _hya_self_test(dev)
         state["hya"] = True
         print(f"[hya] LIVE: route {sorted(k for k, v in HYA_ROUTE.items() if v)} + fallback {HYA_DEFAULT}, worst err {worst:.3e}, "
               f"build {_HYA['build_s']:.0f}s, self-test {time.time() - t1:.1f}s, prepare so far {time.time() - t0:.1f}s", flush=True)
     except Exception as ex:
+        _HYA["mk"] = False
         print(f"[hya] FAILED, r1 path for its shapes: {ex!r}"[:1500], flush=True)
         for t in _HYA["ws"].values():
             for x in t:

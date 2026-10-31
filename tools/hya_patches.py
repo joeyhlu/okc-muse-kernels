@@ -275,7 +275,7 @@ def apply(base, mode, route, drop_ax1):
               "# muse_attention_decode.py CPP_SRC / CUDA_SRC (Apache-2.0, see THIRD_PARTY_NOTICES), verbatim except HYA M1.\n"
               f'HYA_CPP_SRC = r"""{cpp}"""\nHYA_CUDA_SRC = r"""{cuda}"""\n'
               f"HYA_ENABLE = True\nHYA_ROUTE = {rt}\nHYA_DEFAULT = {not lab}\nHYA_PDL = True\nHYA_PDL_T = {{}}\n"
-              f"HYA_TUNED = {TUNED}\nHYA_PREPARE_BY_S = 250.0\nHYA_WS_ROWS = 1 << 15\nHYA_SELF_TEST_STRICT = True\n"
+              f"HYA_TUNED = {TUNED}\nHYA_PREPARE_BY_S = 250.0\nHYA_WS_ROWS = 1 << 16\nHYA_SELF_TEST_STRICT = True\n"
               f"HYA_SELF_TEST = {SELF_TEST}\n"
               f"HYA_GRAPH_CASES = {GRAPH_CASES}\n"
               f'_HYA_NOTICE = r"""\n{notice_hya(fa4_left) + (FA4_BSD if fa4_left else "")}"""\n'
