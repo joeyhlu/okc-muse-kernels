@@ -1,14 +1,14 @@
-"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_3tekv_hyblo18.py (review 8.1).
+"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_4.py (review 8.1).
 
   python tools/build_final.py [--work=build_final] [--strict] [--no-gate] [--from-gc21] [--stop-after=N] [--start-at=N] [-v]
                               [--scored-copy=<path> [--note=<text>]]
 
-Regenerates k3_hh_3tekv_hyblo18 from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 15 patch steps below in
+Regenerates k3_hh_4 from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 18 patch steps below in
 order (each as a fresh `python -I -X utf8 tools/<patcher>` process from the repo root; outputs go to --work, never over a
 committed file). For every step it prints the input / output sha1 and size, compares the output with the committed
 intermediate (kernels/lab/*, when one exists) and with the sha1 recorded here, and warns if a patcher / helper file differs
 from the blob this recipe was recorded with. Last, it asserts the rebuilt file is byte-identical to the committed
-kernels/lab/k3_hh_3tekv_hyblo18.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
+kernels/lab/k3_hh_4.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
 tools/lead_gate.py on it.
 
 --from-gc21 adds step 0: kernels/muse_decode_layer/k3_gc_21.py (scored 2.1887) -> tools/cg_patches.py --trig=1 --ph=0 -> the ship
@@ -20,7 +20,7 @@ an anchored one-line replace; no committed patcher exists) and the line-2 nonce 
 and rob2's derived nonce overwrite it later, so it only matters for byte-identity of the committed k3_b29_raw).
 
 --scored-copy=<path>: also write a scored/check copy of the rebuilt file there (line 2 replaced by `# nonce <stem> (= kernels/lab/
-k3_hh_3tekv_hyblo18.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
+k3_hh_4.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
 Exit code: 0 = rebuilt == committed (and, unless --no-gate, the gate passed), 1 = mismatch / step failure / gate FAIL.
 """
 import argparse
@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_3tekv_hyblo18.py"
+FINAL = "kernels/lab/k3_hh_4.py"
 NONCE_HH_3TEKV = '# nonce k3-hh-3tekv (k3_hh_3rr + VMS_T16 NS2 + ER module for 9-16 tokens [tools/gen_k3_vt16.py --hi=ship --wt2=30 --hix=-DVMS_NS=2,-DVMS_ER=1] + R-kvs-2 [tools/kvs_patches.py] + R-v32 VML scratch fix [tools/vfx_patches.py])'
 LIMIT = 1_000_000
 
@@ -76,6 +76,10 @@ DEP_BLOBS = {
     "tools/vfx_patches.py": "2b0f04e973b110ffb321aa54b114911579816ebe",
     "tools/gen_k3_vt16.py": "e24e6e78f88605727b02729bf8f9d4885f477921",
     "tools/ver_patches.py": "cb15c46932209fbfa2831754cbe4ddf6851d65be",
+    "tools/cslim_patches.py": "6fa2c4200097f8d9052d48c13f968532c538ec7a",
+    "tools/rat_ship.py": "a7b92f705e73213e4c844edaf5a7dff3ba728cc4",
+    "tools/rat_patches.py": "ba5ed7adfc02cd57a7cd7dc29ec606dbd15ec52a",
+    "tools/graft_patches.py": "0aa14e395132e3d9dae3cf9ee2088619ffb40ba4",
     "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
     "tools/vt16_patches.py": "dce79a28df4318e6efbd14954b7a2714303dcab3",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
@@ -166,6 +170,18 @@ STEPS = [
                "third_party/alygg77-okc-muse-spark-kernels-6cae49a/NOTICE",
                "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
          ref="kernels/lab/k3_hh_3tekv_hyblo18.py", sha1="dc155277b5512cccc8c83a51fa5e51f610586285", size=998204),
+    # R-rb-2 (c18774b7) replicated rider subset: cslim (HYA_CUDA_SRC comment / indent strip, SASS identical), rat u8a (v1 -0.42 us),
+    # graft at T=256 (alygg77 Gluon row boundary, Apache-2.0 via _GFT_NOTICE; v32s -2.7 / v32f -0.9 us). NOT HYA f1, NOT hybst st7 / hn.
+    dict(n=16, name="cslim", out="k3_hh_4c.py", tool="tools/cslim_patches.py",
+         argv=["--base={in}", "--out={out}"], deps=["tools/cslim_patches.py", "tools/slim_patches.py"],
+         ref=None, sha1="07a9dd84df0fcdc3cfae341408206138ac4da7a9", size=980538),
+    dict(n=17, name="rat", out="k3_hh_4r.py", tool="tools/rat_ship.py",
+         argv=["--base={in}", "--out={out}", "--flips=u8a"], deps=["tools/rat_ship.py", "tools/rat_patches.py"],
+         ref=None, sha1="b2ac543263b0ade3c17b6badac6f21d2816215e2", size=980515),
+    dict(n=18, name="graft", out="k3_hh_4.py", tool="tools/graft_patches.py",
+         argv=["--base={in}", "--out={out}", "--route=256"],
+         deps=["tools/graft_patches.py", "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
+         ref="kernels/lab/k3_hh_4.py", sha1="ce3ff44993035a533b3b762c2ddb914d43c2ca65", size=988024),
 ]
 
 
