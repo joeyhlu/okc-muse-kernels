@@ -76,7 +76,7 @@ DEP_BLOBS = {
     "tools/vfx_patches.py": "2b0f04e973b110ffb321aa54b114911579816ebe",
     "tools/gen_k3_vt16.py": "e24e6e78f88605727b02729bf8f9d4885f477921",
     "tools/ver_patches.py": "cb15c46932209fbfa2831754cbe4ddf6851d65be",
-    "tools/hyblo_patches.py": "2a564fa34ab5b0fc7f3ac03bce2bfeda4b7812d1",
+    "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
     "tools/vt16_patches.py": "dce79a28df4318e6efbd14954b7a2714303dcab3",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
     "tools/slim_patches.py": "af514d9055754a6e3ec2017dd4777ae868bf9229",
@@ -159,13 +159,13 @@ STEPS = [
          argv=["--base={in}", "--out={out}"], deps=["tools/vfx_patches.py"],
          post=lambda t: _set_line2(t, NONCE_HH_3TEKV),
          ref="kernels/lab/k3_hh_3tekv.py", sha1="9d2497dcc0e8aef9ec055f88e3a2690803634cb4", size=950199),
-    # R-hyblo-1 (c4f0154a): alygg77 helper0 TINY MoE build (Apache-2.0, notices via _HYB_NOTICE) at T = 1 ahead of VMS
+    # R-hyblo-1 (c4f0154a; ship fix 8ff15f4c: _hyblo_prepare after _pt1_join_all): alygg77 helper0 TINY MoE build (Apache-2.0, notices via _HYB_NOTICE) at T = 1 ahead of VMS
     dict(n=15, name="hyblo", out="k3_hh_3tekv_hyblo.py", tool="tools/hyblo_patches.py",
          argv=["--ship=1", "--base={in}", "--out={out}"],
          deps=["tools/hyblo_patches.py", "tools/hyb_unifdef.py", "third_party/alygg77-okc-muse-spark-kernels-6cae49a/LICENSE",
                "third_party/alygg77-okc-muse-spark-kernels-6cae49a/NOTICE",
                "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
-         ref="kernels/lab/k3_hh_3tekv_hyblo.py", sha1="268f47f1593364b552925460d877e954aca3bf17", size=997639),
+         ref="kernels/lab/k3_hh_3tekv_hyblo.py", sha1="7776e90ed97e3bbb744435f8f746f84b41bf25cc", size=998027),
 ]
 
 
