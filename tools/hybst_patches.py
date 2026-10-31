@@ -308,7 +308,7 @@ def apply(s, bits, builds, st):
     for a, n, w in ((A_DBG, N_DBG, "OKC_DEBUG default"), (A_DEF, N_DEF, "OKC_HYBST default"), (A_SEGT, N_SEGT, "wgs_seg template head"),
                     (A_FIRST, N_FIRST, "first stage call"), (A_EPI, N_EPI, "whole-unit epilogue"),
                     (A_FIN, N_FIN, "phase-end flush"), (A_P1, N_P1, "final pass 1"), (A_P2, N_P2, "final pass 2")):
-        check(s.count(a) == 1 and cu.count(a) == 1, f"CUDA anchor {w} not unique inside _HYB_MOE_CUDA")
+        check(cu.count(a) == 1, f"CUDA anchor {w} not unique inside _HYB_MOE_CUDA")   # R-rb-2: _HYBLO_CUDA repeats some defaults; edits stay inside cu
         cu = cu.replace(a, n)
     s = s[:i0] + cu + s[i1:]
     a_flags = next(ln for ln in s.split(NL) if ln.startswith("HYB_FLAGS = ("))

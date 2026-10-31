@@ -202,6 +202,7 @@ def main():
     ap.add_argument("--route", default="128,256")
     ap.add_argument("--emit-kern")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--lab", action="store_true", help="GFT_ROUTE {} by default, prepare (build + self-test) regardless: arms set GFT_ROUTE")
     a = ap.parse_args()
     route = [int(x) for x in a.route.split(",") if x]
     if a.emit_kern:
@@ -215,6 +216,11 @@ def main():
     check(a.force or not dst.exists(), f"{dst} exists")
     base = src.read_bytes().decode("utf-8")
     t = apply(base, route)
+    if a.lab:
+        r0 = "GFT_ROUTE = {" + ", ".join(f"{b}: True" for b in route) + "}"
+        skip = "    if not GFT_ROUTE or not any(GFT_ROUTE.values()):\n        return\n"
+        check(t.count(r0) == 1 and t.count(skip) == 1, "lab anchors")
+        t = t.replace(r0, "GFT_ROUTE = {}", 1).replace(skip, "", 1)
     gate(t, base)
     dst.write_bytes(t.encode("utf-8"))
     print(f"[graft_patches] {a.base} -> {a.out}: route {route}")
