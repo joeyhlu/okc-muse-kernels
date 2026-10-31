@@ -46,6 +46,11 @@ a positional-input tool, `--ps=1` sets VSE_PS on bf2 and w72); dpin_2 == `dpin_p
 b29 stack = dpin -> BND256 -> ax2 (vx 3 st 3) -> ax1 `--route=1 --slim=0` (lab.md same entry); bundle order b29_raw -> hya -> hyb
 -> rob2 `--no-p2` -> slim LAST (lab.md 2026-10-31 ~00:10 UTC). The rebuilt files equal the committed ones, which settles it.
 
+**Step 13 (2026-10-31, lead): kvs** `tools/kvs_patches.py --base=k3_hh_3.py --out=k3_hh_3k.py` (R-kvs-2, 34ca93c7: kv_scale != 1
+at q_len 1 -> HYA, non-strict 3-case self-test, FA3 fallback). It anchors on slimmed text, so it runs AFTER slim; output ==
+committed kernels/lab/k3_hh_3k.py (sha1 9d979dcd, 937,781 B), FINAL = k3_hh_3k. rob2 P2 does not apply on the hya chain (AX1 site
+is `if o is None and _ax1_wanted(...)` after HYA) and stays off until ported.
+
 ## Gaps and hand edits (all automated in build_final.py; none changes the result)
 
 1. **BND attn-256 (step 6).** `V9_BND_ROUTE` gets `('attn', 256): (1, (1024, True))` (R-bndx-2). It was a hand sed in the b25 bundle

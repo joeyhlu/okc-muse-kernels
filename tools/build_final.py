@@ -1,14 +1,14 @@
-"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_3.py (review 8.1).
+"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_3k.py (review 8.1).
 
   python tools/build_final.py [--work=build_final] [--strict] [--no-gate] [--from-gc21] [--stop-after=N] [--start-at=N] [-v]
                               [--scored-copy=<path> [--note=<text>]]
 
-Regenerates k3_hh_3 from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 12 patch steps below in
+Regenerates k3_hh_3k from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 13 patch steps below in
 order (each as a fresh `python -I -X utf8 tools/<patcher>` process from the repo root; outputs go to --work, never over a
 committed file). For every step it prints the input / output sha1 and size, compares the output with the committed
 intermediate (kernels/lab/*, when one exists) and with the sha1 recorded here, and warns if a patcher / helper file differs
 from the blob this recipe was recorded with. Last, it asserts the rebuilt file is byte-identical to the committed
-kernels/lab/k3_hh_3.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
+kernels/lab/k3_hh_3k.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
 tools/lead_gate.py on it.
 
 --from-gc21 adds step 0: kernels/muse_decode_layer/k3_gc_21.py (scored 2.1887) -> tools/cg_patches.py --trig=1 --ph=0 -> the ship
@@ -20,7 +20,7 @@ an anchored one-line replace; no committed patcher exists) and the line-2 nonce 
 and rob2's derived nonce overwrite it later, so it only matters for byte-identity of the committed k3_b29_raw).
 
 --scored-copy=<path>: also write a scored/check copy of the rebuilt file there (line 2 replaced by `# nonce <stem> (= kernels/lab/
-k3_hh_3.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
+k3_hh_3k.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
 Exit code: 0 = rebuilt == committed (and, unless --no-gate, the gate passed), 1 = mismatch / step failure / gate FAIL.
 """
 import argparse
@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_3.py"
+FINAL = "kernels/lab/k3_hh_3k.py"
 LIMIT = 1_000_000
 
 NONCE_GC21CG = ("# nonce k3-gc-21cg-s1 (k3_gc_21 + CG trig: _k1fa4_combine_gate PREEXIT after its wait + gate load first; "
@@ -71,6 +71,7 @@ DEP_BLOBS = {
     "third_party/alygg77-okc-muse-spark-kernels-6cae49a/NOTICE": "8d1069372b982b1f4fc7bcf263635ba56594a73c",
     "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py": "02389585ece4c36bf983e2cd616a50c0f3a9364f",
     "tools/rob2_patches.py": "a45c9afaf4e482cf7e03653e5d5724678a5ff662",
+    "tools/kvs_patches.py": "985b5dbd6c5c4d7feb261cd308141af82ff46957",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
     "tools/slim_patches.py": "af514d9055754a6e3ec2017dd4777ae868bf9229",
     "tools/lead_gate.py": "44da1a756ce9e6ef4185efc8a2620beee93d4189",
@@ -140,6 +141,10 @@ STEPS = [
     dict(n=12, name="slim", out="k3_hh_3.py", tool="tools/slim_patches.py",
          argv=["--base={in}", "--out={out}"], deps=["tools/slim_patches.py"],
          ref="kernels/lab/k3_hh_3.py", sha1="88e2c90f936012b115aa6d18f5c32d57f605c7ae", size=935816),
+    # R-kvs-2 (34ca93c7): kv_scale != 1 at q_len 1 -> HYA; anchors on slimmed text, so it runs after slim
+    dict(n=13, name="kvs", out="k3_hh_3k.py", tool="tools/kvs_patches.py",
+         argv=["--base={in}", "--out={out}"], deps=["tools/kvs_patches.py"],
+         ref="kernels/lab/k3_hh_3k.py", sha1="9d979dcd0edea861a7f92cbed61ecaaa38204e2e", size=937781),
 ]
 
 
@@ -310,7 +315,7 @@ def main():
         print(f"\n[build_final] stopped after step {a.stop_after}")
         return 0
 
-    # ---- the assertion: rebuilt == committed k3_hh_3
+    # ---- the assertion: rebuilt == committed FINAL
     want, src = ref_bytes(FINAL)
     print(f"\n[build_final] FINAL  rebuilt {cur_path}\n              {fmt(cur)}\n              committed {FINAL} ({src})\n              {fmt(want)}")
     rc = 0
@@ -324,7 +329,7 @@ def main():
         rc = 1 if a.strict else 0
     else:
         print("[build_final] RESULT: MISMATCH from line 3 on")
-        report_diff(cur, want, "k3_hh_3.py")
+        report_diff(cur, want, pathlib.PurePosixPath(FINAL).name)
         if first_bad:
             print(f"        first step whose output differs from the recorded sha1: {first_bad['n']} ({first_bad['name']}, {first_bad['tool'] if 'tool' in first_bad else 'inline'})")
         rc = 1
