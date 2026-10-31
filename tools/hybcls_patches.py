@@ -5,15 +5,15 @@
 
 R-hybsm-2: the same FT_T 32 HYB code with 47,616 B of unused dynamic smem (196 -> 228 KB carveout class) costs +7.85 us at d32s; the L1
 capacity reading is rejected on paper (fresh_handoff_audit.md s11: the gather keeps <= 212 lines in flight, 52 CCTL.IVALL per kernel). This
-file adds six timing/diagnostic modules next to the base's ship HYB, "32" (FT_T 32) and "nx2" (x ring 2, 198,400 B); each is HYB's CUDA
+file adds six timing/diagnostic modules next to the base's ship HYB and "32" (FT_T 32, 183,552 B); each is HYB's CUDA
 source after a text transform (tools/hybx_common.py helper: own PT1 build job, own scratch, ship weight copies, prepare self-test vs FP32
 and vs the ship HYB; a failing module stays OFF), routed by its own window variable (default (0, -1) = never; arms set it):
   32p   "32" + 47,616 B of UNUSED dynamic smem (231,168 B, 228 KB class): the +7.85 us reference
   32c   "32" (183,552 B) with cudaFuncAttributePreferredSharedMemoryCarveout = 100 (MaxShared): the 228 KB carveout without one extra byte
   32n   "32" with every L1-allocating global load turned into ld.global.nc.L1::no_allocate (topk_ids, x gather, normw, gsA / gsB, topk_w)
   32pn  32p with the same L1 bypass
-  nx2p  "nx2" + 32,768 B of unused smem (231,168 B, 228 KB class): same depth-2 x ring as nx2, same footprint as the ship HYB
-  n64   ship HYB with the L1 bypass (production shapes)
+  40    ship HYB with FT_T 40 (x slot 20,480 B instead of 32,768, rings stay 3 deep): about 195 KB, the 196 KB class; the lever candidate
+  40p   "40" + unused smem up to 231,168 B (the ship HYB's size, 228 KB class): same code and rings, only the carveout class moves
 """
 import ast
 import pathlib
@@ -45,11 +45,12 @@ LAB = r'''HYB32P_T = (0, -1)
 HYB32C_T = (0, -1)
 HYB32N_T = (0, -1)
 HYB32PN_T = (0, -1)
-HYBNX2P_T = (0, -1)
-HYBN64_T = (0, -1)
+HYB40_T = (0, -1)
+HYB40P_T = (0, -1)
 HYB32P_PAD = 47616
-HYBNX2P_PAD = 32768
+HYB40_TARGET = 231168
 HYB32P_TESTS = ((32, 72, "skewed"), (32, 75, "conc1"))
+HYB40_TESTS = ((128, 64, "skewed"), (256, 67, "normal"), (128, 79, "conc3"), (320, 69, "normal"))
 _CLS_PADA = "size_t sm = okc_smem_bytes();\n"
 _CLS_CARVA = "(void)e0; (void)e1;\n"
 _CLS_NOL1_H = "\n".join([
@@ -72,6 +73,19 @@ def _cls_pad(s, n):
     if s is None or s.count(_CLS_PADA) != 1:
         return None
     return "#define OKC_SMPAD %d\n" % n + s.replace(_CLS_PADA, "size_t sm = okc_smem_bytes() + (size_t)OKC_SMPAD;\n")
+def _cls_target(s, n):
+    if s is None or s.count(_CLS_PADA) != 1:
+        return None
+    return ("#define OKC_SMTARGET %d\n" % n
+            + s.replace(_CLS_PADA, "size_t sm = okc_smem_bytes();\nif (sm < (size_t)OKC_SMTARGET) sm = (size_t)OKC_SMTARGET;\n"))
+def _cls_ft40(s):
+    seg = "(p, S, ring, u, s0, s1, slot, seq, pd); break;\n"
+    old = "".join(f"case {k}: wgs_seg<PB, {k}>{seg}" for k in (5, 6, 7)) + f"default: wgs_seg<PB, 8>{seg}"
+    for a, b in (("#define OKC_FT_T 64\n", "#define OKC_FT_T 40\n"), (old, f"default: wgs_seg<PB, 5>{seg}")):
+        if s is None or s.count(a) != 1:
+            return None
+        s = s.replace(a, b)
+    return s
 def _cls_carve(s):
     if s is None or s.count(_CLS_CARVA) != 1:
         return None
@@ -92,10 +106,10 @@ _HYBX["32p"] = {"src": _cls_pad(_HYBX["32"]["src"], HYB32P_PAD), "mod": None, "o
 _HYBX["32c"] = {"src": _cls_carve(_HYBX["32"]["src"]), "mod": None, "ok": False, "pdl": -1}
 _HYBX["32n"] = {"src": _cls_nol1(_HYBX["32"]["src"]), "mod": None, "ok": False, "pdl": -1}
 _HYBX["32pn"] = {"src": _cls_nol1(_cls_pad(_HYBX["32"]["src"], HYB32P_PAD)), "mod": None, "ok": False, "pdl": -1}
-_HYBX["nx2p"] = {"src": _cls_pad(_HYBX["nx2"]["src"], HYBNX2P_PAD), "mod": None, "ok": False, "pdl": -1}
-_HYBX["n64"] = {"src": _cls_nol1(_HYB_MOE_CUDA), "mod": None, "ok": False, "pdl": -1}
+_HYBX["40"] = {"src": _cls_ft40(_HYB_MOE_CUDA), "mod": None, "ok": False, "pdl": -1}
+_HYBX["40p"] = {"src": _cls_target(_cls_ft40(_HYB_MOE_CUDA), HYB40_TARGET), "mod": None, "ok": False, "pdl": -1}
 _CLS_MODS = (("32p", HYB32P_TESTS), ("32c", HYB32P_TESTS), ("32n", HYB32P_TESTS), ("32pn", HYB32P_TESTS),
-             ("nx2p", HYBNX2_TESTS), ("n64", HYBNX2_TESTS))
+             ("40", HYB40_TESTS), ("40p", HYB40_TESTS))
 def _hybcls_prepare(st, w, dev):
     for _hn, _tests in _CLS_MODS:
         if _HYBX[_hn]["src"] is None:
@@ -104,12 +118,12 @@ def _hybcls_prepare(st, w, dev):
         _hybx_prepare(_hn, w, dev, _tests)
 '''
 A_DISPATCH = "    if _hyb_on(x.shape[0]):\n"
-N_DISPATCH = ("    for _hn, _hr in (\"32p\", HYB32P_T), (\"32c\", HYB32C_T), (\"32n\", HYB32N_T), (\"32pn\", HYB32PN_T), (\"nx2p\", HYBNX2P_T), (\"n64\", HYBN64_T):\n"
+N_DISPATCH = ("    for _hn, _hr in (\"32p\", HYB32P_T), (\"32c\", HYB32C_T), (\"32n\", HYB32N_T), (\"32pn\", HYB32PN_T), (\"40\", HYB40_T), (\"40p\", HYB40P_T):\n"
               "        if _hr[0] <= x.shape[0] <= _hr[1] and _HYBX[_hn][\"ok\"]:\n"
               "            return _hybx_call(_hn, x, local_ids.to(torch.int32).contiguous(), topk_weights.to(torch.float32).contiguous())\n"
               + A_DISPATCH)
 A_PT1 = '        jobs.append(("hyb", _hyb_build))\n'
-N_PT1 = (A_PT1 + '        for _hn in ("32p", "32c", "32n", "32pn", "nx2p", "n64"):\n'
+N_PT1 = (A_PT1 + '        for _hn in ("32p", "32c", "32n", "32pn", "40", "40p"):\n'
          '            if _HYBX[_hn]["src"] is not None:\n'
          '                jobs.append(("hyb" + _hn, (lambda _n=_hn: _hybx_build(_n))))\n')
 A_PREP = "    _hyb_prepare(st, w, dev)\n"
@@ -118,11 +132,11 @@ N_PREP = A_PREP + "    _hybcls_prepare(st, w, dev)\n"
 
 def apply(s, base_name):
     lines = s.split(NL)
-    lines[1] = (f"# nonce k3-hybcls-ab ({base_name} + R-hybcls-0 lab: HYB modules 32p / 32c / 32n / 32pn / nx2p / n64 "
-                f"(unused-smem pad, carveout attribute, L1 bypass); tools/hybcls_patches.py)")
+    lines[1] = (f"# nonce k3-hybcls-ab ({base_name} + R-hybcls-0 lab: HYB modules 32p / 32c / 32n / 32pn / 40 / 40p "
+                f"(unused-smem pad, carveout attribute, L1 bypass, FT_T 40 diet); tools/hybcls_patches.py)")
     s = NL.join(lines)
     check("\ndef _hybx_build(name):\n" in s, "base lacks the hybx helper (use k3_hybsm_ab.py)")
-    check('_HYBX["32"] = ' in s and '_HYBX["nx2"] = ' in s, 'base lacks modules "32" and "nx2" (use k3_hybsm_ab.py)')
+    check('_HYBX["32"] = ' in s, 'base lacks module "32" (use k3_hybsm_ab.py)')
     s = sub(s, hybx_common.ANCHOR, LAB + hybx_common.ANCHOR, "lab block")
     s = sub(s, A_DISPATCH, N_DISPATCH, "dispatch")
     s = sub(s, A_PT1, N_PT1, "pt1 jobs")

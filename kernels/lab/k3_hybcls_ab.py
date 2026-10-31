@@ -1,5 +1,5 @@
 # okc: problem=muse_decode_layer
-# nonce k3-hybcls-ab (k3_hybsm_ab + R-hybcls-0 lab: HYB modules 32p / 32c / 32n / 32pn / nx2p / n64 (unused-smem pad, carveout attribute, L1 bypass); tools/hybcls_patches.py)
+# nonce k3-hybcls-ab (k3_hybsm_ab + R-hybcls-0 lab: HYB modules 32p / 32c / 32n / 32pn / 40 / 40p (unused-smem pad, carveout attribute, L1 bypass, FT_T 40 diet); tools/hybcls_patches.py)
 THIRD_PARTY_NOTICES = r"""Third-party code in this file (team joeyhlu, Muse Spark Open Kernel Challenge). Each reused block appends its NOTICE-style section below the license text (THIRD_PARTY_NOTICES += _<X>_NOTICE); code not attributed there is team joeyhlu's own.
 ---- Apache License, Version 2.0: full text (applies to every section below marked Apache-2.0) ----
                                  Apache License
@@ -5932,11 +5932,12 @@ HYB32P_T = (0, -1)
 HYB32C_T = (0, -1)
 HYB32N_T = (0, -1)
 HYB32PN_T = (0, -1)
-HYBNX2P_T = (0, -1)
-HYBN64_T = (0, -1)
+HYB40_T = (0, -1)
+HYB40P_T = (0, -1)
 HYB32P_PAD = 47616
-HYBNX2P_PAD = 32768
+HYB40_TARGET = 231168
 HYB32P_TESTS = ((32, 72, "skewed"), (32, 75, "conc1"))
+HYB40_TESTS = ((128, 64, "skewed"), (256, 67, "normal"), (128, 79, "conc3"), (320, 69, "normal"))
 _CLS_PADA = "size_t sm = okc_smem_bytes();\n"
 _CLS_CARVA = "(void)e0; (void)e1;\n"
 _CLS_NOL1_H = "\n".join([
@@ -5959,6 +5960,19 @@ def _cls_pad(s, n):
     if s is None or s.count(_CLS_PADA) != 1:
         return None
     return "#define OKC_SMPAD %d\n" % n + s.replace(_CLS_PADA, "size_t sm = okc_smem_bytes() + (size_t)OKC_SMPAD;\n")
+def _cls_target(s, n):
+    if s is None or s.count(_CLS_PADA) != 1:
+        return None
+    return ("#define OKC_SMTARGET %d\n" % n
+            + s.replace(_CLS_PADA, "size_t sm = okc_smem_bytes();\nif (sm < (size_t)OKC_SMTARGET) sm = (size_t)OKC_SMTARGET;\n"))
+def _cls_ft40(s):
+    seg = "(p, S, ring, u, s0, s1, slot, seq, pd); break;\n"
+    old = "".join(f"case {k}: wgs_seg<PB, {k}>{seg}" for k in (5, 6, 7)) + f"default: wgs_seg<PB, 8>{seg}"
+    for a, b in (("#define OKC_FT_T 64\n", "#define OKC_FT_T 40\n"), (old, f"default: wgs_seg<PB, 5>{seg}")):
+        if s is None or s.count(a) != 1:
+            return None
+        s = s.replace(a, b)
+    return s
 def _cls_carve(s):
     if s is None or s.count(_CLS_CARVA) != 1:
         return None
@@ -5979,10 +5993,10 @@ _HYBX["32p"] = {"src": _cls_pad(_HYBX["32"]["src"], HYB32P_PAD), "mod": None, "o
 _HYBX["32c"] = {"src": _cls_carve(_HYBX["32"]["src"]), "mod": None, "ok": False, "pdl": -1}
 _HYBX["32n"] = {"src": _cls_nol1(_HYBX["32"]["src"]), "mod": None, "ok": False, "pdl": -1}
 _HYBX["32pn"] = {"src": _cls_nol1(_cls_pad(_HYBX["32"]["src"], HYB32P_PAD)), "mod": None, "ok": False, "pdl": -1}
-_HYBX["nx2p"] = {"src": _cls_pad(_HYBX["nx2"]["src"], HYBNX2P_PAD), "mod": None, "ok": False, "pdl": -1}
-_HYBX["n64"] = {"src": _cls_nol1(_HYB_MOE_CUDA), "mod": None, "ok": False, "pdl": -1}
+_HYBX["40"] = {"src": _cls_ft40(_HYB_MOE_CUDA), "mod": None, "ok": False, "pdl": -1}
+_HYBX["40p"] = {"src": _cls_target(_cls_ft40(_HYB_MOE_CUDA), HYB40_TARGET), "mod": None, "ok": False, "pdl": -1}
 _CLS_MODS = (("32p", HYB32P_TESTS), ("32c", HYB32P_TESTS), ("32n", HYB32P_TESTS), ("32pn", HYB32P_TESTS),
-             ("nx2p", HYBNX2_TESTS), ("n64", HYBNX2_TESTS))
+             ("40", HYB40_TESTS), ("40p", HYB40_TESTS))
 def _hybcls_prepare(st, w, dev):
     for _hn, _tests in _CLS_MODS:
         if _HYBX[_hn]["src"] is None:
@@ -6064,7 +6078,7 @@ def _v11_k2a33_call(x, local_ids, topk_weights, st):
                 print(f"[hyb32] route raised ({ex!r}): this call on VML / K2A", flush=True)
     if HYBNX2_T[0] <= x.shape[0] <= HYBNX2_T[1] and _HYBX["nx2"]["ok"]:
         return _hybx_call("nx2", x, local_ids.to(torch.int32).contiguous(), topk_weights.to(torch.float32).contiguous())
-    for _hn, _hr in ("32p", HYB32P_T), ("32c", HYB32C_T), ("32n", HYB32N_T), ("32pn", HYB32PN_T), ("nx2p", HYBNX2P_T), ("n64", HYBN64_T):
+    for _hn, _hr in ("32p", HYB32P_T), ("32c", HYB32C_T), ("32n", HYB32N_T), ("32pn", HYB32PN_T), ("40", HYB40_T), ("40p", HYB40P_T):
         if _hr[0] <= x.shape[0] <= _hr[1] and _HYBX[_hn]["ok"]:
             return _hybx_call(_hn, x, local_ids.to(torch.int32).contiguous(), topk_weights.to(torch.float32).contiguous())
     if _hyb_on(x.shape[0]):
@@ -9508,7 +9522,7 @@ def _pt1_start():
         jobs.append(("vml", _vml_build_job))
     if HYB_ENABLE:
         jobs.append(("hyb", _hyb_build))
-        for _hn in ("32p", "32c", "32n", "32pn", "nx2p", "n64"):
+        for _hn in ("32p", "32c", "32n", "32pn", "40", "40p"):
             if _HYBX[_hn]["src"] is not None:
                 jobs.append(("hyb" + _hn, (lambda _n=_hn: _hybx_build(_n))))
         if _HYBX["nx2"]["src"] is not None:
