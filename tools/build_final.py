@@ -1,14 +1,14 @@
-"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_4.py (review 8.1).
+"""build_final.py: one reproducible build of the final decode_layer candidate kernels/lab/k3_hh_5.py (review 8.1).
 
   python tools/build_final.py [--work=build_final] [--strict] [--no-gate] [--from-gc21] [--stop-after=N] [--start-at=N] [-v]
                               [--scored-copy=<path> [--note=<text>]]
 
-Regenerates k3_hh_4 from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 18 patch steps below in
+Regenerates k3_hh_5 from the scored ship kernels/muse_decode_layer/k3_gc_21cg_s1.py by running the 19 patch steps below in
 order (each as a fresh `python -I -X utf8 tools/<patcher>` process from the repo root; outputs go to --work, never over a
 committed file). For every step it prints the input / output sha1 and size, compares the output with the committed
 intermediate (kernels/lab/*, when one exists) and with the sha1 recorded here, and warns if a patcher / helper file differs
 from the blob this recipe was recorded with. Last, it asserts the rebuilt file is byte-identical to the committed
-kernels/lab/k3_hh_4.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
+kernels/lab/k3_hh_5.py (--strict: lines 1-2 too; default: a difference in lines 1-2 only is reported and tolerated) and runs
 tools/lead_gate.py on it.
 
 --from-gc21 adds step 0: kernels/muse_decode_layer/k3_gc_21.py (scored 2.1887) -> tools/cg_patches.py --trig=1 --ph=0 -> the ship
@@ -20,7 +20,7 @@ an anchored one-line replace; no committed patcher exists) and the line-2 nonce 
 and rob2's derived nonce overwrite it later, so it only matters for byte-identity of the committed k3_b29_raw).
 
 --scored-copy=<path>: also write a scored/check copy of the rebuilt file there (line 2 replaced by `# nonce <stem> (= kernels/lab/
-k3_hh_4.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
+k3_hh_5.py: <note>)`, everything else byte-identical; refuses to overwrite). See kernels/lab/RECIPE.md.
 Exit code: 0 = rebuilt == committed (and, unless --no-gate, the gate passed), 1 = mismatch / step failure / gate FAIL.
 """
 import argparse
@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_4.py"
+FINAL = "kernels/lab/k3_hh_5.py"
 NONCE_HH_3TEKV = '# nonce k3-hh-3tekv (k3_hh_3rr + VMS_T16 NS2 + ER module for 9-16 tokens [tools/gen_k3_vt16.py --hi=ship --wt2=30 --hix=-DVMS_NS=2,-DVMS_ER=1] + R-kvs-2 [tools/kvs_patches.py] + R-v32 VML scratch fix [tools/vfx_patches.py])'
 LIMIT = 1_000_000
 
@@ -80,6 +80,8 @@ DEP_BLOBS = {
     "tools/rat_ship.py": "a7b92f705e73213e4c844edaf5a7dff3ba728cc4",
     "tools/rat_patches.py": "ba5ed7adfc02cd57a7cd7dc29ec606dbd15ec52a",
     "tools/graft_patches.py": "0aa14e395132e3d9dae3cf9ee2088619ffb40ba4",
+    "tools/hyb193_patches.py": "0c81ffef3235a927ae9b9f6af9e97f802a65e939",
+    "tools/hybst_patches.py": "f1500897f907110e4d6199c8833a07044a3b6631",
     "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
     "tools/vt16_patches.py": "dce79a28df4318e6efbd14954b7a2714303dcab3",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
@@ -182,6 +184,10 @@ STEPS = [
          argv=["--base={in}", "--out={out}", "--route=256"],
          deps=["tools/graft_patches.py", "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
          ref="kernels/lab/k3_hh_4.py", sha1="ce3ff44993035a533b3b762c2ddb914d43c2ca65", size=988024),
+    # R-hyb193-1 (16e55d42): HYB st7 + hn as a second HYB module for T >= 193 only (T < 193 module SASS-identical to k3_hh_4's)
+    dict(n=19, name="hyb193", out="k3_hh_5.py", tool="tools/hyb193_patches.py",
+         argv=["--base={in}", "--out={out}"], deps=["tools/hyb193_patches.py", "tools/hybst_patches.py"],
+         ref="kernels/lab/k3_hh_5.py", sha1="538064d59d5cd70261941e61d0cbe2e7d37b111f", size=995100),
 ]
 
 
