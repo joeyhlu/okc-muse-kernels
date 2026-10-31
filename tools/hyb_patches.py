@@ -332,9 +332,10 @@ ROUTE_OLD = '''    rep = _k2a_bucket_of(x.shape[0])
 ROUTE_NEW = '''    if _hyb_on(x.shape[0]):
         try:
             return _hyb_call(x, local_ids.to(torch.int32).contiguous(), topk_weights.to(torch.float32).contiguous())
-        except Exception as ex:
-            print(f"[hyb] route raised ({ex!r}): VML / K2A from here on", flush=True)
-            _HYB["ok"] = False
+        except Exception as ex:   # this call falls through to VML / K2A; no process-wide disable (rob2 P1 rule)
+            if not _HYB.get("warned"):
+                _HYB["warned"] = True
+                print(f"[hyb] route raised ({ex!r}): this call on VML / K2A", flush=True)
     rep = _k2a_bucket_of(x.shape[0])
     vrep = _nb_vml_rep(x.shape[0])
     if VML_ENABLE and VML_BUCKETS.get(vrep)'''
