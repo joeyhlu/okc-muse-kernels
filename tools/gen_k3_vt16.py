@@ -21,6 +21,7 @@ PAD = ARGS.get("pad", "")   # R-vt16-3: e.g. 81920 -> a third VMS module = the b
 M2 = [f for f in ARGS.get("m2", "").split(",") if f]   # R-vt16-4: the third module's defines instead of the pad (e.g. -DVMS_T16=1,-DVMS_T16R=1)
 HIX = [f for f in ARGS.get("hix", "").split(",") if f]   # extra defines for the T16 (VMS_HI_ON 1) module
 LO = [f for f in ARGS.get("lo", "").split(",") if f]   # R-vil: defines of a module for M == 1 calls (VMS_LO_ON), e.g. -DVMS_IL=1
+LOMAX = int(ARGS.get("lomax", "1"))   # R-vcb: the lo module serves calls with M <= LOMAX tokens
 NL = chr(10)
 import vil_patches as PI  # noqa: E402
 
@@ -74,7 +75,16 @@ def main():
     s = BASE.read_text(encoding="utf-8")
     a = s.index('VMS_CUDA_SRC = r"""') + len('VMS_CUDA_SRC = r"""')
     b = s.index('"""', a)
-    s = s[:a] + (PI.apply(PT.apply(s[a:b])) if (LO or ARGS.get("vil") == "1") else PT.apply(s[a:b])) + s[b:]
+    src = PT.apply(s[a:b])
+    if LO or ARGS.get("vil") == "1":
+        src = PI.apply(src)
+    if ARGS.get("vcb") == "1" or any("VMS_CB" in f for f in LO + HIX):   # R-vcb: batched combine loads (flag-gated)
+        import vcb_patches as PC
+        src = PC.apply(src)
+    if ARGS.get("ver") == "1" or any("VMS_ER" in f for f in LO + HIX):   # R-ver: early slot release (flag-gated)
+        import ver_patches as PV
+        src = PV.apply(src)
+    s = s[:a] + src + s[b:]
     fl ='    flags = ["-O3", f"-DVMS_G={G}", "-DVMS_NS=3", "-DVMS_RO=1", "-Xptxas=-warn-spills", "-gencode=arch=compute_90a,code=sm_90a"]\n'
     if MODE == "ship":   # ship = VMS_HI_ON True + a T16-only prepare self-test that drops the T16 module (not VMS) on a failure
         anchor = "        good = True" + NL + "        for bs, seed, dist in VMS_SELF_TEST_CASES:" + NL
@@ -119,12 +129,13 @@ def main():
                  + '    _VMS["mod_hi"] = load_inline(')
         s = _rep(s, '        st["vms"] = {"mod": mod, "mod_hi": _VMS.get("mod_hi"), ', '        st["vms"] = {"mod": mod, "mod_hi": _VMS.get("mod_hi"), "mod_lo": _VMS.get("mod_lo"), ')
         s = _rep(s, '    md.run(x, ids, tw, vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"],' + NL,
-                 '    md = vs["mod_lo"] if (VMS_LO_ON and m == 1 and vs.get("mod_lo") is not None) else md   # R-vil' + NL
+                 '    md = vs["mod_lo"] if (VMS_LO_ON and m <= @LOMAX@ and vs.get("mod_lo") is not None) else md   # R-vil / R-vcb' + NL
                  + '    md.run(x, ids, tw, vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"],' + NL)
         s = _rep(s, "VMS_HI_ON = {ON}", "VMS_LO_ON = {ON}   # R-vil: True = the M == 1 VMS module for calls with 1 token" + NL + "VMS_HI_ON = {ON}")
         if MODE == "ship":
             anchor = "        good = True" + NL + "        for bs, seed, dist in VMS_SELF_TEST_CASES:" + NL
             s = _rep(s, anchor, LO_SELF_TEST + anchor)
+    s = s.replace("@LOMAX@", str(LOMAX))
     s = s.replace("{ON}", "True" if MODE == "ship" else "False").replace("@WT2@", WT2)
     if MODE == "ship":   # the T16 module compiles in a thread next to the ship module (prepare: ~max, not the sum, of two nvcc runs)
         i0 = s.index('    mod = load_inline(name=f"k3_vms_{tag}"')
