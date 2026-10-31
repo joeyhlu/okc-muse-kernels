@@ -16,8 +16,9 @@ segment), so the ext_muse_moe_field.md s4.1 "stitch" is already in the base. Wha
              (wgs_epi_consts / wgs_epi_tile_c: same expressions).
   bit 2 FIN  the phase-end flush (B: the designated finisher = the CTA's LAST segment, on the CTA tail; A: the last
              segment's count / release): read-back of ntt float4 per thread two at a time (ceil(ntt/2) serial L2 round
-             trips + per-tile constant reloads). Fix: wgs_flush_end = wgs_flush with all ntt loads in flight at once and
-             the constants loaded alongside (no accumulators are live at the phase end).
+             trips + per-tile constant reloads). Fix (phase B end only): wgs_flush_end = wgs_flush with OKC_HYBFB = 4
+             n-tiles per round trip and the constants loaded once alongside (8 in flight, or FIN at the A end too,
+             spill at the 96-register cap: 18 warps -> 5 per SMSP -> 96).
   bit 4 FP2  the in-launch final pass: pass 2 re-reads every y row (__ldcg, L2) and topk_w after two CTA barriers. Fix:
              pass 1 keeps its y float4s and the topk_w values in registers for pass 2.
 Bit 8 (lab only): -DOKC_DEBUG=1 = alygg77's own per-CTA globaltimer marks (DBG 0..7) into _HYB["dbg"] (marks builds are
