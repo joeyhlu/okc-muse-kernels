@@ -5947,11 +5947,14 @@ return r;
 #ifndef VMS_T16
 #define VMS_T16 0
 #endif
+#ifndef VMS_LPAD
+#define VMS_LPAD 0
+#endif
 #ifndef VMS_WT1
 #define VMS_WT1 20
 #endif
 #ifndef VMS_WT2
-#define VMS_WT2 26   // R-vt16: split weight of a 2-tile unit (> 8 tokens)
+#define VMS_WT2 30   // R-vt16: split weight of a 2-tile unit (> 8 tokens)
 #endif
 #ifndef VMS_G
 #define VMS_G 132
@@ -5969,9 +5972,9 @@ __nv_bfloat16* inter; float* ybuf; float* ss; int* ctr;
 __nv_bfloat16* out; long long* marks; int m; float eps; int lo;
 };
 struct __align__(16) Smem {
-uint64_t full[NS];
-uint64_t pfull[NRB];
-uint64_t pempty[NRB];
+  uint64_t full[NS];
+  uint64_t pfull[NRB];
+  uint64_t pempty[NRB];
 int njobs, gen;
 int base[4][NE];
 int jE[MAXJ], jS[MAXJ], jC[MAXJ];
@@ -5980,6 +5983,10 @@ float4 red[NRB][NW][32];
 #if VMS_T16
   float4 red2[NRB][NW][32];   // R-vt16: tile-2 partials
   uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane
+  int pl[4];                    // R-vt16: this CTA's a0, a1, b0, b1 (warp 0, route)
+#endif
+#if VMS_LPAD > 0
+unsigned char lpad[VMS_LPAD];
 #endif
 };
 constexpr int RING_OFF = (int)((sizeof(Smem) + 127) / 128 * 128);
@@ -6026,20 +6033,23 @@ asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" :: "r"(su32(bar
 #endif
 }
 #if VMS_T16
-__device__ __forceinline__ int t16_split(const Smem& S, int njobs, int per, long long x) {
-long long acc = 0;
-for (int j = 0; j < njobs; ++j) {
-const int w = S.jC[j] > 8 ? VMS_WT2 : VMS_WT1;
-const long long seg = (long long)per * w;
-if (x < acc + seg) return j * per + (int)((x - acc) / w);
-acc += seg;
+__device__ __forceinline__ int t16_jw(int s0, int s1, int j) {
+const int u0 = __shfl_sync(0xffffffffu, s0, (j - 1) & 31), u1 = __shfl_sync(0xffffffffu, s1, (j - 33) & 31);
+return j == 0 ? 0 : (j <= 32 ? u0 : u1);
 }
-return njobs * per;
+__device__ __forceinline__ int t16_wj(int w0, int w1, int j) {
+const int u0 = __shfl_sync(0xffffffffu, w0, j & 31), u1 = __shfl_sync(0xffffffffu, w1, j & 31);
+return j < 32 ? u0 : (j < 64 ? u1 : 0);
 }
-__device__ __forceinline__ long long t16_wpre(const Smem& S, int per, int v) {
-long long acc = 0;
-for (int j = 0; j < v / per; ++j) acc += (long long)per * (S.jC[j] > 8 ? VMS_WT2 : VMS_WT1);
-return acc + (long long)(v % per) * (S.jC[v / per] > 8 ? VMS_WT2 : VMS_WT1);
+__device__ __forceinline__ int t16_split(int s0, int s1, int w0, int w1, int nJ, int per, int x) {
+const int lane = threadIdx.x & 31;
+const int lo = __popc(__ballot_sync(0xffffffffu, lane < nJ && per * s0 <= x)) + __popc(__ballot_sync(0xffffffffu, lane + 32 < nJ && per * s1 <= x));
+const int dx = x - per * t16_jw(s0, s1, lo), wl = t16_wj(w0, w1, lo);
+return lo >= nJ ? nJ * per : lo * per + (wl == VMS_WT2 ? dx / VMS_WT2 : dx / VMS_WT1);
+}
+__device__ __forceinline__ int t16_wpre(int s0, int s1, int w0, int w1, int per, int v) {
+const int j = v / per;
+return per * t16_jw(s0, s1, j) + (v - j * per) * t16_wj(w0, w1, j);
 }
 #endif
 __device__ __forceinline__ uint32_t scd(uint32_t w, uint32_t sel, uint32_t k16) {
@@ -6069,14 +6079,14 @@ long long* mrow = p.marks + (size_t)c * 16;
 if (tid == 0) {
 if (mk) mrow[0] = gt();
 #if __CUDA_ARCH__ >= 900
-for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], 1);
+    for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], 1);
 #else
-for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], NT);
+    for (int i = 0; i < NS; ++i) mbar_init(&S.full[i], NT);
 #endif
 #if VMS_RO
-for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], NW); mbar_init(&S.pempty[i], 1); }
+    for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], NW); mbar_init(&S.pempty[i], 1); }
 #else
-for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], 1); mbar_init(&S.pempty[i], 1); }
+    for (int i = 0; i < NRB; ++i) { mbar_init(&S.pfull[i], 1); mbar_init(&S.pempty[i], 1); }
 #endif
 #if __CUDA_ARCH__ >= 900
 asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -6127,15 +6137,35 @@ int run = off;
 for (int r = 0; r < 4; ++r) { S.base[r][lane] = run; run += cr[r]; }
 if (lane == 31) S.njobs = jinc;
 __syncwarp();
+#if VMS_T16
+{
+const int nJ = __shfl_sync(0xffffffffu, jinc, 31);
+const int w0 = lane < nJ ? (S.jC[lane] > 8 ? VMS_WT2 : VMS_WT1) : 0;
+const int w1 = lane + 32 < nJ ? (S.jC[lane + 32] > 8 ? VMS_WT2 : VMS_WT1) : 0;
+int s0 = w0, s1 = w1;
+#pragma unroll
+for (int d = 1; d < 32; d <<= 1) {
+const int u0 = __shfl_up_sync(0xffffffffu, s0, d), u1 = __shfl_up_sync(0xffffffffu, s1, d);
+if (lane >= d) { s0 += u0; s1 += u1; }
+}
+s1 += __shfl_sync(0xffffffffu, s0, 31);
+const int WJ = __shfl_sync(0xffffffffu, s1, 31);
+const int pa0 = t16_split(s0, s1, w0, w1, nJ, RBA, RBA * WJ * c / G), pa1 = t16_split(s0, s1, w0, w1, nJ, RBA, RBA * WJ * (c + 1) / G);
+const int T0 = (RBA + RBB) * WJ * c / G, T1 = (RBA + RBB) * WJ * (c + 1) / G;
+const int pb0 = t16_split(s0, s1, w0, w1, nJ, RBB, T0 - t16_wpre(s0, s1, w0, w1, RBA, pa0));
+const int pb1 = t16_split(s0, s1, w0, w1, nJ, RBB, T1 - t16_wpre(s0, s1, w0, w1, RBA, pa1));
+if (lane == 0) { S.pl[0] = pa0; S.pl[1] = pa1; S.pl[2] = pb0; S.pl[3] = pb1; }
+}
+#endif
 #if (VMS_FX & 4) && __CUDA_ARCH__ >= 900
 {
 const int nj0 = __shfl_sync(0xffffffffu, jinc, 31);
 if (lane == 0) {
 const int NA0 = nj0 * RBA, NN0 = nj0 * (RBA + RBB);
 const int a00 = c * NA0 / G, nA0 = (c + 1) * NA0 / G - a00;
-const int t00 = c * NN0 / G, N0 = (c + 1) * NN0 / G - t00;
-for (int q = 0; q < NS && q < N0; ++q) issue(unit_src(p, S, q, nA0, a00, t00 - a00), ring + q * UB, &S.full[q], 0);
-}
+        const int t00 = c * NN0 / G, N0 = (c + 1) * NN0 / G - t00;
+        for (int q = 0; q < NS && q < N0; ++q) issue(unit_src(p, S, q, nA0, a00, t00 - a00), ring + q * UB, &S.full[q], 0);
+      }
 }
 #endif
 const unsigned lt = (1u << lane) - 1u;
@@ -6150,13 +6180,9 @@ else S.pos[i] = -1;
 }
 __syncthreads();
 #if VMS_T16
-const int njobs = S.njobs;
-int WJ = 0;
-for (int j = 0; j < njobs; ++j) WJ += S.jC[j] > 8 ? VMS_WT2 : VMS_WT1;
-const int a0 = t16_split(S, njobs, RBA, (long long)RBA * WJ * c / G), a1 = t16_split(S, njobs, RBA, (long long)RBA * WJ * (c + 1) / G);
-const long long T0 = (long long)(RBA + RBB) * WJ * c / G, T1 = (long long)(RBA + RBB) * WJ * (c + 1) / G;
-const int b0 = t16_split(S, njobs, RBB, T0 - t16_wpre(S, RBA, a0)), b1 = t16_split(S, njobs, RBB, T1 - t16_wpre(S, RBA, a1));
-const int nA = a1 - a0, N = nA + (b1 - b0);
+  const int njobs = S.njobs;
+  const int a0 = S.pl[0], a1 = S.pl[1], b0 = S.pl[2], b1 = S.pl[3];   // R-vt16: warp 0's weighted split (route)
+  const int nA = a1 - a0, N = nA + (b1 - b0);
 #else
 const int njobs = S.njobs;
 const int NA = njobs * RBA, NN = njobs * (RBA + RBB);
@@ -6172,8 +6198,8 @@ for (int q = 0; q < NS && q < N; ++q) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
-issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], tid);
-}
+      issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], tid);
+    }
 #endif
 const uint32_t k16 = 16u + (uint32_t)(p.m >> 30);
 const int g = lane >> 2, t = lane & 3;
@@ -6236,7 +6262,7 @@ xr[2 * cc + 1] = PB ? __ldcg(src + cc * 8 + 1) : __ldg(src + cc * 8 + 1);
 for (int cc = 0; cc < 16; ++cc) xr[cc] = make_uint4(0u, 0u, 0u, 0u);
 }
 #if VMS_T16
-        two = cnt > 8;
+        two = __all_sync(0xffffffffu, cnt > 8);   // R-vt16: a vote = provably warp-uniform (no collective guards on the mma.sync branch)
         if (two) {   // R-vt16: tokens 8-15 of the job into this lane's x2s column
           if (g + 8 < cnt) {
 const uint4* src2 = PB ? reinterpret_cast<const uint4*>(p.inter + (size_t)(st + 8 + g) * ID)
@@ -6257,8 +6283,8 @@ for (int cc = 0; cc < 16; ++cc) x2p[cc * 32] = make_uint4(0u, 0u, 0u, 0u);
 #if VMS_MK2
 ck = clock64();
 #endif
-mbar_wait(&S.full[sl], par);
-if (mk && tid == 0 && q == 0) mrow[2] = gt();
+      mbar_wait(&S.full[sl], par);
+      if (mk && tid == 0 && q == 0) mrow[2] = gt();
 #if VMS_MK2
 { const long long c2 = clock64(); if (q > 0) cF += c2 - ck; ck = c2; }
 if (mk && tid == 0 && q == nA - 1) mrow[15] = gt();
@@ -6338,8 +6364,8 @@ if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
-issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
-}
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
+      }
 mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));
 #if VMS_MK2
 { const long long c2 = clock64(); cE += c2 - ck; if (c2 - ck > 200) ++nE; ck = c2; }
@@ -6348,8 +6374,8 @@ S.red[bq][warp][lane] = o;
 #if VMS_T16
 if (two) S.red2[bq][warp][lane] = o2;
 #endif
-__syncwarp();
-if (lane == 0) mbar_arrive(&S.pfull[bq]);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(&S.pfull[bq]);
 #else
 const int bq = q & (NRB - 1);
 #if VMS_MK2
@@ -6371,9 +6397,9 @@ if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
-issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
-}
-if (tid == 0) mbar_arrive(&S.pfull[bq]);
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
+      }
+      if (tid == 0) mbar_arrive(&S.pfull[bq]);
 #endif
 if (++sl == NS) { sl = 0; par ^= 1u; }
 }
@@ -6392,7 +6418,10 @@ const int bq = q & (NRB - 1);
 #if VMS_MK2
 ck = clock64(); if (q > 0) cU += ck - cP;
 #endif
-mbar_wait(&S.pfull[bq], (uint32_t)((q / NRB) & 1));
+#if VMS_T16
+      const bool two = __all_sync(0xffffffffu, S.jC[(q < nA) ? ((a0 + q) >> 9) : ((b0 + (q - nA)) >> 8)] > 8);   // R-vt16: tile 2 of this unit (warp-uniform vote, its smem read under the pfull wait)
+#endif
+      mbar_wait(&S.pfull[bq], (uint32_t)((q / NRB) & 1));
 #if VMS_MK2
 { const long long c2 = clock64(); cF += c2 - ck; cP = c2; }
 #endif
@@ -6400,7 +6429,6 @@ float4 sm = S.red[bq][0][lane];
 #pragma unroll
 for (int w = 1; w < NW; ++w) { const float4 u = S.red[bq][w][lane]; sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w; }
 #if VMS_T16
-const bool two = S.jC[(q < nA) ? ((a0 + q) >> 9) : ((b0 + (q - nA)) >> 8)] > 8;
 float4 sm2 = make_float4(0.f, 0.f, 0.f, 0.f);
 if (two) {
 #pragma unroll
@@ -6602,7 +6630,7 @@ def _vms_build():
                       extra_cuda_cflags=flags)
     _VMS["G"] = G
     _VMS["mod"] = mod
-    fl_hi = flags[:4] + ["-DVMS_T16=1", "-DVMS_WT2=26"] + flags[4:]
+    fl_hi = flags[:4] + ["-DVMS_T16=1", "-DVMS_WT2=30"] + flags[4:]
     tag_hi = hashlib.sha1((VMS_CUDA_SRC + " ".join(fl_hi)).encode()).hexdigest()[:10]
     _VMS["mod_hi"] = load_inline(name=f"k3_vmshi_{tag_hi}", cpp_sources=VMS_CPP_SRC, cuda_sources=VMS_CUDA_SRC,
                                  functions=["run", "attrs"], extra_cuda_cflags=fl_hi)

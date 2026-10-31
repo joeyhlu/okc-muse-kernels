@@ -55,7 +55,8 @@ def main():
     if r.returncode:
         sys.exit(f"slim_patches failed rc {r.returncode}")
     t = OUT.read_text(encoding="utf-8")
-    assert t.isascii() and "importlib" not in t and "sys.modules" not in t and "__trap" not in t
+    b0 = BASE.read_text(encoding="utf-8")   # the hh chain carries a "no __trap() in a bounded wait" comment: no NEW ones
+    assert t.isascii() and "importlib" not in t and "sys.modules" not in t and t.count("__trap") <= b0.count("__trap")
     assert not [x for x in t.split(NL) if len(x) >= 1000]
     print(f"[gen_k3_vt16] wrote {OUT.relative_to(ROOT)} ({len(t.encode())} B, mode {MODE}); unslimmed {tmp.relative_to(ROOT)}")
 
