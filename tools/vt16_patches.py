@@ -21,6 +21,8 @@ import sys
 
 DEF_ANCHOR = "#ifndef VMS_G\n"
 DEFS = ("#ifndef VMS_T16\n#define VMS_T16 0   // R-vt16: 1 = 16-token jobs (2 n-tiles per unit), weighted unit split\n#endif\n"
+        "#ifndef VMS_T16R\n#define VMS_T16R 0   // R-vt16-3: 1 = tokens 8-15 x in registers (xr2[16]) instead of the 64 KB x2s smem (in-layer PDL co-residency)\n#endif\n"
+        "#if VMS_T16R\n#define T16X2(i) xr2[i]\n#else\n#define T16X2(i) x2p[(i) * 32]\n#endif\n"
         "#ifndef VMS_T16F\n#define VMS_T16F 0   // R-vt16: 1 = no 2-tile job in the call -> the ship's closed-form split (no prefix / ballot plan)\n#endif\n"
         "#ifndef VMS_T16E\n#define VMS_T16E 0   // R-vt16: 1 = consumer 1-tile loop first (fall-through), the 2-tile path after it (layout)\n#endif\n"
         "#ifndef VMS_T16X\n#define VMS_T16X 0   // R-vt16 bisect (exact only without > 8-token jobs): 1 = no consumer 2-tile path, 2 = no helper tile 2, 4 = base plan\n#endif\n"
@@ -29,7 +31,7 @@ DEFS = ("#ifndef VMS_T16\n#define VMS_T16 0   // R-vt16: 1 = 16-token jobs (2 n-
         "#ifndef VMS_WT2\n#define VMS_WT2 30   // R-vt16: split weight of a 2-tile unit (> 8 tokens)\n#endif\n")
 O_SMEM = "  float4 red[NRB][NW][32];\n};\n"
 N_SMEM = ("  float4 red[NRB][NW][32];\n#if VMS_T16\n  float4 red2[NRB][NW][32];   // R-vt16: tile-2 partials\n"
-          "  uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane\n"
+          "#if !VMS_T16R\n  uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane\n#endif\n"
           "  int pl[4];                    // R-vt16: this CTA's a0, a1, b0, b1 (warp 0, route)\n#endif\n"
           "#if VMS_LPAD > 0\n  unsigned char lpad[VMS_LPAD];   // R-vt16 probe: unused smem (L1 carve-out effect)\n#endif\n};\n")
 O_SPLITFN = "__device__ __forceinline__ uint32_t scd(uint32_t w, uint32_t sel, uint32_t k16) {\n"
@@ -104,7 +106,7 @@ N_PLAN = ("#if VMS_T16 && !(VMS_T16X & 4)\n"
           "  const int nA = a1 - a0, N = nA + (b1 - b0);\n"
           "#else\n" + O_PLAN + "#endif\n")
 O_XDECL = "    uint4 xr[16];\n    int curj = -1;\n"
-N_XDECL = ("    uint4 xr[16];\n#if VMS_T16\n    uint4* x2p = &S.x2s[warp][0][lane];   // R-vt16: this lane's tokens 8-15 x\n    bool two = false;\n#endif\n"
+N_XDECL = ("    uint4 xr[16];\n#if VMS_T16\n#if VMS_T16R\n    uint4 xr2[16];   // R-vt16-3: this lane's tokens 8-15 x in registers\n#else\n    uint4* x2p = &S.x2s[warp][0][lane];   // R-vt16: this lane's tokens 8-15 x\n#endif\n    bool two = false;\n#endif\n"
            "    int curj = -1;\n")
 O_XLOAD = ("        } else {\n"
            "#pragma unroll\n"
@@ -124,12 +126,12 @@ N_XLOAD = ("        } else {\n"
            "            src2 += warp * 64 + 2 * t;\n"
            "#pragma unroll\n"
            "            for (int cc = 0; cc < 8; ++cc) {\n"
-           "              x2p[(2 * cc) * 32] = PB ? __ldcg(src2 + cc * 8) : __ldg(src2 + cc * 8);\n"
-           "              x2p[(2 * cc + 1) * 32] = PB ? __ldcg(src2 + cc * 8 + 1) : __ldg(src2 + cc * 8 + 1);\n"
+           "              T16X2(2 * cc) = PB ? __ldcg(src2 + cc * 8) : __ldg(src2 + cc * 8);\n"
+           "              T16X2(2 * cc + 1) = PB ? __ldcg(src2 + cc * 8 + 1) : __ldg(src2 + cc * 8 + 1);\n"
            "            }\n"
            "          } else {\n"
            "#pragma unroll\n"
-           "            for (int cc = 0; cc < 16; ++cc) x2p[cc * 32] = make_uint4(0u, 0u, 0u, 0u);\n"
+           "            for (int cc = 0; cc < 16; ++cc) T16X2(cc) = make_uint4(0u, 0u, 0u, 0u);\n"
            "          }\n"
            "        }\n"
            "#endif\n"
@@ -153,7 +155,7 @@ T2_BODY = r"""#pragma unroll
           const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
           const uint32_t bb[8] = {xr[2 * cc].x, xr[2 * cc].y, xr[2 * cc].z, xr[2 * cc].w,
                                   xr[2 * cc + 1].x, xr[2 * cc + 1].y, xr[2 * cc + 1].z, xr[2 * cc + 1].w};
-          const uint4 y0 = x2p[(2 * cc) * 32], y1 = x2p[(2 * cc + 1) * 32];
+          const uint4 y0 = T16X2(2 * cc), y1 = T16X2(2 * cc + 1);
           const uint32_t b2[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
 #pragma unroll
           for (int s = 0; s < 4; ++s) {

@@ -17,6 +17,9 @@ BASE = ROOT / ARGS.get("base", "kernels/lab/k3_b29_raw.py")
 OUT = ROOT / ARGS.get("out", "kernels/lab/k3_vt16_ab.py")
 WT2 = ARGS.get("wt2", "26")
 MODE = ARGS.get("hi", "1")
+PAD = ARGS.get("pad", "")   # R-vt16-3: e.g. 81920 -> a third VMS module = the base + VMS_LPAD bytes of unused smem (VMS_HI_ON 2)
+M2 = [f for f in ARGS.get("m2", "").split(",") if f]   # R-vt16-4: the third module's defines instead of the pad (e.g. -DVMS_T16=1,-DVMS_T16R=1)
+HIX = [f for f in ARGS.get("hix", "").split(",") if f]   # extra defines for the T16 (VMS_HI_ON 1) module
 NL = chr(10)
 
 
@@ -46,6 +49,23 @@ def main():
         s = _rep(s, '    vs["mod"].run(x, ids, tw, vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"],\n',
                  '    md = vs["mod_hi"] if (VMS_HI_ON and m > 8 and vs.get("mod_hi") is not None) else vs["mod"]   # R-vt16-1\n'
                  '    md.run(x, ids, tw, vs["wA"], vs["wB"], vs["gsA"], vs["gsB"], vs["nw"], vs["inter"], vs["ybuf"], vs["ss"], vs["ctr"],\n')
+    if HIX:   # extra T16-module defines; a define already in the ship flags (e.g. -DVMS_NS) is replaced, not duplicated
+        s = _rep(s, '"-DVMS_WT2=@WT2@"]', '"-DVMS_WT2=@WT2@"' + "".join(f', "{f}"' for f in HIX) + "]")
+        keys = sorted({f.split("=")[0] for f in HIX})
+        s = _rep(s, "    fl_hi = flags[:4] + [", f"    fl_hi = [f for f in flags[:4] if f.split('=')[0] not in {keys!r}] + [")
+    if PAD or M2:   # R-vt16-3: VMS_HI_ON 2 = a third module for > 8 tokens (pad = smem-size control, or --m2 defines)
+        s = _rep(s, '    _VMS["mod_hi"] = load_inline(',
+                 '    fl_pd = [f for f in flags[:4] if f.split("=")[0] not in @M2K@] + [@M2L@] + flags[4:]' + NL
+                 + '    tag_pd = hashlib.sha1((VMS_CUDA_SRC + " ".join(fl_pd)).encode()).hexdigest()[:10]' + NL
+                 + '    _VMS["mod_pd"] = load_inline(name=f"k3_vmspd_{tag_pd}", cpp_sources=VMS_CPP_SRC, cuda_sources=VMS_CUDA_SRC,' + NL
+                 + '                                 functions=["run", "attrs"], extra_cuda_cflags=fl_pd)' + NL
+                 + '    _VMS["mod_hi"] = load_inline(')
+        s = _rep(s, '        st["vms"] = {"mod": mod, "mod_hi": _VMS.get("mod_hi"), ', '        st["vms"] = {"mod": mod, "mod_hi": _VMS.get("mod_hi"), "mod_pd": _VMS.get("mod_pd"), ')
+        s = _rep(s, '    md = vs["mod_hi"] if (VMS_HI_ON and m > 8 and vs.get("mod_hi") is not None) else vs["mod"]   # R-vt16-1' + NL,
+                 '    md = vs["mod_hi"] if (VMS_HI_ON == 1 and m > 8 and vs.get("mod_hi") is not None) else vs["mod"]   # R-vt16-1' + NL
+                 + '    md = vs["mod_pd"] if (VMS_HI_ON == 2 and m > 8 and vs.get("mod_pd") is not None) else md   # R-vt16-3' + NL)
+        s = s.replace("@M2L@", ", ".join(f'"{f}"' for f in (M2 or [f"-DVMS_LPAD={PAD}"])))
+        s = s.replace("@M2K@", repr(sorted({f.split("=")[0] for f in (M2 or [f"-DVMS_LPAD={PAD}"])})))
     s = s.replace("{ON}", "True" if MODE == "ship" else "False").replace("@WT2@", WT2)
     tmp = OUT.with_name(OUT.stem + "_unslim.py")
     tmp.write_text(s, encoding="utf-8", newline=NL)
