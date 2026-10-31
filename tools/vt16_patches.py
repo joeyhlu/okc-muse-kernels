@@ -21,7 +21,7 @@ import sys
 DEF_ANCHOR = "#ifndef VMS_G\n"
 DEFS = ("#ifndef VMS_T16\n#define VMS_T16 0   // R-vt16: 1 = 16-token jobs (2 n-tiles per unit), weighted unit split\n#endif\n"
         "#ifndef VMS_WT1\n#define VMS_WT1 20   // R-vt16: split weight of a 1-tile unit\n#endif\n"
-        "#ifndef VMS_WT2\n#define VMS_WT2 23   // R-vt16: split weight of a 2-tile unit (> 8 tokens)\n#endif\n")
+        "#ifndef VMS_WT2\n#define VMS_WT2 26   // R-vt16: split weight of a 2-tile unit (> 8 tokens)\n#endif\n")
 O_SMEM = "  float4 red[NRB][NW][32];\n};\n"
 N_SMEM = ("  float4 red[NRB][NW][32];\n#if VMS_T16\n  float4 red2[NRB][NW][32];   // R-vt16: tile-2 partials\n"
           "  uint4 x2s[NW][16][32];       // R-vt16: tokens 8-15 x, one private uint4 column per lane\n#endif\n};\n")
@@ -36,6 +36,11 @@ __device__ __forceinline__ int t16_split(const Smem& S, int njobs, int per, long
     acc += seg;
   }
   return njobs * per;
+}
+__device__ __forceinline__ long long t16_wpre(const Smem& S, int per, int v) {   // R-vt16: weight of the units before index v
+  long long acc = 0;
+  for (int j = 0; j < v / per; ++j) acc += (long long)per * (S.jC[j] > 8 ? VMS_WT2 : VMS_WT1);
+  return acc + (long long)(v % per) * (S.jC[v / per] > 8 ? VMS_WT2 : VMS_WT1);
 }
 #endif
 __device__ __forceinline__ uint32_t scd(uint32_t w, uint32_t sel, uint32_t k16) {
@@ -56,7 +61,9 @@ N_PLAN = ("#if VMS_T16\n"
           "  int WJ = 0;   // R-vt16: per-unit weights summed over jobs (A list: 512 units / job, B: 256)\n"
           "  for (int j = 0; j < njobs; ++j) WJ += S.jC[j] > 8 ? VMS_WT2 : VMS_WT1;\n"
           "  const int a0 = t16_split(S, njobs, RBA, (long long)RBA * WJ * c / G), a1 = t16_split(S, njobs, RBA, (long long)RBA * WJ * (c + 1) / G);\n"
-          "  const int b0 = t16_split(S, njobs, RBB, (long long)RBB * WJ * c / G), b1 = t16_split(S, njobs, RBB, (long long)RBB * WJ * (c + 1) / G);\n"
+          "  // B starts where this CTA's total (A + B) weight share begins: the ship's b0 = t0 - a0 coupling in weight space\n"
+          "  const long long T0 = (long long)(RBA + RBB) * WJ * c / G, T1 = (long long)(RBA + RBB) * WJ * (c + 1) / G;\n"
+          "  const int b0 = t16_split(S, njobs, RBB, T0 - t16_wpre(S, RBA, a0)), b1 = t16_split(S, njobs, RBB, T1 - t16_wpre(S, RBA, a1));\n"
           "  const int nA = a1 - a0, N = nA + (b1 - b0);\n"
           "#else\n" + O_PLAN + "#endif\n")
 O_XDECL = "    uint4 xr[16];\n    int curj = -1;\n"
