@@ -28,7 +28,7 @@ OLD_W = ('    w64 = arm["kind"] == "vml" and _vml_cfg(_MB["mods"][arm["b"]])[4] 
          '    if w64:\n'
          '        W = 64\n')
 NEW_W = (OLD_W +
-         '    mk2 = arm["kind"] == "lvms" and "-DVMS_MK2=1" in tuple(MB_BUILDS[arm["b"]][1])   # mb_gen42: 32-wide MK2 rows\n'
+         '    mk2 = arm["kind"] == "lvms" and "-DVMS_MK2=1" in tuple(MB_BUILDS[arm["b"]][1:2] and MB_BUILDS[arm["b"]][1])   # mb_gen42: 32-wide MK2 rows\n'
          '    if mk2:\n'
          '        W = 32\n')
 OLD_ACC = ('        if vms:\n'
@@ -54,7 +54,7 @@ OLD_Q = '        return f"{sum(p50) / len(p50):.1f}/{sum(mx) / len(mx):.1f}" if 
 NEW_Q = ('        if p50 and k in ("F", "C", "E", "S", "hF", "hU", "ghz"):   # mb_gen42: per-unit values need 2-3 decimals\n'
          '            return f"{sum(p50) / len(p50):.3f}/{sum(mx) / len(mx):.3f}"\n' + OLD_Q)
 OLD_DIAG = "        diag += [a for a in ok_arms if a['kind'] == 'vml' and _vml_cfg(_MB['mods'][a['b']])[4] == 64]   # mb_gen29\n"
-NEW_DIAG = (OLD_DIAG + "        diag += [a for a in ok_arms if a['kind'] == 'lvms' and '-DVMS_MK2=1' in tuple(MB_BUILDS[a['b']][1])]   "
+NEW_DIAG = (OLD_DIAG + "        diag += [a for a in ok_arms if a['kind'] == 'lvms' and '-DVMS_MK2=1' in tuple(MB_BUILDS[a['b']][1:2] and MB_BUILDS[a['b']][1])]   "
             "# mb_gen42\n")
 
 
@@ -84,13 +84,10 @@ def main():
         builds.pop(k, None)
     builds["lvmk"] = ("lvms", ("-DVMS_MK2=1",))
     builds["lvf1mk"] = ("lvms", ("-DVMS_FX=1", "-DVMS_MK2=1"))
-    builds["lvhi"] = ("lvms", ("-DVMS_HI=1",))
-    builds["lvf1hi"] = ("lvms", ("-DVMS_FX=1", "-DVMS_HI=1"))
-    builds["lvhimk"] = ("lvms", ("-DVMS_HI=1", "-DVMS_MK2=1"))
     oa, arms = _assign(s, "MB_ARMS")
-    arms[1] = ["lvf1", "lv", "lvhi", "lvf1hi", "lvmk", "lvhimk"]
-    arms[8] = ["lv", "lvf1", "lvhi", "lvmk", "lvhimk"]
-    arms[16] = ["lv", "lvhi", "lvmk", "lvhimk"]
+    arms[1] = ["lvf1", "lv", "lvmk"]
+    arms[8] = ["lv", "lvf1", "lvmk"]
+    arms[16] = ["lv", "lvmk"]
     arms[32] = ["bf2ps:193:L"]
     arms[128] = ["w72:193:L"]
     arms[256] = ["w72:193:L"]
