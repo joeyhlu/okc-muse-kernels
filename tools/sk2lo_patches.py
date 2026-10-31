@@ -10,6 +10,9 @@ be passed in the unused `dg` argument for TOKR == 8 instances (`(TOKR == 8 && dg
 instance), so slice8 writes straight into our zero buffer zb[:T] (ldo HIDDEN) like GD's sliced unpooler.
 Arms: SK2L_ON = {(proj, T): 1} (proj qkv / unpooler, T 1 / 8 / 16), SK2L_PDL = {"qkv": 0, "unpooler": 2}. Default {} = base.
 Their layer's qkv at m 2..8 is a narrow-escape variant (_de_source); not tested here (the plain pick is).
+R-sk2-3 adds their tokr 8 pooler pick pooler8h_r72 (SK2L_ON {("pooler", 8): 1}, first in _v13_pooler). At T = 8 the ship runs
+the pooler fused with the FP32 router rows (VF_GDR -> _vfr_gdr VF 2, gd_kernel<..., 1, 2, 0>), so the arm also sets VF_GDR = False:
+pooler on the main stream, our f32 router (vf_router32) on the side stream, as at T = 1.
 """
 import ast
 import pathlib
@@ -25,7 +28,7 @@ ARGS = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and 
 FLAGS = {a[2:] for a in sys.argv[1:] if a.startswith("--") and "=" not in a}
 NL = chr(10)
 PICK_LO = {("qkv_gate", 16): "qkv16_r176", ("unpooler", 16): "unpooler16h_r100", ("qkv_gate", 8): "qkv8_r176",
-           ("unpooler", 8): "slice8_r192"}
+           ("unpooler", 8): "slice8_r192", ("pooler", 8): "pooler8h_r72"}   # pooler8h_r72: R-sk2-3
 STRIDE = ("OutT* o = out + (size_t)tt * N + cta * R + row;\n",
           "OutT* o = out + (size_t)tt * (TOKR == 8 && dg > 0 ? dg : N) + cta * R + row;\n")
 
@@ -41,7 +44,7 @@ def cuda_lo(consts, fns):
     P.check(len(fl) == 3, "sk2f lines")
     sk2 = "\n".join(ln for ln in lines if ln not in fl)
     sd = [ln for ln in sk2.split("\n") if ln.lstrip().startswith("if (cfg == ")]
-    P.check(len(sd) == 4, f"lo dispatch {sd}")
+    P.check(len(sd) == 5, f"lo dispatch {sd}")
     common = consts["bfp_CUDA_SRC"].replace("@@MBAR@@", consts["bfp_MBAR_HELPERS"]).replace("@@BODY@@", "")
     common = P.cut(common, "// cross-CTA spins are bounded", "__device__ __forceinline__ void okc_spin_ge", "spin comment + trap")
     a = common.index("__device__ __forceinline__ void okc_spin_ge")
@@ -68,7 +71,8 @@ _SK2L_CPP = r"""@CPP@"""
 SK2L_ON = {}
 SK2L_PDL = {"qkv": 0, "unpooler": 2}
 _SK2L_CFGS = @CFGS@
-_SK2L_PICK = {("qkv", 16): "qkv16_r176", ("unpooler", 16): "unpooler16h_r100", ("qkv", 8): "qkv8_r176", ("unpooler", 8): "slice8_r192"}
+_SK2L_PICK = {("qkv", 16): "qkv16_r176", ("unpooler", 16): "unpooler16h_r100", ("qkv", 8): "qkv8_r176", ("unpooler", 8): "slice8_r192",
+              ("pooler", 8): "pooler8h_r72"}
 _SK2L = {"mod": None, "err": None, "secs": 0.0, "ok": {}, "w": {}, "calls": {}}
 def _sk2l_build():
     from torch.utils.cpp_extension import load_inline
@@ -169,6 +173,9 @@ HOOKS = (
     ('    ffn_output = _sk2(state, "unpooler", expert_output) if SK2_ON else None\n',
      '    ffn_output = _sk2l(state, "unpooler", expert_output) if SK2L_ON else None\n    if ffn_output is None:\n'
      '        ffn_output = _sk2(state, "unpooler", expert_output) if SK2_ON else None\n', "unpooler hook"),
+    ('    y = _vfr_marked_pooler(state, ffn_input) if VF_GDM else None\n',
+     '    y = _sk2l(state, "pooler", ffn_input) if SK2L_ON else None\n    if y is None:\n'
+     '        y = _vfr_marked_pooler(state, ffn_input) if VF_GDM else None\n', "pooler hook (R-sk2-3)"),
     ('    _sk2_prepare(state, t0)\n', '    _sk2_prepare(state, t0)\n    _sk2l_prepare(state, t0)\n', "prepare call"),
     ('    if SK2_ENABLE:\n        jobs.append(("sk2", _sk2_build))\n',
      '    if SK2_ENABLE:\n        jobs.append(("sk2", _sk2_build))\n        jobs.append(("sk2l", _sk2l_build))\n', "PT1 job"),

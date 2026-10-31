@@ -10862,7 +10862,9 @@ def _v13_p1(state, proj, x, out=None, **kw):
         _k3_disable(state, "p1", None, "P1", ex)
         return None
 def _v13_pooler(ffn_input, dense, state):
-    y = _vfr_marked_pooler(state, ffn_input) if VF_GDM else None
+    y = _sk2l(state, "pooler", ffn_input) if SK2L_ON else None
+    if y is None:
+        y = _vfr_marked_pooler(state, ffn_input) if VF_GDM else None
     if y is None:
         y = _gd(state, "pooler", ffn_input)
     if y is None:
@@ -22519,6 +22521,7 @@ TORCH_CHECK(false, "sk2f: no config");
 void sk2(at::Tensor Ws, at::Tensor x, at::Tensor out, at::Tensor ptab, int64_t pmax, int64_t base4,
 int64_t M, int64_t N, int64_t K, int64_t cfg, int64_t tokr, int64_t dg, at::Tensor dbgt) {
 unsigned long long* dbg = dbgt.numel() >= 8192 + 3 * 1024 ? reinterpret_cast<unsigned long long*>(dbgt.data_ptr()) : nullptr;
+if (cfg == 4 && tokr == 8) { launch_sk2<1, 8, 1, 2, 2, 4, 3, true, false, 1, 1, __nv_bfloat16>(Ws, x, out, ptab, pmax, base4, M, N, K, dg, dbg); return; }
 if (cfg == 5 && tokr == 16) { launch_sk2<1, 16, 3, 1, 4, 2, 5, true, false, 1, 1, __nv_bfloat16>(Ws, x, out, ptab, pmax, base4, M, N, K, dg, dbg); return; }
 if (cfg == 7 && tokr == 8) { launch_sk2<1, 8, 3, 1, 4, 2, 6, true, false, 1, 1, __nv_bfloat16>(Ws, x, out, ptab, pmax, base4, M, N, K, dg, dbg); return; }
 if (cfg == 9 && tokr == 8) { launch_sk2<1, 8, 1, 1, 8, 2, 4, true, false, 2, 1, __nv_bfloat16>(Ws, x, out, ptab, pmax, base4, M, N, K, dg, dbg); return; }
@@ -22533,8 +22536,9 @@ void sk2_set_pdl(int64_t n);
 """
 SK2L_ON = {}
 SK2L_PDL = {"qkv": 0, "unpooler": 2}
-_SK2L_CFGS = {'qkv16_r176': (5, 'qkv_gate', 2304, 24, 3, 1, 4, 2), 'unpooler16h_r100': (10, 'unpooler', 8192, 32, 4, 1, 4, 1), 'qkv8_r176': (7, 'qkv_gate', 2304, 24, 3, 1, 4, 2), 'slice8_r192': (9, 'unpooler', 1024, 8, 1, 1, 8, 2)}
-_SK2L_PICK = {("qkv", 16): "qkv16_r176", ("unpooler", 16): "unpooler16h_r100", ("qkv", 8): "qkv8_r176", ("unpooler", 8): "slice8_r192"}
+_SK2L_CFGS = {'qkv16_r176': (5, 'qkv_gate', 2304, 24, 3, 1, 4, 2), 'unpooler16h_r100': (10, 'unpooler', 8192, 32, 4, 1, 4, 1), 'qkv8_r176': (7, 'qkv_gate', 2304, 24, 3, 1, 4, 2), 'slice8_r192': (9, 'unpooler', 1024, 8, 1, 1, 8, 2), 'pooler8h_r72': (4, 'pooler', 4096, 16, 1, 2, 2, 4)}
+_SK2L_PICK = {("qkv", 16): "qkv16_r176", ("unpooler", 16): "unpooler16h_r100", ("qkv", 8): "qkv8_r176", ("unpooler", 8): "slice8_r192",
+              ("pooler", 8): "pooler8h_r72"}
 _SK2L = {"mod": None, "err": None, "secs": 0.0, "ok": {}, "w": {}, "calls": {}}
 def _sk2l_build():
     from torch.utils.cpp_extension import load_inline
