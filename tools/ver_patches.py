@@ -32,16 +32,25 @@ N_W = ("{\n#if VMS_ER && VMS_RO && !VMS_HI\n        const uint4 w = wv[cc];   //
 O_SYNC = "#if !VMS_HI\n      cta_sync_compute();\n"
 N_SYNC = "#if !VMS_HI && !VMS_ER\n      cta_sync_compute();\n"
 
-PATCHES = [("defines", DEF_ANCHOR, DEFS + DEF_ANCHOR, 1), ("early release", O_SC, N_SC, 1), ("w from registers", O_W, N_W, 1),
-           ("post-compute sync", O_SYNC, N_SYNC, 1)]
+# the layer's VMS (no VMS_HI variant): the RO-path CTA sync + refill issue right before the pempty wait
+O_SYNC_L = ("      cta_sync_compute();\n#if VMS_MK2\n      { const long long c2 = clock64(); cS += c2 - ck; ck = c2; }\n#endif\n"
+            "      if (q + NS < N) {\n#if __CUDA_ARCH__ >= 900\n        if (tid == 0)\n#endif\n"
+            "        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);\n      }\n"
+            "      mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));\n")
+N_SYNC_L = ("#if !VMS_ER\n" + O_SYNC_L[:O_SYNC_L.index("      mbar_wait(&S.pempty")] + "#endif\n"
+            + O_SYNC_L[O_SYNC_L.index("      mbar_wait(&S.pempty"):])
+PATCHES = [("defines", DEF_ANCHOR, DEFS + DEF_ANCHOR, 1), ("early release", O_SC, N_SC, 1), ("w from registers", O_W, N_W, 1)]
 
 
 def apply(s):
     for tag, old, _, n in PATCHES:
         assert s.count(old) == n, f"ver anchor '{tag}' found {s.count(old)} times (want {n})"
+    alt = [(O_SYNC, N_SYNC), (O_SYNC_L, N_SYNC_L)]
+    hits = [(o, n) for o, n in alt if s.count(o) == 1]
+    assert len(hits) == 1, f"ver anchor 'post-compute sync': {[s.count(o) for o, _ in alt]} (want exactly one form once)"
     for _, old, new, _ in PATCHES:
         s = s.replace(old, new)
-    return s
+    return s.replace(hits[0][0], hits[0][1])
 
 
 if __name__ == "__main__":
