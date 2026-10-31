@@ -16,7 +16,7 @@ OLD = [
     # (anchor, replacement) pairs; every anchor must occur exactly once
     ("constexpr int XB = (XP & 1) ? 2 : 1;\n",
      "constexpr int XB = (XP & 1) ? 2 : 1;\n"
-     "constexpr int XH = (((XP & 8) != 0) && ((XP & 1) == 0) && MT >= 2) ? 2 : 1;   // token halves per unit (R-gdxh)\n"
+     "constexpr int XH = ((XP & 1) != 0) ? 1 : (((XP & 16) != 0 && MT >= 4) ? 4 : (((XP & 8) != 0 && MT >= 2) ? 2 : 1));   // token groups per unit (R-gdxh: bit 8 halves, bit 16 quarters)\n"
      "constexpr int MTH = MT / XH;\n"),
     ("uint4 X[XB][MT][2];\n"
      "#pragma unroll\n"

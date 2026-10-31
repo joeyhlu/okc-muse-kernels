@@ -44,6 +44,7 @@ XH_CFGS = [
     ("pool_T32x", "pooler", (4, 1, 8, 16, 1, 1, 8), 32), ("pool_T32x_M1", "pooler", (4, 1, 8, 16, 1, 1, 8), 1),
     ("unp_T32x", "unpooler", (4, 2, 4, 16, 1, 1, 8), 32), ("unp_T32x_M1", "unpooler", (4, 2, 4, 16, 1, 1, 8), 1), ("unp_T16x", "unpooler", (2, 2, 4, 16, 2, 1, 14), 16),
     ("o_T32x", "o", (4, 1, 4, 4, 1, 1, 8), 32),
+    ("qkv_T32q", "qkv", (4, 1, 4, 8, 1, 4, 16), 32), ("pool_T32q", "pooler", (4, 1, 8, 16, 1, 1, 16), 32), ("unp_T32q", "unpooler", (4, 2, 4, 16, 1, 1, 16), 32),
 ]
 
 
@@ -144,9 +145,9 @@ def main():
         refo = x.double() @ W[proj].double().T
         rel = float((y.double() - refo).norm() / refo.norm())
         yk, bit = (proj, M, tuple(rt[:6])), ""
-        if rt[6] & 8 and yk in ys:   # token-half X (XP bit 8): same geometry, same accumulation order -> the output must be bitwise the shipped one
+        if rt[6] & 24 and yk in ys:   # token-half X (XP bit 8): same geometry, same accumulation order -> the output must be bitwise the shipped one
             bit = f" bitwise={bool(torch.equal(y, ys[yk]))}"
-        elif not rt[6] & 8:
+        elif not rt[6] & 24:
             ys[yk] = y.clone()
         mb = pk["w"].numel() * 4 / 1e6
         if MODE == "ncu":
