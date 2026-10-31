@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_5.py"
+FINAL = "kernels/lab/k3_hh_5_sk2.py"
 NONCE_HH_3TEKV = '# nonce k3-hh-3tekv (k3_hh_3rr + VMS_T16 NS2 + ER module for 9-16 tokens [tools/gen_k3_vt16.py --hi=ship --wt2=30 --hix=-DVMS_NS=2,-DVMS_ER=1] + R-kvs-2 [tools/kvs_patches.py] + R-v32 VML scratch fix [tools/vfx_patches.py])'
 LIMIT = 1_000_000
 
@@ -82,6 +82,7 @@ DEP_BLOBS = {
     "tools/graft_patches.py": "0aa14e395132e3d9dae3cf9ee2088619ffb40ba4",
     "tools/hyb193_patches.py": "0c81ffef3235a927ae9b9f6af9e97f802a65e939",
     "tools/hybst_patches.py": "f1500897f907110e4d6199c8833a07044a3b6631",
+    "tools/sk2_patches.py": "757973d85bc90a47457f3d2ffe31a95393f9bd15",
     "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
     "tools/vt16_patches.py": "dce79a28df4318e6efbd14954b7a2714303dcab3",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
@@ -188,6 +189,11 @@ STEPS = [
     dict(n=19, name="hyb193", out="k3_hh_5.py", tool="tools/hyb193_patches.py",
          argv=["--base={in}", "--out={out}"], deps=["tools/hyb193_patches.py", "tools/hybst_patches.py"],
          ref="kernels/lab/k3_hh_5.py", sha1="538064d59d5cd70261941e61d0cbe2e7d37b111f", size=995100),
+    # R-sk2-1 (904c7c65): alygg77 sk2 skinny BF16 GEMM at qkv + unpooler for T = 32 only; dead P1M (V20) block cut (-37 KB)
+    dict(n=20, name="sk2", out="k3_hh_5_sk2.py", tool="tools/sk2_patches.py",
+         argv=["--ship", "--base={in}", "--out={out}"],
+         deps=["tools/sk2_patches.py", "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
+         ref="kernels/lab/k3_hh_5_sk2.py", sha1="cdc55d98a4e7a143c64a1ab41e56ee448a01f6c6", size=985698),
 ]
 
 
