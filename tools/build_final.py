@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_5_sk2.py"
+FINAL = "kernels/lab/k3_hh_5_sk2_pz.py"
 NONCE_HH_3TEKV = '# nonce k3-hh-3tekv (k3_hh_3rr + VMS_T16 NS2 + ER module for 9-16 tokens [tools/gen_k3_vt16.py --hi=ship --wt2=30 --hix=-DVMS_NS=2,-DVMS_ER=1] + R-kvs-2 [tools/kvs_patches.py] + R-v32 VML scratch fix [tools/vfx_patches.py])'
 LIMIT = 1_000_000
 
@@ -83,6 +83,9 @@ DEP_BLOBS = {
     "tools/hyb193_patches.py": "0c81ffef3235a927ae9b9f6af9e97f802a65e939",
     "tools/hybst_patches.py": "f1500897f907110e4d6199c8833a07044a3b6631",
     "tools/sk2_patches.py": "757973d85bc90a47457f3d2ffe31a95393f9bd15",
+    "tools/padz_patches.py": "c75d56470cbd37ba446d7d7832aa433d35e808ee",
+    "tools/hybpro_patches.py": "9069738be60a82186eba6f5a14dc70aba43507ba",
+    "tools/hybsync_patches.py": "a6fb3457e760446c2bc768448a7b65b313d316c6",
     "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
     "tools/vt16_patches.py": "dce79a28df4318e6efbd14954b7a2714303dcab3",
     "tools/pyslim.py": "3d521f58a5c49ee884a0befc551b05afd06fe8bf",
@@ -194,6 +197,11 @@ STEPS = [
          argv=["--ship", "--base={in}", "--out={out}"],
          deps=["tools/sk2_patches.py", "third_party/alygg77-okc-muse-spark-kernels-6cae49a/kernels/muse_decode_layer.py"],
          ref="kernels/lab/k3_hh_5_sk2.py", sha1="cdc55d98a4e7a143c64a1ab41e56ee448a01f6c6", size=985698),
+    # R-padz-1b (f15ee3f2): HYB zero-fills its stale xA / xB pad rows (outputs bitwise == ship); in-layer v16s..v32f -0.2..-1.0 us
+    dict(n=21, name="padz", out="k3_hh_5_sk2_pz.py", tool="tools/padz_patches.py",
+         argv=["--ship", "--base={in}", "--out={out}"],
+         deps=["tools/padz_patches.py", "tools/hybpro_patches.py", "tools/hybsync_patches.py"],
+         ref="kernels/lab/k3_hh_5_sk2_pz.py", sha1="0d36e0e621c94b12bc84347fc83fe8b8a9a231da", size=987199),
 ]
 
 

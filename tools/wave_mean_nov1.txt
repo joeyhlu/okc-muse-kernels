@@ -1,0 +1,4 @@
+muse_decode_layer kernels/muse_decode_layer/k3_hh4_c2.py
+muse_decode_layer kernels/muse_decode_layer/k3_sk2_c1.py
+muse_decode_layer kernels/muse_decode_layer/k3_hh4_c3.py
+muse_decode_layer kernels/muse_decode_layer/k3_sk2_c2.py
