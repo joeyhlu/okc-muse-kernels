@@ -5,7 +5,7 @@ Arms: sgl (auto) / sgl2 (position control), t<threads><p|n> = launch_config (thr
 kernel. Per arm: bitwise flag + max rel error of out / new_stream vs auto; judge GpuTimer (flush + 300 us gate), 30 rotated rounds,
 contexts solo [boundary] and chain [cuBLAS producer -> boundary (-> consumer for attn)], both boundaries.
 
-    python3 -u kernels/lab/bndx_sweep.py [--ts=128,256] [--rounds=30] [--out=box_out/bndx/sweep.json]
+    python3 -u kernels/lab/bndx_sweep.py [--ts=128,256] [--rounds=30] [--arms=t1024p,cl8,...] [--out=box_out/bndx/sweep.json]
 """
 import json
 import statistics
@@ -15,7 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 H = 8192
 CFG = {"t256p": ((256, True), None), "t256n": ((256, False), None), "t512p": ((512, True), None), "t512n": ((512, False), None),
-       "t1024p": ((1024, True), None), "t1024n": ((1024, False), None), "cl2": (None, 2), "cl4": (None, 4)}
+       "t1024p": ((1024, True), None), "t1024n": ((1024, False), None), "cl2": (None, 2), "cl4": (None, 4), "cl8": (None, 8),
+       "cl16": (None, 16)}
 
 
 def log(s):
@@ -56,14 +57,16 @@ def main():
                                       cluster_size=cs)[:2]
 
     gen = torch.Generator(device="cuda").manual_seed(4242)
-    arms = ["sgl"] + list(CFG) + ["sgl2"]
+    sel = [x for x in a.get("arms", ",".join(CFG)).split(",") if x]
+    assert all(x in CFG for x in sel), sel
+    arms = ["sgl"] + sel + ["sgl2"]
     usable = {}
     for T in ts:
         for which in ops:
             stream = torch.randn((T, H), generator=gen, device="cuda") * 2
             branch = (torch.randn((T, H), generator=gen, device="cuda") * 3).to(torch.bfloat16)
             r_out, r_ns = run(which, "sgl", branch, stream)
-            for arm in CFG:
+            for arm in sel:
                 try:
                     o, ns = run(which, arm, branch, stream)
                     torch.cuda.synchronize()
