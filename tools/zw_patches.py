@@ -81,7 +81,10 @@ folds and rolling ticket protocol are unchanged. Apache-2.0 text is reproduced a
 THIRD_PARTY_NOTICES += _ZW_NOTICE
 ZW_SEL = frozenset()  # live A/B switch: {}, {16}, {32}, {16,32}; select before graph capture
 ZW_FLAGS = ("-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", "-DOKC_WST_ACC32=1", "-DZH_SCH=1")
-ZW_OUT_TOL = 2e-2
+# Compare each implementation to the SAME independent reference, as _hya_self_test
+# does. HYA is itself approximate (FP8 Q/P); distance to HYA is diagnostic only.
+ZW_REF_FACTOR = 1.25
+ZW_REF_SLACK = 5e-3
 ZW_KV_TOL = 2e-3
 _ZW = {"mod": None, "attempted": False, "err": None, "banks": {}, "validated": set(), "checks": []}
 
@@ -138,16 +141,41 @@ def _zw_launch(qkv, data, cfg, pdl):
                             out.view(B * 8, -1), bank["tickets"][B], data["v_scale"], int(bool(pdl)))
     return out
 
-def _zw_check(d, cfg, qkv, ref, candidate, label):
+def _zw_check(d, cfg, qkv, ref, fp32, candidate, before, label):
     eo = _hya_rel(candidate, ref)
+    eh, ef = _hya_rel(ref, fp32), _hya_rel(candidate, fp32)
+    limit = ZW_REF_FACTOR * eh + ZW_REF_SLACK
     ek = [_hya_rel(d[name].view(torch.uint8).view(-1, 128)[d["cache_loc"]].view(FP8),
                    d["zw_ref_" + name]) for name in ("k_cache", "v_cache")]
     ekv = max(ek)
     tick = _ZW["banks"][str(qkv.device)]["tickets"][cfg["batch"]]
-    if (not bool(torch.isfinite(candidate).all()) or not math.isfinite(eo) or not all(math.isfinite(e) for e in ek)
-            or eo > ZW_OUT_TOL or ekv > ZW_KV_TOL or bool(((tick & 255) != 0).any())):
-        raise RuntimeError(f"ZW {label} relL2 out={eo:.4g} KV={ekv:.4g} / ticket residue")
-    return {"B": cfg["batch"], "case": label, "out_relL2": eo, "kv_relL2": ekv}
+    # Evaluate independently: the old `or eo > .02 or ...` never inspected tickets
+    # on the failing pod case, despite printing '/ ticket residue' unconditionally.
+    residue = bool(((tick & 255) != 0).any())
+    expected = (before.to(torch.int64) + 256) & 0xffffffff
+    step_bad = bool(((tick.to(torch.int64) & 0xffffffff) != expected).any())
+    finite = (all(bool(torch.isfinite(x).all()) for x in (candidate, ref, fp32))
+              and all(math.isfinite(e) for e in (eo, eh, ef, *ek)))
+    reasons = []
+    if not finite:
+        reasons.append("nonfinite")
+    if not math.isfinite(ef) or not math.isfinite(limit) or ef > limit:
+        reasons.append("output_vs_fp32")
+    if not all(math.isfinite(e) for e in ek) or ekv > ZW_KV_TOL:
+        reasons.append("new_kv")
+    if residue:
+        reasons.append("ticket_residue")
+    if step_bad:
+        reasons.append("ticket_step")
+    row = {"B": cfg["batch"], "case": label, "out_relL2": eo, "kv_relL2": ekv,
+           "hya_fp32_relL2": eh, "out_fp32_relL2": ef, "fp32_limit": limit,
+           "ticket_residue": residue, "ticket_step_bad": step_bad, "reasons": reasons}
+    _ZW["last_check"] = row  # preserve failure diagnostics even if self_test raises
+    if reasons:
+        raise RuntimeError(f"ZW B{cfg['batch']} {label} failed={','.join(reasons)} "
+                           f"relL2 vsHYA={eo:.5g} vsFP32={ef:.5g} HYA/FP32={eh:.5g} limit={limit:.5g} "
+                           f"KV={ekv:.5g} ticket_residue={residue} ticket_step_bad={step_bad}")
+    return row
 
 def _zw_self_test(dev, t0):
     checks = []
@@ -158,6 +186,9 @@ def _zw_self_test(dev, t0):
             d = _k1fa4_case(B, ctx, 8, 0, 7300 + B + ctx, True, dev)
             qkv = d["qkv"].view(B * 8, -1).contiguous()
             cfg = dict(d["config"], tokens=B * 8)
+            # The real base reference does FP32 attention with its BF16 scaled Q
+            # and FP8 new K/V. It neither reads our output nor writes the cache.
+            fp32 = _k1fa4_reference(dict(d, qkv=qkv))
             ref = _hya_launch(qkv, d, cfg, True).clone()
             for name in ("k_cache", "v_cache"):
                 d["zw_ref_" + name] = d[name].view(torch.uint8).view(-1, 128)[d["cache_loc"]].clone().view(FP8)
@@ -165,25 +196,30 @@ def _zw_self_test(dev, t0):
             bank = _ZW["banks"][str(dev)]
             bank["tickets"][B].fill_(-256)  # exercise unsigned 32-bit rollover on the first launch
             for pdl in (False, True):
+                before = bank["tickets"][B].clone()
                 bank["out"][B].fill_(float("nan"))
                 out = _zw_launch(qkv, d, cfg, pdl)
                 torch.cuda.synchronize(dev)
-                checks.append(_zw_check(d, cfg, qkv, ref, out, f"ctx{ctx}/pdl{int(pdl)}"))
+                checks.append(_zw_check(d, cfg, qkv, ref, fp32, out, before, f"ctx{ctx}/pdl{int(pdl)}"))
             # Capture the actual no-allocation adapter, then change qkv between replays.
             gr = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gr):
                 out = _zw_launch(qkv, d, cfg, True)
             for replay in range(3):
+                if time.time() - t0 > 290.0:
+                    raise RuntimeError("ZW validation exceeded prepare guard")
                 qkv.mul_(-1.0)
+                fp32 = _k1fa4_reference(dict(d, qkv=qkv))
                 ref = _hya_launch(qkv, d, cfg, True).clone()
                 for name in ("k_cache", "v_cache"):
                     d["zw_ref_" + name] = d[name].view(torch.uint8).view(-1, 128)[d["cache_loc"]].clone().view(FP8)
                     d[name].view(torch.uint8).view(-1, 128)[d["cache_loc"]] = 0
+                before = bank["tickets"][B].clone()
                 bank["out"][B].fill_(float("nan"))
                 gr.replay()
                 torch.cuda.synchronize(dev)
-                checks.append(_zw_check(d, cfg, qkv, ref, out, f"ctx{ctx}/replay{replay}"))
-            del gr, d, qkv, ref, out
+                checks.append(_zw_check(d, cfg, qkv, ref, fp32, out, before, f"ctx{ctx}/replay{replay}"))
+            del gr, d, qkv, ref, fp32, out, before
     return checks
 
 def _zw_prepare(state, t0):
@@ -203,8 +239,11 @@ def _zw_prepare(state, t0):
             _ZW["validated"].add(str(dev))
         state["zw"] = True
         eo = max(x["out_relL2"] for x in _ZW["checks"])
+        ef = max(x["out_fp32_relL2"] for x in _ZW["checks"])
+        eh = max(x["hya_fp32_relL2"] for x in _ZW["checks"])
         ek = max(x["kv_relL2"] for x in _ZW["checks"])
-        print(f"[zw] READY B16/B32 relL2 out={eo:.4g} KV={ek:.4g}; PDL/replay/wrap PASS; selected={sorted(ZW_SEL)}", flush=True)
+        print(f"[zw] READY B16/B32 relL2 vsHYA={eo:.4g} vsFP32={ef:.4g} HYA/FP32={eh:.4g} KV={ek:.4g}; "
+              f"per-case FP32/PDL/replay/ticket+256 PASS; selected={sorted(ZW_SEL)}", flush=True)
     except Exception as ex:
         _ZW["err"] = repr(ex)[:1000]
         _ZW["validated"].clear()
