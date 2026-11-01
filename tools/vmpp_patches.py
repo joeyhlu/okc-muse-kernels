@@ -66,7 +66,7 @@ def literal(s, name):
 
 GLOBALS = '''VMPP_ON = 0
 VMPP_COST_SCALE = 1.0
-VMPP_ARMS = None  # None = all live variants x (1.0, 0.93); runner batches <=7 arms.
+VMPP_ARMS = [(1, 1.0), (2, 1.0), (3, 1.0)]  # R-vmpp-1 burst: three exact variants, plan scale 1.0 (None = all live x (1.0, 0.93)).
 _VMPP = {"calls": {}}
 def vmpp_live(n):
     v = "bf2" if n == 0 else f"bf2p{n}"
