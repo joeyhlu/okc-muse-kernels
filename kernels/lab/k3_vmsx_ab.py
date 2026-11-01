@@ -4238,10 +4238,33 @@ __device__ __forceinline__ const unsigned char* unit_src(const Params& p, const 
 if (q < nA) { const int v = a0 + q; return p.wA + ((size_t)S.jE[v >> 9] * RBA + (v & 511)) * UB; }
 const int v = b0 + (q - nA); return p.wB + ((size_t)S.jE[v >> 8] * RBB + (v & 255)) * UB;
 }
-__device__ __forceinline__ void issue(const unsigned char* src, unsigned char* dst, uint64_t* bar, int tid) {
-#if __CUDA_ARCH__ >= 900
+#if VMS_DIET & 24
+__device__ __forceinline__ uint32_t d4_hold(uint32_t x) {
+asm volatile("mov.b32 %0, %1;" : "=r"(x) : "r"(x)); return x;
+}
+__device__ __forceinline__ int d4_bq(int q) {
+static_assert(NRB == 4, "D4 shared mask requires the audited NRB=4");
+uint32_t b; asm("bfe.u32 %0, %1, 0, 2;" : "=r"(b) : "r"(q)); return (int)b;
+}
+#endif
+#if VMS_DIET & 16
+__device__ __forceinline__ uint64_t d4_policy() {
 uint64_t pol;
 asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+return pol;
+}
+#endif
+#if VMS_DIET & 16
+__device__ __forceinline__ void issue(const unsigned char* src, unsigned char* dst, uint64_t* bar, int tid, uint64_t pol = d4_policy(), uint32_t UB = vms::UB) {
+#else
+__device__ __forceinline__ void issue(const unsigned char* src, unsigned char* dst, uint64_t* bar, int tid) {
+#endif
+#if __CUDA_ARCH__ >= 900
+#if VMS_DIET & 16
+#else
+uint64_t pol;
+asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+#endif
 asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" :: "r"(su32(bar)), "r"(UB) : "memory");
 asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n"
 :: "r"(su32(dst)), "l"(src), "r"(UB), "r"(su32(bar)), "l"(pol) : "memory");
@@ -4435,15 +4458,32 @@ const int nA = a1 - a0, N = t1 - t0;
 #endif
 if (mk && tid == 0) mrow[1] = gt();
 if (warp < NW) {
+#if VMS_DIET & 8
+Smem& S = *reinterpret_cast<Smem*>(__cvta_shared_to_generic(d4_hold(su32(smem))));
+#else
+#endif
+#if VMS_DIET & 16
+const uint64_t d4_pol = d4_policy();
+const uint32_t d4_ub = d4_hold(UB);
+#else
+#endif
 #if !((VMS_FX & 4) && __CUDA_ARCH__ >= 900)
 for (int q = 0; q < NS && q < N; ++q) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
+#if VMS_DIET & 16
+      issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], tid, d4_pol, d4_ub);
+#else
       issue(unit_src(p, S, q, nA, a0, b0), ring + q * UB, &S.full[q], tid);
+#endif
     }
 #endif
+#if VMS_DIET & 8
+const uint32_t k16 = d4_hold(16u + (uint32_t)(p.m >> 30));
+#else
 const uint32_t k16 = 16u + (uint32_t)(p.m >> 30);
+#endif
 const int g = lane >> 2, t = lane & 3;
 uint4 xr[16];
 #if VMS_T16
@@ -4547,7 +4587,11 @@ if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
+#if VMS_DIET & 16
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid, d4_pol, d4_ub);
+#else
         issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
+#endif
       }
 #endif
 float acc[4][4];
@@ -4735,7 +4779,11 @@ o.z = acc[0][2] + acc[1][2] + acc[2][2] + acc[3][2];
 o.w = acc[0][3] + acc[1][3] + acc[2][3] + acc[3][3];
 #endif
 #if VMS_RO
+#if VMS_DIET & 8
+const int bq = d4_bq(q);
+#else
 const int bq = q & (NRB - 1);
+#endif
 #if VMS_MK2
 { const long long c2 = clock64(); cC += c2 - ck; ck = c2; }
 #endif
@@ -4748,7 +4796,11 @@ if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
+#if VMS_DIET & 16
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid, d4_pol, d4_ub);
+#else
         issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
+#endif
       }
 #endif
 mbar_wait(&S.pempty[bq], (uint32_t)(((q / NRB) & 1) ^ 1));
@@ -4762,7 +4814,11 @@ if (two) S.red2[bq][warp][lane] = o2;
       __syncwarp();
       if (lane == 0) mbar_arrive(&S.pfull[bq]);
 #else
+#if VMS_DIET & 8
+const int bq = d4_bq(q);
+#else
 const int bq = q & (NRB - 1);
+#endif
 #if VMS_MK2
 { const long long c2 = clock64(); cC += c2 - ck; ck = c2; }
 #endif
@@ -4782,7 +4838,11 @@ if (q + NS < N) {
 #if __CUDA_ARCH__ >= 900
 if (tid == 0)
 #endif
+#if VMS_DIET & 16
+        issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid, d4_pol, d4_ub);
+#else
         issue(unit_src(p, S, q + NS, nA, a0, b0), ring + sl * UB, &S.full[sl], tid);
+#endif
       }
       if (tid == 0) mbar_arrive(&S.pfull[bq]);
 #endif
@@ -4796,10 +4856,18 @@ mrow[13] = (long long)N | ((long long)nA << 16) | ((long long)njobs << 32);
 }
 #endif
 } else {
+#if VMS_DIET & 16
+Smem& S = *reinterpret_cast<Smem*>(__cvta_shared_to_generic(d4_hold(su32(smem))));
+#else
+#endif
 const int g = lane >> 2, t = lane & 3;
 float* ssc = p.ss + (S.gen & 1) * MAXP;
 for (int q = 0; q < N; ++q) {
+#if VMS_DIET & 16
+const int bq = d4_bq(q);
+#else
 const int bq = q & (NRB - 1);
+#endif
 #if VMS_MK2
 ck = clock64(); if (q > 0) cU += ck - cP;
 #endif
@@ -5006,7 +5074,7 @@ std::vector<int64_t> attrs();
 """
 VMSX_ON = 0
 _VMSX = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}
-VMSX_VARIANTS = {"d1": 1}   # lead 2026-11-01: D1 only (audit: D2 regresses, D12 / D123 held)
+VMSX_VARIANTS = {"d1": 1, "d14a": 9, "d14ab": 25}
 def _vmsx_build_one(mask, flags):
     from torch.utils.cpp_extension import load_inline
     tag = hashlib.sha1((VMS_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
@@ -5110,7 +5178,7 @@ def _vms_call(st, x, local_ids, topk_weights):
     out = torch.empty((m, K2A_D_HIDDEN), dtype=torch.bfloat16, device=x.device)
     md = vs["mod_hi"] if (VMS_HI_ON and m > 8 and vs.get("mod_hi") is not None) else vs["mod"]
     if m == 16:
-        if type(VMSX_ON) is not int or VMSX_ON not in (0, 1, 2, 3, 7):
+        if type(VMSX_ON) is not int or VMSX_ON not in (0, *VMSX_VARIANTS.values()):
             raise RuntimeError(f"invalid VMSX_ON {VMSX_ON!r}")
         if VMSX_ON:
             if md is not vs.get("mod_hi") or VMSX_ON not in vs["diet"]:
