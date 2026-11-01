@@ -48,7 +48,7 @@ COOP_LOAD_NEW = ("      const uint4 graw = use_pre ? gate_pre : (act ? *reinterp
 
 EDITS_U1 = [
     (GPRE_OLD, GPRE_NEW, 1),
-    ("    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0);\n", "    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0, gpre, L == 1);\n", 1),
+    ("    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0);\n", "    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0, gpre, L == 1 && !WS);\n", 1),
     (FIN_SIG_OLD, FIN_SIG_NEW, 1),
     (FIN_LOAD_OLD, FIN_LOAD_NEW, 1),
     (COOP_OLD, COOP_NEW, 1),

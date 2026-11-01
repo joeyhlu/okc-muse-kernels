@@ -2351,7 +2351,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 
   // ---- last CTA: sum the copies, normalize, rmsnorm * sigmoid(gate), store; reset the workspace ----
   if (p.nc == 1) {
-    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0, gpre, L == 1);
+    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0, gpre, L == 1 && !WS);
   } else
   {
     const int part = tid & 7;
