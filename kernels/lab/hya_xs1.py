@@ -194,6 +194,7 @@ struct Params {
   unsigned ns_magic;    // ceil(2^32 / n_splits) (0: n_splits == 1)
   int pfw;              // bits 0 / 1 / 2 / 3: merge-workspace / counter / gate-row L2 warm-up, finalize gate-load hoist (R-att-3/4)
   int skew;             // flat kernels: first-half CTAs take (1024 + skew) / 1024 of an equal key share (R-att-5)
+  int segk;             // flat kernels: virtual keys charged per request boundary (0: the compiled default 600 / 400)
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -2625,7 +2626,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     if (fpart && p.B > 32) {   // many requests: the generic partition by lane 0 (after the whole prefix sum)
       __syncwarp();
       if (threadIdx.x == 0) {
-        constexpr int SEGKF = (L == 8) ? 600 : 400;
+        const int SEGKF = p.segk ? p.segk : ((L == 8) ? 600 : 400);
         const int64_t Tg = (int64_t)S.cum[p.B] + (SEGKF > 0 ? (int64_t)(p.B - 1) * SEGKF : 0);
         int csg = skew_bnd((int)blockIdx.x, Tg, (int)gridDim.x, p.skew), ceg = skew_bnd((int)blockIdx.x + 1, Tg, (int)gridDim.x, p.skew);
         if (SEGKF > 0) {
@@ -2655,7 +2656,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     } else if (fpart) {   // (one iteration above: lane b holds cum[b + 1] = incl_l, cum[b] = incl_l - n_l; lanes >= B: n = 0)
       const unsigned FULL = 0xffffffffu;
       const int lane_f = (int)threadIdx.x;
-      constexpr int SEGKF = (L == 8) ? 600 : 400;
+      const int SEGKF = p.segk ? p.segk : ((L == 8) ? 600 : 400);
       const int excl = incl_l - n_l;
       const int64_t Tf = (int64_t)__shfl_sync(FULL, incl_l, 31) + (SEGKF > 0 ? (int64_t)(p.B - 1) * SEGKF : 0);
       const int cf = blockIdx.x, Gf = gridDim.x;
@@ -2703,7 +2704,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   // every request boundary costs a CTA that crosses it a whole extra segment (q staging, pipeline refill,
   // merge: ~7 us at q_len 8), so the shares are cut in a virtual key space with SEGK keys inserted before each
   // request after the first, then mapped back (a CTA crossing a boundary gets SEGK fewer real keys)
-  constexpr int SEGK = (L == 8) ? 600 : 400;
+  const int SEGK = p.segk ? p.segk : ((L == 8) ? 600 : 400);
   const int64_t T = T0 + (int64_t)(p.B - 1) * SEGK;
   const int c = blockIdx.x, G = gridDim.x;
   // (experiment: the first-dispatched half of the grid takes the second half of the keys)
@@ -2953,6 +2954,7 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
   p.coop = (int)((tma >> 1) & 1);
   p.pfw = (int)((tma >> 5) & 15);
   p.skew = ((tma >> 17) & 1) ? (int)((tma >> 9) & 255) - 128 : 0;
+  p.segk = (int)((tma >> 18) & 1023);
   const bool pdl = ((tma >> 16) & 1);   // programmatic dependent launch (off by default)
   if (L == 1) launch<1>(p, grid, stream, (int)cs, pdl);
   else launch<8>(p, grid, stream, (int)cs, pdl);
