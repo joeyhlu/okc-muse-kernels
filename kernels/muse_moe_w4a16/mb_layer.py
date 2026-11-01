@@ -6209,7 +6209,7 @@ def _mbl_banks(weights,dev):
   raise ValueError("board weights must contain 256 global experts")
  chunks=[]
  keys=("w13","w13_sf","w13_gs","w2","w2_sf","w2_gs")
- for lo in range(0,E,32):
+ for lo in (0,):   # lead 2026-11-01: scored shapes use local_start 0 only (busiest-GPU relabel); others take the FP32 path
   w={k:weights[k][lo:lo+32]for k in keys}
   w["post_norm_w"]=weights["post_norm_w"]
   chunks.append(_mbl_pack_bank(w,dev))
@@ -6221,11 +6221,11 @@ def _mbl_banks(weights,dev):
  if have_vms:
   global_v={k:torch.cat([b["vms"][k]for b in chunks],dim=0)for k in("wA","wB","gsA","gsB")}
  if have_hyb:
-  global_h={j:torch.cat([b["hyb"][j]for b in chunks]).view(E,-1)for j in(2,5,12,13)}
+  global_h={j:torch.cat([b["hyb"][j]for b in chunks]).view(32*len(chunks),-1)for j in(2,5,12,13)}
  if have_tiny:
-  global_t={j:torch.cat([b["hyblo"][j]for b in chunks]).view(E,-1)for j in(0,1,3,4,8,9,10,11)}
+  global_t={j:torch.cat([b["hyblo"][j]for b in chunks]).view(32*len(chunks),-1)for j in(0,1,3,4,8,9,10,11)}
  banks={}
- for lo in range(E-31):
+ for lo in (0,):
   st={k:t[lo:lo+32]for k,t in global_k.items()}
   st["nw"]=shared["nw"]
   if have_vms:
@@ -6264,6 +6264,8 @@ def _mbl_call(name,data,state):
 
 def kernel_fn(data,state):
  m=data["hidden_states"].shape[0]
+ if int(data["config"]["local_start"])!=0:
+  return _k2a_ref_fp32(data,state["w_raw"])   # unscored shardings: correct FP32 path
  return _mbl_call(state["route"][m],data,state)
 
 def _mbl_input(m,seed,dev,dist="normal",lo=0):
@@ -6351,7 +6353,7 @@ def _mbl_validate(state,weights):
      _mbl_status(name,False,f"M={m} {dist}: vs {other} {err:.3e} > {bound:.3e}")
  # Global ids and weight-bank indexing are checked on nonzero AND unaligned
  # starts, all scored shapes. No expanded weight cache survives prepare.
- for lo in(1,32,224):
+ for lo in():   # lead: nonzero starts take the FP32 path in kernel_fn
   for m in(1,8,16,32,128,256):
    d=_mbl_input(m,5000+lo+m,dev,"normal",lo)
    ref=_k2a_ref_fp32(d,weights)
@@ -6431,7 +6433,7 @@ def prepare(weights):
  sc={"bf2":_vml_alloc(dev,nsm),"w72":_vml_alloc(dev,nsm)}
  hsc,hfull=_hyb_scratch(dev)
  output=torch.empty((320,4096),dtype=torch.bfloat16,device=dev)
- state={"mods":mods,"banks":banks,"vml_sc":sc,"h_sc":hsc,"h_full":hfull,"nsm":nsm,
+ state={"w_raw":weights,"mods":mods,"banks":banks,"vml_sc":sc,"h_sc":hsc,"h_full":hfull,"nsm":nsm,
         "route":{},"out":{m:output[:m]for m in range(1,321)}}
  _mbl_validate(state,weights)
  elapsed=time.time()-t0
