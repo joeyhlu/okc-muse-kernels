@@ -5,7 +5,8 @@ registers or grow allocation. SASS/resource gates decide, no speed claim.
 D2/D3 code is retained but excluded from the lab bank (D2 regressed).
 D4a (bit 3) / D4b (bit 4) hoist compute / issuer-helper integer arithmetic
 on D1 (bit 0). Kill risks: ptxas rematerialization and register pressure.
-No protocol changes; only d1 / d14a / d14ab are built for the lab.
+No protocol changes; R-vmsx-3 builds d1 / zt / d1t for the lab.
+Arm bit 6 is a cache-key-only twin marker, never a VMS_DIET bit.
 Bytes/unit unchanged: HBM weight tile 36,864 B; compute lane weight/scale
 LDS 8*16+16=144 B, x fragments 16*16=256 B cold / 512 B hot; helper
 red/red2 128 B cold / 256 B hot. No added load, store, wait or arrival.
@@ -27,7 +28,7 @@ from types import SimpleNamespace as NS
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASE = ROOT / "kernels/lab/k3_hh_5_sk2_pz.py"
 OUT = ROOT / "kernels/lab/k3_vmsx_ab.py"
-VARIANTS = {"d1": 1, "d14a": 9, "d14ab": 25}
+VARIANTS = {"d1": 1, "zt": 64, "d1t": 65}
 
 
 def literal(s, name):
@@ -154,7 +155,7 @@ asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},
 
 PYTHON = '''VMSX_ON = 0
 _VMSX = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}
-VMSX_VARIANTS = {"d1": 1, "d14a": 9, "d14ab": 25}
+VMSX_VARIANTS = {"d1": 1, "zt": 64, "d1t": 65}
 def _vmsx_build_one(mask, flags):
     from torch.utils.cpp_extension import load_inline
     tag = hashlib.sha1((VMS_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
@@ -174,7 +175,9 @@ def _vmsx_prepare(st):
         t0 = time.time()
         try:
             if mask not in _VMSX["mods"]:
-                flags = list(_VMSX["flags"]) + [f"-DVMS_DIET={mask}", "-Xptxas=-v"]
+                flags = list(_VMSX["flags"]) + [f"-DVMS_DIET={mask & 63}", "-Xptxas=-v"]
+                if mask & 64:
+                    flags += ["-DVMS_TWIN=1"]  # Unused macro: distinct cache key, identical code.
                 _VMSX["mods"][mask] = _vmsx_build_one(mask, flags)
             md = _VMSX["mods"][mask]
             a = list(md.attrs())
@@ -230,7 +233,7 @@ def build(base, report=False):
     protocol = ("mbar_", "cta_sync", "__sync", "__threadfence", "S.gen", "p.ctr", "S.red[bq][warp]", "S.red2[bq][warp]")
     assert [l for l in cu.splitlines() if any(k in l for k in protocol)] == [l for l in original.splitlines() if any(k in l for k in protocol)], "protocol/publication changed"
     d1 = diet_project(cu, 1)
-    for mask in VARIANTS.values():
+    for mask in (v & 63 for v in VARIANTS.values() if v & 63):
         active = diet_project(cu, mask)
         for needles in (protocol, ("mma(", "bmul", "scd(", "acc[", "sm.x", "sm2", "__expf", "st_keep_bf16", "__shfl", "__all_sync")):
             assert [l for l in active.splitlines() if any(k in l for k in needles)] == [l for l in d1.splitlines() if any(k in l for k in needles)], (mask, "D4 FP/protocol identity")
@@ -301,9 +304,13 @@ def dry_run(base, patched):
             exec(compile(ast.Module(body=[n], type_ignores=[]), "flags", "exec"), flags_ns)
     def load_inline(**kw):
         flags = kw["extra_cuda_cflags"]
-        mask = int(next(f.split("=")[1] for f in flags if f.startswith("-DVMS_DIET=")))
-        assert flags == flags_ns["fl_hi"] + [f"-DVMS_DIET={mask}", "-Xptxas=-v"]
+        diet = int(next(f.split("=")[1] for f in flags if f.startswith("-DVMS_DIET=")))
+        twin = int("-DVMS_TWIN=1" in flags)
+        mask = diet + 64 * twin
+        assert flags == flags_ns["fl_hi"] + [f"-DVMS_DIET={diet}", "-Xptxas=-v"] + (["-DVMS_TWIN=1"] if twin else [])
         assert kw["name"].startswith(f"k3_vmshi_d{mask}_") and kw["functions"] == ["run", "attrs"]
+        tag = hashlib.sha1((ns["VMS_CUDA_SRC"] + " ".join(flags)).encode()).hexdigest()[:10]
+        assert kw["name"] == f"k3_vmshi_d{mask}_{tag}"
         assert kw["cuda_sources"] == literal(patched, "VMS_CUDA_SRC")
         assert kw["cpp_sources"] == literal(base, "VMS_CPP_SRC")
         builds.append(mask)
@@ -336,6 +343,8 @@ def dry_run(base, patched):
     masks = set(VARIANTS.values())
     assert ns["VMSX_VARIANTS"] == VARIANTS
     assert state["vms_ok"] and set(state["vms"]["diet"]) == masks and sorted(builds) == sorted(masks)
+    assert "VMS_TWIN" not in ns["VMS_CUDA_SRC"] and "VMS_TWIN" not in ns["VMS_CPP_SRC"]
+    assert len({id(state["vms"]["mod_hi"]), *(id(v) for v in state["vms"]["diet"].values())}) == 4
     for mask in (0, *VARIANTS.values()):
         ns["VMSX_ON"] = mask
         for bs in (1, 8, 12, 16):
@@ -349,14 +358,17 @@ def dry_run(base, patched):
     ns["VMSX_ON"] = 0
     with contextlib.redirect_stdout(io.StringIO()): ns["_vmsx_prepare"](state)
     assert len(builds) == len(masks), "cache miss on repeated prepare"
-    failed.add(9); ns["_VMSX"]["mods"].pop(9)
-    with contextlib.redirect_stdout(io.StringIO()): ns["_vmsx_prepare"](state)
-    assert set(state["vms"]["diet"]) == masks - {9} and "d14a" in ns["_VMSX"]["errors"]
-    ns["VMSX_ON"] = 9
-    try: ns["_vms_call"](state, Tensor(), Tensor(), Tensor())
-    except RuntimeError: pass
-    else: raise AssertionError("missing build silently fell back")
-    failed.clear()
+    for name, mask in VARIANTS.items():
+        failed.add(mask); ns["_VMSX"]["mods"].pop(mask)
+        with contextlib.redirect_stdout(io.StringIO()): ns["_vmsx_prepare"](state)
+        assert set(state["vms"]["diet"]) == masks - {mask} and name in ns["_VMSX"]["errors"]
+        ns["VMSX_ON"] = mask
+        try: ns["_vms_call"](state, Tensor(), Tensor(), Tensor())
+        except RuntimeError: pass
+        else: raise AssertionError("missing build silently fell back")
+        failed.clear()
+        with contextlib.redirect_stdout(io.StringIO()): ns["_vmsx_prepare"](state)
+    ns["VMSX_ON"] = 0
     for index, value in ((0, 169), (1, 4), (2, 174465)):
         a = [153, 0, 174464, 132, 2]; a[index] = value; badattrs[1] = a
         with contextlib.redirect_stdout(io.StringIO()): ns["_vmsx_prepare"](state)
@@ -390,12 +402,43 @@ def exact_cpu_gate():
                 assert smem + 16 + bq * 8 == smem + 16 + (bq << 3)
     for m in range(1, 17):
         assert 16 + (m >> 30) == 16
-    # Every admissible pair: unsigned packed multiply/add is carry-free.
-    for a in range(8, 127):
-        for b in range(8, 127):
-            s2 = (a | b << 16) * 16 + 0x5C005C00
-            assert (s2 & 65535) * 0x10001 == (a * 0x10001) * 16 + 0x5C005C00
-            assert (s2 >> 16) * 0x10001 == (b * 0x10001) * 16 + 0x5C005C00
+    # Exact __byte_perm byte selection and uint32 multiply/add, including
+    # selector 4 reading the zero second operand (not byte 0 of w).
+    u32 = 0xFFFFFFFF
+    def byte_perm(a, b, sel):
+        src = (a & u32) | ((b & u32) << 32)
+        return sum(((src >> (8 * ((sel >> (4 * i)) & 7))) & 0xFF)
+                   << (8 * i) for i in range(4)) & u32
+    def scd(w, sel, k16):
+        product = (byte_perm(w, 0, sel) * k16) & u32
+        return (product + 0x5C005C00) & u32
+    # Both cc parities, both multipliers, all bytes (including sign/NaN
+    # encodings): this proves equivalence, not signed E4M3 decoding.
+    lane_checks = 0
+    for cc, sel, packed_sel in ((0, 0x4040, 0x4140), (1, 0x4242, 0x4342)):
+        for k16 in (16, 17):
+            for b0 in range(256):
+                for b1 in range(256):
+                    # Nonzero unselected bytes expose accidental selection.
+                    w = ((b0 | (b1 << 8)) << (16 * cc)) | (0xA55A << (16 * (1 - cc)))
+                    old_sg = scd(w, sel, k16)
+                    old_sg8 = scd(w, sel + 0x0101, k16)
+                    s2 = scd(w, packed_sel, k16)
+                    assert s2 == ((old_sg & 0xFFFF) | ((old_sg8 << 16) & u32))
+                    for b, lane, old in ((b0, s2 & 0xFFFF, old_sg),
+                                         (b1, s2 >> 16, old_sg8)):
+                        # Check unmasked bounds: neither multiply nor add
+                        # can carry from one 16-bit lane into the other.
+                        product = b * k16
+                        value = product + 0x5C00
+                        assert 0 <= product < 0x10000 and 0 <= value < 0x10000
+                        assert lane == (old & 0xFFFF) == (old >> 16) == value
+                        # BF16 -> FP32 is exact integer bit widening; equal
+                        # finite encodings denote the same numerical value.
+                        assert ((lane >> 7) & 0xFF) != 0xFF
+                        assert (lane << 16) == ((old & 0xFFFF) << 16)
+                        lane_checks += 1
+    assert lane_checks == 4 * 65_536 * 2
     # First-use coverage: all four cold/hot accumulator chains initialized once.
     for hot in (False, True):
         seen = set()
@@ -407,7 +450,7 @@ def exact_cpu_gate():
                     assert zero == (chain not in seen)
                     seen.add(chain)
         assert seen == set(range(4))
-    print("[vmsx] CPU arithmetic PASS: D4 mask/address/hoist identities; 14,161 scale pairs; cold/hot first-MMA coverage")
+    print(f"[vmsx] CPU arithmetic PASS: D4 mask/address/hoist identities; 65,536 scale pairs x 2 byte positions x 2 k16 x 2 lanes = {lane_checks:,} checks; uint32 PRMT/IMAD, carry-free, BF16 identical; cold/hot first-MMA coverage")
 
 
 def ship_build(base, report=False):

@@ -1,4 +1,18 @@
-"""Task W / R-vmsw-1: exact fragment exchange, three whole-unit roles on D1.
+"""Task AA / R-vmsw-2: separate role code from dynamic-smem reservation.
+
+Kill risks FIRST: rs0 may retain the compiler's role-scheduling penalty;
+m4 may leave PDL admission unchanged (the +4 KB hypothesis then fails).
+MEASURED lab R-vmsw-1: d1 H=+1.28, rs H=-47.5, e H=-50.9 us.
+These are diagnostic controls, not saving forecasts: no bandwidth/edge
+arithmetic explains a 47.5 us admission/code penalty without the paired run.
+rs0=4 is rs=2 with no fragB allocation; m4=5 is d1=1 with a bare
++4096 host dynamic-smem request, never an accessed member or changed offset.
+Both keep 36864 HBM B/unit and 36864/102400 shared B/unit (cold/hot);
+432/464 arithmetic ops/lane/unit before=after; role dispatch is unchanged
+from rs, and m4 must have byte-identical kernel SASS to d1 (compile gate).
+No protocol change: all CTA/thread coverage below remains identical.
+
+Original Task W accounting/proof, retained for buildable rs/e:
 
 Kill risks FIRST: compiler merging/serializing roles or >168 regs/spills;
 extra shared traffic / recipient issue / +4096 B reservation erase the gain.
@@ -55,7 +69,8 @@ sys.dont_write_bytecode = True
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASE = ROOT / "kernels/lab/k3_hh_5_sk2_pz.py"
 OUT = ROOT / "kernels/lab/k3_vmsw_ab.py"
-VARIANTS = {"d1": 1, "rs": 2, "e": 3}
+VARIANTS = {"d1": 1, "rs": 2, "e": 3, "rs0": 4, "m4": 5}
+SMEM = {0: 174464, 1: 174464, 2: 178560, 3: 178560, 4: 174464, 5: 178560}
 
 
 def node(s, name):
@@ -97,9 +112,9 @@ const uint32_t r1 = __funnelshift_l(qw, qw, 10) & M;
 const uint32_t r2 = __funnelshift_l(qw, qw, 13) & M;
 const uint32_t r3 = ((qw & 0x001B001Bu) * unp_ok32(0x1084u)) & M;
 '''
-ROLE_HELPER = r'''#if VMS_W >= 2
+ROLE_HELPER = r'''#if VMS_W >= 2 && VMS_W <= 4
 template<int C> struct VmswRole { static constexpr int value = C; };
-static_assert(RING_OFF-sizeof(Smem)>=8 && SMEM_BYTES==178560, "VMSW layout");
+static_assert(RING_OFF-sizeof(Smem)>=8 && SMEM_BYTES==(VMS_W==4 ? 174464 : 178560), "VMSW layout");
 __device__ __forceinline__ void vmsw_wait(uint64_t* b, uint32_t phase, int* err) {
 int n=0;
 while (true) {
@@ -137,7 +152,8 @@ rw = *reinterpret_cast<const uint4*>(slot + (donor*8+7)*512 + lane*16);
 rsw = *reinterpret_cast<const uint32_t*>(slot + UC + donor*512 + lane*16 + 12);
 }
 cta_sync_compute();''')
-    production = '''if constexpr (VMS_W==3 && C==2) {
+    production = '''#if VMS_W==3
+if constexpr (C==2) {
 const uint32_t s2 = scd(rsw,0x4342u,k16);
 const uint32_t ww[4] = {rw.x,rw.y,rw.z,rw.w};
 #pragma unroll
@@ -147,6 +163,7 @@ for (int s=0; s<4; ++s) {
 __syncwarp();
 if (lane==0) mbar_arrive(reinterpret_cast<uint64_t*>(ring-8));
 }
+#endif
 '''
     # Pre-register x B operands identical to the actual cc7 block.
     bb = '''const uint32_t bb[8] = {xr[14].x,xr[14].y,xr[14].z,xr[14].w,
@@ -156,13 +173,14 @@ xr[15].x,xr[15].y,xr[15].z,xr[15].w};
 const uint32_t b2[8] = {y0.x,y0.y,y0.z,y0.w,y1.x,y1.y,y1.z,y1.w};
 '''
     def consume(hot):
-        return '''if constexpr (VMS_W==3 && C==1) {
+        return '''#if VMS_W==3
+if constexpr (C==1) {
 vmsw_wait(reinterpret_cast<uint64_t*>(ring-8),uint32_t(q&1),p.ctr+2);
 ''' + bb + (b2 if hot else "") + '''#pragma unroll
 for (int s=0; s<4; ++s) {
 const uint4 f = S.fragB[warp/4][lane][s];
 const uint32_t A0=f.x,A1=f.y,A2=f.z,A3=f.w;
-''' + (HOT_MMA if hot else COLD_MMA) + "}\n}\n"
+''' + (HOT_MMA if hot else COLD_MMA) + "}\n}\n#endif\n"
     body = '''float acc[4][4];
 float4 o2;
 auto vmsw_unit = [&](auto tag) {
@@ -199,13 +217,17 @@ def source_recipe(base):
     # Header must follow definitions of native flags; only VMS_W is supplied by bank.
     lines.append("    replace(%r,%r)" % ("namespace vms {\n", "namespace vms {\n"+header))
     smem = "#if VMS_LPAD > 0\nunsigned char lpad[VMS_LPAD];\n#endif\n"
-    lines.append("    replace(%r,%r)" % (smem, smem+"#if VMS_W >= 2\nuint4 fragB[2][32][4];\n#endif\n"))
+    lines.append("    replace(%r,%r)" % (smem, smem+"#if VMS_W==2 || VMS_W==3\nuint4 fragB[2][32][4];\n#endif\n"))
+    request = "constexpr int SMEM_BYTES = RING_OFF + NS * UB;\n"
+    assert cu.count("SMEM_BYTES") == 4, "dynamic size must remain host-only"
+    lines.append("    replace(%r,%r)" % (request, "#if VMS_W==5\n" +
+                 request.replace(";", " + 4096;") + "#else\n" + request + "#endif\n"))
     lines.append(f"    replace({kernel!r},{(ROLE_HELPER+kernel)!r})")
     init = "if (mk) mrow[0] = gt();\n"
     lines.append("    replace(%r,%r)" % (init, init+"#if VMS_W==3\nmbar_init(reinterpret_cast<uint64_t*>(ring-8),2);\n#endif\n"))
     lines += ["    i=s.index('const unsigned char* slot = ring + sl * UB;\\n')",
               "    j=s.index('float4 o;\\n',i)",
-              f"    s=s[:i]+'#if VMS_W >= 2\\n'+{roles!r}+'#else\\n'+s[i:j]+'#endif\\n'+s[j:]",
+              f"    s=s[:i]+'#if VMS_W >= 2 && VMS_W <= 4\\n'+{roles!r}+'#else\\n'+s[i:j]+'#endif\\n'+s[j:]",
               "    return s", "VMSW_CUDA_SRC = _vmsw_source()", ""]
     return "\n".join(lines), d1, roles
 
@@ -231,6 +253,7 @@ def build(base, report=False):
     ns = {"VMS_CUDA_SRC": literal(base, "VMS_CUDA_SRC")}
     exec(recipe, ns)
     active = ns["VMSW_CUDA_SRC"]
+    source_gate(active)
     suffix = "float4 o;\n"
     assert active[active.index(suffix):] == d1[d1.index(suffix):]
     assert "return" not in roles and "continue" not in roles and "if (cc" not in roles
@@ -247,7 +270,51 @@ def build(base, report=False):
     return s
 
 
-PYTHON = 'VMSW_ON = 0\n_VMSW = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}\nVMSW_VARIANTS = {"d1": 1, "rs": 2, "e": 3}\ndef _vmsw_build_one(mask, flags):\n    from torch.utils.cpp_extension import load_inline\n    tag = hashlib.sha1((VMSW_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]\n    return load_inline(name=f"k3_vmshi_d{mask}_{tag}", cpp_sources=VMS_CPP_SRC, cuda_sources=VMSW_CUDA_SRC,\n                       functions=["run", "attrs"], extra_cuda_cflags=flags)\ndef _vmsw_prepare(st):\n    _VMSW["errors"] = {}\n    _VMSW["calls"].clear()\n    vs = st["vms"]\n    vs["diet"] = {}\n    if not st["vms_ok"] or vs.get("mod_hi") is None:\n        return\n    base = list(vs["mod_hi"].attrs())\n    if base[0] > 168 or base[1] or base[2] != 174464:\n        raise RuntimeError(f"VMSW base resources {base}")\n    def one(name, mask):\n        t0 = time.time()\n        try:\n            if mask not in _VMSW["mods"]:\n                flags = list(_VMSW["flags"]) + [f"-DVMS_W={mask}", "-Xptxas=-v"]\n                _VMSW["mods"][mask] = _vmsw_build_one(mask, flags)\n            md = _VMSW["mods"][mask]\n            a = list(md.attrs())\n            if a[0] > 168 or a[1] or a[2:] != [178560 if mask >= 2 else 174464] + base[3:]:\n                raise RuntimeError(f"VMSW {name} resources {a}, base {base}")\n            vs["diet"][mask] = md\n            print(f"[vmsw] {name} resources {a}", flush=True)\n        except Exception as ex:\n            _VMSW["errors"][name] = repr(ex)\n            print(f"[vmsw] {name} unavailable: {ex!r}", flush=True)\n        _VMSW["secs"][name] = time.time() - t0\n    import threading\n    ths = [threading.Thread(target=one, args=(name, mask)) for name, mask in VMSW_VARIANTS.items()]\n    for th in ths:\n        th.start()\n    for th in ths:\n        th.join()\n'
+def source_gate(source):
+    """Resolve only our variant guards; leave every native preprocessor line.
+
+    This is a source identity gate, not a substitute for the nvcc/SASS gate.
+    """
+    def selected(mask):
+        result, stack, keep = [], [], True
+        for line in source.splitlines(keepends=True):
+            directive = re.match(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)", line)
+            if directive:
+                op, expr = directive.groups()
+                if op in ("if", "ifdef", "ifndef"):
+                    own = op == "if" and re.search(r"\bVMS_W\b", expr)
+                    cond = None
+                    if own:
+                        expr = re.sub(r"\bVMS_W\b", str(mask), expr).replace("&&", " and ").replace("||", " or ")
+                        cond = bool(eval(expr, {"__builtins__": {}}))
+                    stack.append((keep, cond))
+                    if own:
+                        keep = keep and cond
+                        continue
+                elif op == "else" and stack[-1][1] is not None:
+                    keep = stack[-1][0] and not stack[-1][1]
+                    continue
+                elif op == "elif":
+                    assert stack[-1][1] is None, "variant elif unsupported"
+                elif op == "endif":
+                    parent, cond = stack.pop()
+                    keep = parent
+                    if cond is not None:
+                        continue
+            if keep:
+                result.append(line)
+        assert not stack
+        return "".join(result)
+    d1, rs, rs0, m4 = (selected(mask) for mask in (1, 2, 4, 5))
+    request = "constexpr int SMEM_BYTES = RING_OFF + NS * UB"
+    assert m4.replace(request + " + 4096;", request + ";") == d1
+    assert rs.replace("uint4 fragB[2][32][4];\n", "") == rs0
+    assert "fragB" not in rs0 and "VMSW_ROLE" in rs0
+    assert all(token not in d1 + m4 for token in ("fragB", "vmsw_unit", "vmsw_wait"))
+    assert rs0.count("vmsw_unit(VmswRole<") == 3
+
+
+PYTHON = 'VMSW_ON = 0\n_VMSW = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}\nVMSW_VARIANTS = {"d1": 1, "rs": 2, "e": 3, "rs0": 4, "m4": 5}\ndef _vmsw_build_one(mask, flags):\n    from torch.utils.cpp_extension import load_inline\n    tag = hashlib.sha1((VMSW_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]\n    return load_inline(name=f"k3_vmshi_d{mask}_{tag}", cpp_sources=VMS_CPP_SRC, cuda_sources=VMSW_CUDA_SRC,\n                       functions=["run", "attrs"], extra_cuda_cflags=flags)\ndef _vmsw_prepare(st):\n    _VMSW["errors"] = {}\n    _VMSW["calls"].clear()\n    vs = st["vms"]\n    vs["diet"] = {}\n    if not st["vms_ok"] or vs.get("mod_hi") is None:\n        return\n    base = list(vs["mod_hi"].attrs())\n    if base[0] > 168 or base[1] or base[2] != 174464:\n        raise RuntimeError(f"VMSW base resources {base}")\n    def one(name, mask):\n        t0 = time.time()\n        try:\n            if mask not in _VMSW["mods"]:\n                flags = list(_VMSW["flags"]) + [f"-DVMS_W={mask}", "-Xptxas=-v"]\n                _VMSW["mods"][mask] = _vmsw_build_one(mask, flags)\n            md = _VMSW["mods"][mask]\n            a = list(md.attrs())\n            if a[0] > 168 or a[1] or a[2:] != [178560 if mask in (2, 3, 5) else 174464] + base[3:]:\n                raise RuntimeError(f"VMSW {name} resources {a}, base {base}")\n            vs["diet"][mask] = md\n            print(f"[vmsw] {name} resources {a}", flush=True)\n        except Exception as ex:\n            _VMSW["errors"][name] = repr(ex)\n            print(f"[vmsw] {name} unavailable: {ex!r}", flush=True)\n        _VMSW["secs"][name] = time.time() - t0\n    import threading\n    ths = [threading.Thread(target=one, args=(name, mask)) for name, mask in VMSW_VARIANTS.items()]\n    for th in ths:\n        th.start()\n    for th in ths:\n        th.join()\n'
 SELECT = '    if m == 16:\n        if type(VMSW_ON) is not int or VMSW_ON not in (0, *VMSW_VARIANTS.values()):\n            raise RuntimeError(f"invalid VMSW_ON {VMSW_ON!r}")\n        if VMSW_ON:\n            if md is not vs.get("mod_hi") or VMSW_ON not in vs["diet"]:\n                raise RuntimeError(f"unavailable VMSW arm {VMSW_ON}")\n            md = vs["diet"][VMSW_ON]\n        key = f"T16:{VMSW_ON}"\n        _VMSW["calls"][key] = _VMSW["calls"].get(key, 0) + 1\n'
 
 
@@ -282,7 +349,7 @@ def dry_run(base, patched):
     seen, builds, stock_builds, failed, badattrs = [], [], [], set(), {}
     class Module:
         def __init__(self, mask): self.mask = mask
-        def attrs(self): return badattrs.get(self.mask, [156, 0, 178560 if self.mask >= 2 else 174464, 132, 2])
+        def attrs(self): return badattrs.get(self.mask, [156, 0, SMEM.get(self.mask, 174464), 132, 2])
         def run(self, *a): seen.append((self.mask, a[14]))
     def inputs(bs, *a): return {k: Tensor((bs, 4096)) for k in ("hidden_states", "topk_ids", "topk_weights")}
     # Execute base's actual flags expressions, not copied approximations.
@@ -341,7 +408,7 @@ def dry_run(base, patched):
         for bs in (1, 8, 12, 16):
             ns["_vms_call"](state, Tensor((bs, 4096)), Tensor(), Tensor())
             assert seen[-1] == ((mask if bs == 16 else 0 if bs > 8 else -1), bs)
-    for bad in (-1, 4, 7, 8, 16, True, 1.0, None):
+    for bad in (-1, 6, 7, 8, 16, True, 1.0, None):
         ns["VMSW_ON"] = bad
         try: ns["_vms_call"](state, Tensor(), Tensor(), Tensor())
         except RuntimeError: pass
@@ -349,25 +416,28 @@ def dry_run(base, patched):
     ns["VMSW_ON"] = 0
     with contextlib.redirect_stdout(io.StringIO()): ns["_vmsw_prepare"](state)
     assert len(builds) == len(masks), "cache miss on repeated prepare"
-    failed.add(2); ns["_VMSW"]["mods"].pop(2)
-    with contextlib.redirect_stdout(io.StringIO()): ns["_vmsw_prepare"](state)
-    assert set(state["vms"]["diet"]) == masks - {2} and "rs" in ns["_VMSW"]["errors"]
-    ns["VMSW_ON"] = 2
-    try: ns["_vms_call"](state, Tensor(), Tensor(), Tensor())
-    except RuntimeError: pass
-    else: raise AssertionError("missing build silently fell back")
-    failed.clear()
-    for index, value in ((0, 169), (1, 4), (2, 174465)):
-        a = [153, 0, 174464, 132, 2]; a[index] = value; badattrs[1] = a
+    for name, mask in VARIANTS.items():
+        failed.add(mask); ns["_VMSW"]["mods"].pop(mask)
         with contextlib.redirect_stdout(io.StringIO()): ns["_vmsw_prepare"](state)
-        assert 1 not in state["vms"]["diet"] and "d1" in ns["_VMSW"]["errors"]
-    badattrs.clear()
+        assert set(state["vms"]["diet"]) == masks - {mask} and name in ns["_VMSW"]["errors"]
+        ns["VMSW_ON"] = mask
+        try: ns["_vms_call"](state, Tensor(), Tensor(), Tensor())
+        except RuntimeError: pass
+        else: raise AssertionError("missing build silently fell back")
+        failed.clear()
+        for index, value in ((0, 169), (1, 4), (2, SMEM[mask] ^ 4096)):
+            a = [156, 0, SMEM[mask], 132, 2]; a[index] = value; badattrs[mask] = a
+            with contextlib.redirect_stdout(io.StringIO()): ns["_vmsw_prepare"](state)
+            assert mask not in state["vms"]["diet"] and name in ns["_VMSW"]["errors"]
+        badattrs.clear()
+        with contextlib.redirect_stdout(io.StringIO()): ns["_vmsw_prepare"](state)
+        assert set(state["vms"]["diet"]) == masks
     state["vms_ok"] = False; ns["_vmsw_prepare"](state)
     assert not state["vms"]["diet"]
     state["vms_ok"] = True; state["vms"]["mod_hi"] = None; ns["_vmsw_prepare"](state)
     assert not state["vms"]["diet"]
     ns["VMS_ENABLE"] = False; ns["_vms_prepare"](state, w, "cpu"); assert not state["vms_ok"]
-    print("[vmsw] CPU dry run PASS: real prepare/state, flags, three builds, cache, arms, independent failure, no silent fallback")
+    print("[vmsw] CPU dry run PASS: real prepare/state, flags, five builds, cache, all arms/resource failures, no silent fallback")
 
 def exact_cpu_gate():
     """Address, bit-pattern, MMA-order and phase/overwrite checks without CUDA."""
@@ -385,6 +455,8 @@ def exact_cpu_gate():
         return size, ring, ring+2*36864
     assert layout(0) == (100720,100736,174464)
     assert layout(256) == (104816,104832,178560)
+    assert SMEM[1] == SMEM[4] == layout(0)[2]
+    assert SMEM[5] == layout(0)[2] + 4096 == SMEM[2] == SMEM[3]
     assert 104816 <= 104832-8 and (104832-8)%8 == 0
     def perm(w, sel):
         b = [(w>>(8*i))&255 for i in range(4)] + [0]*4

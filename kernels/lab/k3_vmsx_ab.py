@@ -5074,7 +5074,7 @@ std::vector<int64_t> attrs();
 """
 VMSX_ON = 0
 _VMSX = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}
-VMSX_VARIANTS = {"d1": 1, "d14a": 9, "d14ab": 25}
+VMSX_VARIANTS = {"d1": 1, "zt": 64, "d1t": 65}
 def _vmsx_build_one(mask, flags):
     from torch.utils.cpp_extension import load_inline
     tag = hashlib.sha1((VMS_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
@@ -5094,7 +5094,9 @@ def _vmsx_prepare(st):
         t0 = time.time()
         try:
             if mask not in _VMSX["mods"]:
-                flags = list(_VMSX["flags"]) + [f"-DVMS_DIET={mask}", "-Xptxas=-v"]
+                flags = list(_VMSX["flags"]) + [f"-DVMS_DIET={mask & 63}", "-Xptxas=-v"]
+                if mask & 64:
+                    flags += ["-DVMS_TWIN=1"]  # Unused macro: distinct cache key, identical code.
                 _VMSX["mods"][mask] = _vmsx_build_one(mask, flags)
             md = _VMSX["mods"][mask]
             a = list(md.attrs())
