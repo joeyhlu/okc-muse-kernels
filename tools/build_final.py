@@ -36,7 +36,7 @@ BASE = "kernels/muse_decode_layer/k3_gc_21cg_s1.py"
 BASE_SHA1 = "9752060f1c503aff1557ade0599b96d89f9280d5"
 BASE_GC21 = "kernels/muse_decode_layer/k3_gc_21.py"
 BASE_GC21_SHA1 = "310ad0acffb9b92a0ea0eeef5edf784190f495fa"
-FINAL = "kernels/lab/k3_hh_5_sk2_pz.py"
+FINAL = "kernels/lab/k3_hh_5_sk2_pz_rt.py"
 NONCE_HH_3TEKV = '# nonce k3-hh-3tekv (k3_hh_3rr + VMS_T16 NS2 + ER module for 9-16 tokens [tools/gen_k3_vt16.py --hi=ship --wt2=30 --hix=-DVMS_NS=2,-DVMS_ER=1] + R-kvs-2 [tools/kvs_patches.py] + R-v32 VML scratch fix [tools/vfx_patches.py])'
 LIMIT = 1_000_000
 
@@ -84,6 +84,7 @@ DEP_BLOBS = {
     "tools/hybst_patches.py": "f1500897f907110e4d6199c8833a07044a3b6631",
     "tools/sk2_patches.py": "757973d85bc90a47457f3d2ffe31a95393f9bd15",
     "tools/padz_patches.py": "c75d56470cbd37ba446d7d7832aa433d35e808ee",
+    "tools/mg_patches.py": "71b52a2e105c14a1814f3a307bfe6dba4c931a58",
     "tools/hybpro_patches.py": "9069738be60a82186eba6f5a14dc70aba43507ba",
     "tools/hybsync_patches.py": "a6fb3457e760446c2bc768448a7b65b313d316c6",
     "tools/hyblo_patches.py": "966e73ae5d673150c212da2d07211da36da7cb57",
@@ -202,6 +203,10 @@ STEPS = [
          argv=["--ship", "--base={in}", "--out={out}"],
          deps=["tools/padz_patches.py", "tools/hybpro_patches.py", "tools/hybsync_patches.py"],
          ref="kernels/lab/k3_hh_5_sk2_pz.py", sha1="0d36e0e621c94b12bc84347fc83fe8b8a9a231da", size=987199),
+    # R-mg-7 (0cd6b487): RTR2, T=8 fused-router suffix 2 rows x 4 tokens per warp (bitwise == stock; pooler gd -0.8..-1.1 us at T=8)
+    dict(n=22, name="rtr2", out="k3_hh_5_sk2_pz_rt.py", tool="tools/mg_patches.py",
+         argv=["--ship", "--bits=64", "--base={in}", "--out={out}"], deps=["tools/mg_patches.py"],
+         ref="kernels/lab/k3_hh_5_sk2_pz_rt.py", sha1="88a65ab76747562e2312a8bd070e2a44d48cfa13", size=987838),
 ]
 
 
