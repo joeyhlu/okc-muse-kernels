@@ -226,6 +226,10 @@ void m16xa(const uint8_t* W, const uint16_t* X, float* O, int* smids, int* error
     const int wg = warp / 4, wp = warp & 3;
     for (int u = wg; u < units; u += 2) {
       const int slot = u % 3;
+      // Odd ring depth alternates the owner of each slot. Do not test a future
+      // full phase while the previous owner's TMA can still be in flight: its
+      // old parity would look ready. The previous empty phase certifies retirement.
+      if (u >= 3) wait(bars + (3 + slot) * 8, ((u / 3) - 1) & 1, err);
       wait(bars + slot * 8, (u / 3) & 1, err);
       if constexpr (MODE != 0) {
         float d[N / 2] = {};
@@ -383,6 +387,77 @@ def unit_coords(units, grid):
     cta, local = ids // units, ids % units
     row_tile = (cta // 4) * units + local
     return row_tile // 128, row_tile % 128, cta % 4
+
+
+def address_bounds(arm, n, units, grid, capacities=None):
+    """Replay every global access site in bytes; no tensors/GPU needed.
+
+    Intervals enumerate every bulk transfer, X uint4 and helper float4. Repeated
+    error polls share the same per-CTA int32 address. Capacities may come from the
+    actual tensors, so a short allocation cannot pass by checking only a formula.
+    """
+    assert (arm, n) in ARMS and units >= 4 and units % 2 == 0 and grid >= 1
+    assert max(units + 2, grid) < 2**31, "C++ int loop/launch overflow"
+    sizes = {"W": grid * units * UNIT, "X": n * 1024 * 2,
+             "O": grid * units * 64 * 32 * 4, "sm": grid * 4, "err": grid * 4}
+    if capacities is not None:
+        assert set(capacities) == set(sizes)
+        sizes = capacities
+    assert max(sizes.values()) < 2**63, "size_t/int64 address overflow"
+    accesses = {}
+
+    def check(name, starts, width, alignment):
+        starts = np.asarray(starts, dtype=np.int64)
+        assert starts.size and int(starts.min()) >= 0
+        end = int(starts.max()) + width
+        assert end <= sizes[name], (arm, n, name, end, sizes[name])
+        assert np.all(starts % alignment == 0), (name, "misaligned offset")
+        accesses[name] = {"accesses": int(starts.size), "first_byte": int(starts.min()),
+                          "end_byte_exclusive": end, "tensor_bytes": int(sizes[name])}
+
+    cta = np.arange(grid, dtype=np.int64)
+    u = np.arange(units, dtype=np.int64)
+    tiles = cta[:, None] * units + u[None, :]  # CUDA casts blockIdx.x to size_t FIRST.
+    check("W", tiles * UNIT, UNIT, 16)
+    xi = np.concatenate([np.arange(tid * 8, n * 1024, 384 * 8, dtype=np.int64)
+                         for tid in range(384)])
+    assert np.array_equal(np.sort(xi), np.arange(0, n * 1024, 8))
+    check("X", np.broadcast_to(xi * 2, (grid, xi.size)), 16, 16)
+    if arm != "null":
+        # Helpers 288..319 (even units) and 320..351 (odd units).
+        js = np.concatenate([np.arange(lane, 64 * n // 4, 32, dtype=np.int64)
+                             for lane in range(32)])
+        assert np.array_equal(np.sort(js), np.arange(64 * n // 4))
+        seen = []
+        for wg in (0, 1):
+            owned = tiles[:, wg::2].reshape(-1)
+            starts = owned[:, None] * (64 * n * 4) + js[None, :] * 16
+            seen.append(starts.reshape(-1))
+        check("O", np.concatenate(seen), 16, 16)
+    else:
+        accesses["O"] = {"accesses": 0, "tensor_bytes": int(sizes["O"])}
+    check("sm", cta * 4, 4, 4)  # thread 0 terminal store
+    check("err", cta * 4, 4, 4)  # thread 0 reset/read + all waiters' atomic polls
+    # prepare_bank's actual raw tensor slices, including cohort/expert transitions.
+    es, rows, ks = unit_coords(units, grid)
+    experts = ((grid + 3) // 4 * units + 127) // 128
+    assert np.all((es >= 0) & (es < experts))
+    assert np.all((rows * 64 >= 0) & ((rows + 1) * 64 <= 8192))
+    assert np.all((ks * 512 >= 0) & ((ks + 1) * 512 <= 2048))
+    assert np.all((ks * 64 >= 0) & ((ks + 1) * 64 <= 256))
+    assert len(set(zip(es.tolist(), rows.tolist(), ks.tolist()))) == grid * units
+    return {"arm": arm, "n": n, "grid": grid, "units": units, "status": "PASS",
+            "experts": experts, "accesses": accesses}
+
+
+def tensor_bounds(arm, n, units, grid, w, x, out, sm, err):
+    """Run the same CPU arithmetic against the actual launch allocations."""
+    tensors = {"W": w, "X": x, "O": out, "sm": sm, "err": err}
+    for name, tensor in tensors.items():
+        assert tensor.is_contiguous(), (name, "non-contiguous launch tensor")
+        assert tensor.data_ptr() % (4 if name in ("sm", "err") else 16) == 0
+    return address_bounds(arm, n, units, grid,
+                          {k: t.numel() * t.element_size() for k, t in tensors.items()})
 
 
 def prepare_bank(weights, units, grid):
@@ -552,6 +627,20 @@ def cpu_gates():
     assert "@" not in src and "__trap" not in src
     assert len(re.findall(r"m16xa<\d+, \d+><<<", src)) == len(ARMS)
     assert len(set(ARMS)) == len(ARMS)
+    # Tie the address/protocol replay to the generated CUDA access sites.
+    for expression in (
+        "constexpr int UB = 36864, XS = 65536, RSZ = 3 * UB;",
+        "W + (size_t(blockIdx.x) * units + u) * UB",
+        "O + (size_t(blockIdx.x) * units + u) * 64 * N",
+        "for (int i = tid * 8; i < N * 1024; i += 384 * 8)",
+        "reinterpret_cast<const uint4*>(X + i)",
+        "for (int j = lane; j < 64 * N / 4; j += 32)",
+        "int* err = errors + blockIdx.x;", "smids[blockIdx.x] = sm;",
+    ):
+        assert expression in src, ("update address replay", expression)
+    handoff = "if (u >= 3) wait(bars + (3 + slot) * 8, ((u / 3) - 1) & 1, err);"
+    assert src.count(handoff) == 2  # Producer and consumer, not producer alone.
+    assert handoff + "\n      wait(bars + slot * 8, (u / 3) & 1, err);" in src
     # Check exact copied CUDA functions against only the matching base snippets.
     wanted = ("unp_ok32", "deq4", "deq4_dq", "bmul2l", "bmul2h", "dec_half2")
     hits = {name: [] for name in wanted}
@@ -616,6 +705,19 @@ def cpu_gates():
         sf = weights["w13_sf"][e, r*64:(r+1)*64, k*64:(k+1)*64]
         actual, _ = base_pack_cpu(sl, sf)
         assert np.array_equal(actual, prepared[u]), ("bank map", u)
+    # Execute the real full-grid prepare path, not just a small representative bank.
+    full_weights = make_weights(13, 1801)
+    full_bank = prepare_bank(full_weights, 48, GRID)
+    assert full_bank.shape == (6336, UNIT) and full_bank.nbytes == 233570304
+    ec, rc, kc = unit_coords(48, GRID)
+    for u in (0, 47, 48, 511, 512, 6335):
+        e, r, k = int(ec[u]), int(rc[u]), int(kc[u])
+        expected, _ = base_pack_cpu(full_weights["w13"][e,r*64:(r+1)*64,k*512:(k+1)*512],
+                                    full_weights["w13_sf"][e,r*64:(r+1)*64,k*64:(k+1)*64])
+        assert np.array_equal(full_bank[u], expected), ("full-grid bank map", u)
+    full_bank_bytes = full_bank.nbytes
+    del full_bank, full_weights
+    bound_rows = address_gates()
     rejected = []
     for key in ("w13", "w13_sf"):
         bad = dict(weights); bad.pop(key)
@@ -635,6 +737,8 @@ def cpu_gates():
         assert len(set(coords)) == 64*n
     # Event-level interleaving of ring/epilogue protocols, including all final drains.
     protocol_gates()
+    phase_report = ring_phase_gates()
+    reset_report = input_reset_gates()
     # Compiler-log parser and decision boundary checks use synthetic fixtures,
     # never presented as hardware measurements and never written to a result file.
     fixtures=[]
@@ -673,7 +777,122 @@ def cpu_gates():
             "weight_layout": {"w13": [2,8192,2048], "w13_sf_raw_e4m3": [2,8192,256]},
             "arm_instances": [f"{a}_n{n}" for a,n in ARMS], "no_layer_state_access": True,
             "protocol_interleavings":120,"verdict_boundaries":"PASS","compiler_parser":"PASS",
+             "full_grid_prepare":{"units":6336,"bank_bytes":full_bank_bytes,"status":"PASS"},
+             "global_address_bounds":bound_rows,"ring_phase_replay":phase_report,
+             "correctness_input_reset":reset_report,
             "source_sha256": hashlib.sha256(src.encode()).hexdigest()}
+
+
+def address_gates():
+    class Tensor:
+        def __init__(self, count, width): self.count, self.width = count, width
+        def numel(self): return self.count
+        def element_size(self): return self.width
+        def is_contiguous(self): return True
+        def data_ptr(self): return 0x100000000  # Exercise an address above int32.
+    rows=[]
+    for arm,n in ARMS:
+        rows.append(tensor_bounds(arm,n,48,GRID,Tensor(GRID*48*UNIT,1),Tensor(n*1024,2),
+                                 Tensor(GRID*48*64*32,4),Tensor(GRID,4),Tensor(GRID,4)))
+    # Every global buffer gets a one-byte-short negative control at its last access.
+    last=next(r for r in rows if r["arm"]=="rs" and r["n"]==32)
+    sizes={k:v["tensor_bytes"] for k,v in last["accesses"].items()}
+    for key in sizes:
+        bad={**sizes,key:last["accesses"][key]["end_byte_exclusive"]-1}
+        try: address_bounds("rs",32,48,GRID,bad)
+        except AssertionError as ex:
+            assert ex.args[0][:3] == ("rs",32,key), (key, ex)
+        else: raise AssertionError(("short tensor accepted",key))
+    return rows
+
+
+def input_reset_gates():
+    class Buffer:
+        def __init__(self, x): self.value=x.copy()
+        def copy_(self, x): self.value[:]=x
+    cases=0
+    for n in (8,16,32):
+        original=pack_x(np.arange(n*1024,dtype=np.uint16).reshape(n,1024))
+        px=Buffer(original)
+        for arm,an in ARMS:
+            if an!=n: continue
+            # Replay -X from a previous arm, including its early-failure path.
+            px.value ^= np.uint16(0x8000)
+            assert not np.array_equal(px.value,original), "negative control did not mutate X"
+            reset_correctness_input(px,original)
+            assert np.array_equal(px.value,original), (arm,n,"inherited -X")
+            cases+=1
+    return {"status":"PASS","arm_resets":cases,"legacy_negated_input_rejected":True}
+
+
+def ring_phase_gates():
+    """Replay actual parity tests with out-of-order TMA and eight independent warps.
+
+    The older slot==unit simulator assumes away future-phase waits. In an odd
+    ring a slot changes WG owner on reuse, so that assumption needs a handshake.
+    """
+    def run(units,seed,fixed,prefix=()):
+        rng=np.random.default_rng(seed)
+        full,empty=[0]*3,[0]*3  # Number of completed generations, parity = count & 1.
+        inflight=[None]*3
+        arrivals=[set() for _ in range(3)]
+        next_u=[w//4 for w in range(8)]
+        stage=[1]*8  # 0 previous-empty wait, 1 full wait, 2 consume/release.
+        producer=0
+        for tick in range(units*50):
+            ops=[]
+            if producer<units:
+                slot=producer%3
+                if producer<3 or (empty[slot]&1)!=((producer//3-1)&1): ops.append(("p",0))
+            ops += [("t",s) for s in range(3) if inflight[s] is not None]
+            for w,u in enumerate(next_u):
+                if u>=units: continue
+                s,g=u%3,u//3
+                if stage[w]==0 and (empty[s]&1)!=((g-1)&1): ops.append(("e",w))
+                if stage[w]==1 and (full[s]&1)!=(g&1): ops.append(("f",w))
+                if stage[w]==2: ops.append(("r",w))
+            if not ops: break
+            op,k=prefix[tick] if tick<len(prefix) else ops[int(rng.integers(len(ops)))]
+            assert (op,k) in ops, ("invalid replay prefix",op,k)
+            if op=="p":
+                s,g=producer%3,producer//3
+                assert inflight[s] is None and full[s]==g and empty[s]==g, "overlapping refill"
+                inflight[s]=producer; producer+=1
+            elif op=="t":
+                assert full[k]==inflight[k]//3
+                full[k]+=1; inflight[k]=None
+            else:
+                u=next_u[k]; s,g=u%3,u//3
+                if op=="e":
+                    assert empty[s]==g, "future empty phase"
+                    stage[k]=1
+                elif op=="f":
+                    assert full[s]==g+1, "future full phase accepted before TMA completion"
+                    stage[k]=2
+                else:
+                    assert empty[s]==g and k not in arrivals[s]
+                    arrivals[s].add(k)
+                    if len(arrivals[s])==4:
+                        assert arrivals[s]==set(range((u&1)*4,(u&1)*4+4))
+                        empty[s]+=1; arrivals[s].clear()
+                    next_u[k]+=2
+                    stage[k]=0 if fixed and next_u[k]>=3 else 1
+        assert producer==units and all(u>=units for u in next_u), "deadlock"
+        assert inflight==[None]*3 and not any(arrivals)
+        for s in range(3):
+            uses=len(range(s,units,3))
+            assert full[s]==empty[s]==uses, "terminal drain incomplete"
+    # Issue 0/1/2, finish only 1, let one WG1 warp consume 1 then test future 3.
+    witness=(("p",0),("p",0),("p",0),("t",1),("f",4),("r",4),("f",4))
+    try: run(48,0,False,witness)
+    except AssertionError as ex: assert "future full phase" in str(ex)
+    else: raise AssertionError("legacy parity race was not reproduced")
+    # Fixed code blocks that last operation on empty(0); then all schedules drain.
+    run(48,0,True,witness[:-1])
+    for units in (4,6,8,48,50):
+        for seed in range(24): run(units,seed,True)
+    return {"status":"PASS","warp_interleavings":121,"legacy_future_phase_rejected":True,
+            "witness":"issue 0,1,2; complete 1; WG1 consumes 1; future full(3) looked ready"}
 
 
 def protocol_gates():
@@ -860,7 +1079,12 @@ def clocks():
     return {"host_time":time.time(),"query":cmd,"csv":p.stdout.strip()}
 
 
-def gpu_correctness(mod, torch):
+def reset_correctness_input(px, original):
+    # A preceding arm's last graph replay deliberately leaves -X in px.
+    px.copy_(original)
+
+
+def gpu_correctness(mod, torch, results=None):
     """Four CTAs x four units, all K stripes, every real specialization, FP32 CPU torch oracle."""
     weights=make_weights(1,31)
     # Include zero, negative, subnormal and maximum finite E4M3, without NaNs.
@@ -870,12 +1094,13 @@ def gpu_correctness(mod, torch):
     w=torch.from_numpy(bank).cuda()
     err=torch.empty(4,device="cuda",dtype=torch.int32)
     sm=torch.empty_like(err)
-    results=[]
+    if results is None: results=[]
     for n in (8,16,32):
         gen=torch.Generator().manual_seed(411+n)
         x=torch.randn(n,1024,generator=gen).to(torch.bfloat16)
         xb=x.view(torch.int16).numpy().view(np.uint16)
-        px=torch.from_numpy(pack_x(xb).view(np.int16)).cuda()
+        original=torch.from_numpy(pack_x(xb).view(np.int16)).cuda()
+        px=torch.empty_like(original)
         refs=[]
         for expert,row,stripe in zip(*unit_coords(4,4)):
             raw=torch.from_numpy(weights["w13"][expert,row*64:(row+1)*64,stripe*512:(stripe+1)*512].copy())
@@ -886,13 +1111,19 @@ def gpu_correctness(mod, torch):
             refs.append(dw.reshape(64,1024).float() @ x.float().T)
         reference=torch.stack(refs)
         for arm,an in ARMS:
-            if an != n or arm=="null": continue
+            if an != n: continue
+            reset_correctness_input(px,original)
             out=torch.full((16,64,n),float("nan"),device="cuda",dtype=torch.float32)
+            tensor_bounds(arm,n,4,4,w,px,out,sm,err)
             def call(): mod.launch(ARM_ID[arm],n,4,4,w.data_ptr(),px.data_ptr(),out.data_ptr(),sm.data_ptr(),err.data_ptr(),torch.cuda.current_stream().cuda_stream)
             call(); torch.cuda.synchronize()
             if err.any().item():
                 results.append({"arm":arm,"n":n,"status":"FAIL","why":"device protocol timeout"}); err.zero_(); continue
             got=out.cpu()
+            if arm=="null":
+                results.append({"arm":arm,"n":n,"status":"PASS" if bool(torch.isnan(got).all()) else "FAIL",
+                                "check":"null protocol; output untouched"})
+                continue
             # FP32 reduction order differs; bound by FP32 sum |W*x|, not a loose BF16 tolerance.
             scale=torch.stack([r.abs().amax().clamp_min(1) for r in refs])[:,None,None]
             delta=(got-reference).abs()
@@ -945,7 +1176,9 @@ def benchmark(mod,args,report):
         assert 96<=reg<=128 and local<=16 and occ==1, (arm,n,reg,local,occ)  # lead: <= 16 B local tolerated in the probe
         attrs[f"{arm}{n}"]={"regs":reg,"local_bytes":local,"static_smem":static,"dynamic_smem":dynamic,"ctas_per_sm":occ}
     report["kernel_attributes"]=attrs
-    report["correctness"]=gpu_correctness(mod,torch)
+    report["correctness"]=[]  # Preserve completed per-arm checks if a later launch faults.
+    gpu_correctness(mod,torch,report["correctness"])
+    assert all(c["status"]=="PASS" for c in report["correctness"] if c["arm"]=="null"), "invalid matched null"
     timer=Timer(torch)
     stream=timer.stream.cuda_stream
     empty=timer.capture(lambda:mod.empty(stream))
@@ -965,10 +1198,19 @@ def benchmark(mod,args,report):
     sm=torch.empty(GRID,device="cuda",dtype=torch.int32)
     err=torch.empty_like(sm)
     graphs={}
+    report["launch_bounds"]=[]
+    # H2D preparation/allocation belongs to the current stream; captures use timer.stream.
+    timer.stream.wait_stream(torch.cuda.current_stream())
     for arm,n in ARMS:
-        graphs[arm,n]=[timer.capture(lambda arm=arm,n=n,w=w:mod.launch(ARM_ID[arm],n,args.units,GRID,w.data_ptr(),inputs[n].data_ptr(),output.data_ptr(),sm.data_ptr(),err.data_ptr(),stream)) for w in banks]
-        assert not err.any().item(), (arm,n,"protocol error")
-        assert len(set(sm.cpu().tolist()))==GRID, (arm,n,"grid not one CTA per SM")
+        graphs[arm,n]=[]
+        for bank,w in enumerate(banks):
+            bounds=tensor_bounds(arm,n,args.units,GRID,w,inputs[n],output,sm,err)
+            report["launch_bounds"].append({"bank":bank,**bounds})
+            report["capture_progress"]={"arm":arm,"n":n,"bank":bank,"status":"STARTED"}
+            graphs[arm,n].append(timer.capture(lambda arm=arm,n=n,w=w:mod.launch(ARM_ID[arm],n,args.units,GRID,w.data_ptr(),inputs[n].data_ptr(),output.data_ptr(),sm.data_ptr(),err.data_ptr(),stream)))
+            assert not err.any().item(), (arm,n,bank,"protocol error")
+            assert len(set(sm.cpu().tolist()))==GRID, (arm,n,bank,"grid not one CTA per SM")
+            report["capture_progress"]["status"]="PASS"
     report["clocks_before"]=clocks()
     before=statistics.median(timer.replay(empty) for _ in range(15))
     samples={k:[] for k in ARMS}
