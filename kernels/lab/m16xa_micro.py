@@ -938,7 +938,7 @@ def benchmark(mod,args,report):
     attrs={}
     for arm,n in ARMS:
         reg,local,static,dynamic,occ=mod.info(ARM_ID[arm],n)
-        assert 96<=reg<=128 and local==0 and occ==1, (arm,n,reg,local,occ)
+        assert 96<=reg<=128 and local<=16 and occ==1, (arm,n,reg,local,occ)  # lead: <= 16 B local tolerated in the probe
         attrs[f"{arm}{n}"]={"regs":reg,"local_bytes":local,"static_smem":static,"dynamic_smem":dynamic,"ctas_per_sm":occ}
     report["kernel_attributes"]=attrs
     report["correctness"]=gpu_correctness(mod,torch)
