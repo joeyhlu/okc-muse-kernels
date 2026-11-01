@@ -97,10 +97,12 @@ EDITS = [
     (FIN_LOAD_OLD, FIN_LOAD_NEW, 1),
     (COOP_OLD, COOP_NEW, 1),
     (COOP_LOAD_OLD, COOP_LOAD_NEW, 1),
+    ("  HYA_MARK(0);\n", "  HYA_MARK(0);\n  if (p.dbg && threadIdx.x == 0) { unsigned sm_; asm volatile(\"mov.u32 %0, %%smid;\" : \"=r\"(sm_)); p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * 16 + 14] = (long long)sm_; }\n", 1),
+    ("  const int nseg = S.nseg;\n", "  const int nseg = S.nseg;\n  if (p.dbg && threadIdx.x == 0) p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * 16 + 15] = (long long)nseg;\n", 1),
     ("template <int L, bool FLAT, int MODE = 0>\n__global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_kernel(const __grid_constant__ Params p) {", SKEW_FN, 1),
     ("  int pfw;              // bits 0 / 1 / 2 / 3: merge-workspace / counter / gate-row L2 warm-up, finalize gate-load hoist (R-att-3/4)\n};",
      "  int pfw;              // bits 0 / 1 / 2 / 3: merge-workspace / counter / gate-row L2 warm-up, finalize gate-load hoist (R-att-3/4)\n  int skew;             // flat kernels: first-half CTAs take (1024 + skew) / 1024 of an equal key share (R-att-5)\n};", 1),
-    ("  p.pfw = (int)((tma >> 5) & 15);\n", "  p.pfw = (int)((tma >> 5) & 15);\n  p.skew = (int)((tma >> 9) & 255);\n", 1),
+    ("  p.pfw = (int)((tma >> 5) & 15);\n", "  p.pfw = (int)((tma >> 5) & 15);\n  p.skew = ((tma >> 17) & 1) ? (int)((tma >> 9) & 255) - 128 : 0;\n", 1),
     ("        int csg = (int)((int64_t)blockIdx.x * Tg / gridDim.x), ceg = (int)((int64_t)(blockIdx.x + 1) * Tg / gridDim.x);",
      "        int csg = skew_bnd((int)blockIdx.x, Tg, (int)gridDim.x, p.skew), ceg = skew_bnd((int)blockIdx.x + 1, Tg, (int)gridDim.x, p.skew);", 1),
     ("      int csf = (int)((int64_t)cf * Tf / Gf), cef = (int)((int64_t)(cf + 1) * Tf / Gf);",
@@ -112,10 +114,10 @@ EDITS = [
 # plan overrides per arm: pfw bits go in "tma" (bits 5..8). The base plan stays as in hya_t0 except for the two shapes hya_t0 already overrides.
 BASE = {(32, 8, True): dict(n_splits=4, nc=1, coop=1), (1, 1, False): dict(nc=8, coop=1, n_splits=252)}
 SHAPES = [(1, 1, True), (16, 1, True), (32, 1, True), (1, 8, True), (16, 8, True), (32, 8, True), (1, 1, False), (1, 8, False)]
-ARMS = {"xa": 0, "xt": 0, "xb": 1, "xc": 3, "xd": 7, "xe": 4, "xh": 8, "xm": 15, "xs1": 0, "xs2": 0, "xs3": 0, "xs4": 0}
+ARMS = {"xa": 0, "xt": 0, "xb": 1, "xc": 3, "xd": 7, "xe": 4, "xh": 8, "xm": 15, "xs1": 0, "xs2": 0, "xs3": 0, "xs4": 0, "xn1": 0, "xn2": 0, "xn3": 0, "xn4": 0}
 FLAT_SHAPES = [(16, 1, False), (32, 1, False), (16, 8, False), (32, 8, False)]
 # skew in 1/1024 per arm: (q_len 1, q_len 8)
-SKEW = {"xs1": (4, 40), "xs2": (8, 60), "xs3": (12, 80), "xs4": (16, 100)}
+SKEW = {"xs1": (4, 40), "xs2": (8, 60), "xs3": (12, 80), "xs4": (16, 100), "xn1": (-4, -40), "xn2": (-8, -80), "xn3": (-12, -120), "xn4": (-16, -127)}
 OLD_TUNED = """_TUNED = {
     (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
     (1, 1, False, 1): dict(nc=8, coop=1, n_splits=252),
@@ -148,7 +150,7 @@ def main():
         if name in SKEW:   # flat full-layer shapes: weighted key split (first half of the grid takes more)
             for key in FLAT_SHAPES:
                 dq = SKEW[name][0] if key[1] == 1 else SKEW[name][1]
-                ent += f"    ({key[0]}, {key[1]}, {key[2]}, 1): dict(tma={dq << 9}),\n"
+                ent += f"    ({key[0]}, {key[1]}, {key[2]}, 1): dict(tma={((dq + 128) << 9) | (1 << 17)}),\n"
         t = text.replace(OLD_TUNED, "_TUNED = {\n" + ent + "}\n")
         ls = t.split("\n")
         ls[1] = f"# nonce hya-x-{name} (attention lane Nov 1: hya_t0 + HYA_MARK + pfw bits {bits}; tools/hya_x_patch.py; lab only)"

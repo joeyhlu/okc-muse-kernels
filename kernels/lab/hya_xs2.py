@@ -2514,6 +2514,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   Smem<L, FLAT>& S = *reinterpret_cast<Smem<L, FLAT>*>(smem_raw + ((1024u - (smem_u32(smem_raw) & 1023u)) & 1023u));
   const int pair = blockIdx.z;
   HYA_MARK(0);
+  if (p.dbg && threadIdx.x == 0) { unsigned sm_; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_)); p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * 16 + 14] = (long long)sm_; }
   if (!FLAT) {
     // grid (n_splits, B): request b, split s of its window / context
     const int split = blockIdx.x, b = blockIdx.y;
@@ -2760,6 +2761,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   }
   if (!fpart) __syncthreads();   // (warp 0 wrote the list before the barrier above)
   const int nseg = S.nseg;
+  if (p.dbg && threadIdx.x == 0) p.dbg[(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * 16 + 15] = (long long)nseg;
   auto run_segments = [&](auto role) {
     constexpr int R = decltype(role)::value;
     int tb = 0;
@@ -2950,7 +2952,7 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   p.coop = (int)((tma >> 1) & 1);
   p.pfw = (int)((tma >> 5) & 15);
-  p.skew = (int)((tma >> 9) & 255);
+  p.skew = ((tma >> 17) & 1) ? (int)((tma >> 9) & 255) - 128 : 0;
   const bool pdl = ((tma >> 16) & 1);   // programmatic dependent launch (off by default)
   if (L == 1) launch<1>(p, grid, stream, (int)cs, pdl);
   else launch<8>(p, grid, stream, (int)cs, pdl);
@@ -2989,10 +2991,10 @@ def _cached(cache, key, make):
 _TUNED = {
     (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
     (1, 1, False, 1): dict(nc=8, coop=1, n_splits=252),
-    (16, 1, False, 1): dict(tma=4096),
-    (32, 1, False, 1): dict(tma=4096),
-    (16, 8, False, 1): dict(tma=30720),
-    (32, 8, False, 1): dict(tma=30720),
+    (16, 1, False, 1): dict(tma=200704),
+    (32, 1, False, 1): dict(tma=200704),
+    (16, 8, False, 1): dict(tma=227328),
+    (32, 8, False, 1): dict(tma=227328),
 }
 
 
