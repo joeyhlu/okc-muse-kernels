@@ -5006,7 +5006,7 @@ std::vector<int64_t> attrs();
 """
 VMSX_ON = 0
 _VMSX = {"mods": {}, "flags": None, "errors": {}, "secs": {}, "calls": {}}
-VMSX_VARIANTS = {"d1": 1, "d2": 2, "d12": 3, "d123": 7}
+VMSX_VARIANTS = {"d1": 1}   # lead 2026-11-01: D1 only (audit: D2 regresses, D12 / D123 held)
 def _vmsx_build_one(mask, flags):
     from torch.utils.cpp_extension import load_inline
     tag = hashlib.sha1((VMS_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:10]
