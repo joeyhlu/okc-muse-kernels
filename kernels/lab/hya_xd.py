@@ -1,5 +1,5 @@
 # okc: problem=muse_attention_decode
-# nonce hya-x-xd (attention lane Nov 1: hya_t0 + HYA_MARK + merge-workspace L2 warm-up bits 7; tools/hya_x_patch.py; lab only)
+# nonce hya-x-xd (attention lane Nov 1: hya_t0 + HYA_MARK + pfw bits 7; tools/hya_x_patch.py; lab only)
 # Portions Copyright vjeux, from https://github.com/vjeux/okc-2026 (commit f35a41ee1c), licensed under the Apache
 # License 2.0 (full text: tools/vendor/vjeux_okc2026_f35a41ee/LICENSE). Modified by team joeyhlu, 2026-10-31: HYA M1
 # (spin_fail sets a sticky flag and the poll loop breaks instead of __trap) and the _TUNED entries for full B 16 / 32.
@@ -192,7 +192,8 @@ struct Params {
   int lrb;              // log2(row bytes of a cache row: Hkv * 64)
   int off32;            // both caches below 4 GB (32-bit cache offsets); else the 64-bit path
   unsigned ns_magic;    // ceil(2^32 / n_splits) (0: n_splits == 1)
-  int pfw;              // bits 0 / 1 / 2: L2 warm-up of the merge workspace / counters / gate rows by every CTA (R-att-3)
+  int pfw;              // bits 0 / 1 / 2 / 3: merge-workspace / counter / gate-row L2 warm-up, finalize gate-load hoist (R-att-3/4)
+  int skew;             // flat kernels: first-half CTAs take (1024 + skew) / 1024 of an equal key share (R-att-5)
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -877,7 +878,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
 // reset the workspace. Not inlined: this runs once per launch and is otherwise fetched cold.
 template <int L, int NT>
 __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int pair, const int bp, const float vscale,
-                                     const int dry) {
+                                     const int dry, const uint4 gpre = make_uint4(0u, 0u, 0u, 0u), const bool use_pre = false) {
   const int tid = threadIdx.x;
   // loads of a group of passes first (one L2 round trip per group), then math and stores; groups of 2 passes in a
   // rolled loop (this runs once per launch from a cold instruction cache: q_len 8 has 4 passes)
@@ -897,7 +898,8 @@ __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int 
       xa[u] = __ldcg(reinterpret_cast<const float4*>(acc));
       xb[u] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
       lc[u] = __ldcg(p.ws_l + (bp * L + j) * 16 + hh);
-      graw[u] = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8);
+      if (use_pre) graw[u] = gpre;
+      else graw[u] = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8);
     }
 #pragma unroll
     for (int u = 0; u < GP; ++u) {
@@ -2142,6 +2144,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   }
 
   HYA_MARK(3);
+  uint4 gpre = make_uint4(0u, 0u, 0u, 0u);   // pfw & 8: this CTA's last-CTA-finalize gate row, loaded before the merge
+  if (L == 1 && !WS && (p.pfw & 8) && tid < NT)
+    gpre = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + (tid >> 3)) * 64 + (tid & 7) * 8);
   // ---- merge: rescale to the fixed reference 2^0 and accumulate with FP32 atomics ----
   bool do_red = true;
      // stream 1's state was merged into stream 0
@@ -2272,6 +2277,15 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     // keep both divisions above the barrier wait (ptxas otherwise sinks them below the spin, where
     // they are first used: scout's v200 census found them after the poll); volatile asm keeps program order
     asm volatile("" : "+r"(nact), "+r"(R));
+    const bool use_pre = (p.pfw & 8) && R <= NT / 8;   // one pass of the slice loop: the gate row can be loaded before the barrier
+    uint4 gate_pre = make_uint4(0u, 0u, 0u, 0u);
+    if (use_pre) {
+      const int rr = split_idx * R + (tid >> 3);
+      if (rr < min(L * 16, split_idx * R + R)) {
+        const int j = rr >> 4, hh = rr & 15;
+        gate_pre = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + (tid & 7) * 8);
+      }
+    }
       if (tid == 0) {
       // two key counters alternating per launch (parity = this slot's epoch, read in the prologue): the last split
       // to arrive resets the OTHER counter (unused until the next launch) and bumps the epoch, so nobody needs a
@@ -2315,8 +2329,8 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const int rr = rbase + (tid >> 3);
       const bool act = rr < r_hi;
       const int j = act ? rr >> 4 : 0, hh = act ? rr & 15 : 0;
-      const uint4 graw = act ? *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8)
-                             : make_uint4(0, 0, 0, 0);
+      const uint4 graw = use_pre ? gate_pre : (act ? *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8)
+                             : make_uint4(0, 0, 0, 0));
       float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
       float lsum = 0.f;
       sum_copies<L>(p, bp, j, hh, part, act, y, lsum);
@@ -2356,7 +2370,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 
   // ---- last CTA: sum the copies, normalize, rmsnorm * sigmoid(gate), store; reset the workspace ----
   if (p.nc == 1) {
-    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0);
+    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0, gpre, L == 1 && (p.pfw & 8) != 0);
   } else
   {
     const int part = tid & 7;
@@ -2483,6 +2497,13 @@ __device__ __forceinline__ void flat_finalize(const Params& p, const int* sense_
   
 }
 
+// first half of the grid takes (1024 + dq) / 1024 of an equal share of the T keys, the second half (1024 - dq) / 1024; boundary of CTA c
+__device__ __forceinline__ int skew_bnd(int c, int64_t T, int G, int dq) {
+  if (c >= G) return (int)T;
+  const int half = G >> 1;
+  const int64_t W = c <= half ? (int64_t)c * (1024 + dq) : (int64_t)half * (1024 + dq) + (int64_t)(c - half) * (1024 - dq);
+  return (int)(T * W / ((int64_t)1024 * G));
+}
 template <int L, bool FLAT, int MODE = 0>
 __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_kernel(const __grid_constant__ Params p) {
   constexpr int NT = Cfg<L, FLAT>::NT;
@@ -2605,7 +2626,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
       if (threadIdx.x == 0) {
         constexpr int SEGKF = (L == 8) ? 600 : 400;
         const int64_t Tg = (int64_t)S.cum[p.B] + (SEGKF > 0 ? (int64_t)(p.B - 1) * SEGKF : 0);
-        int csg = (int)((int64_t)blockIdx.x * Tg / gridDim.x), ceg = (int)((int64_t)(blockIdx.x + 1) * Tg / gridDim.x);
+        int csg = skew_bnd((int)blockIdx.x, Tg, (int)gridDim.x, p.skew), ceg = skew_bnd((int)blockIdx.x + 1, Tg, (int)gridDim.x, p.skew);
         if (SEGKF > 0) {
           auto vmapg = [&](int v) -> int {
             int lo_b = 0, hi_b = p.B - 1;
@@ -2637,7 +2658,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
       const int excl = incl_l - n_l;
       const int64_t Tf = (int64_t)__shfl_sync(FULL, incl_l, 31) + (SEGKF > 0 ? (int64_t)(p.B - 1) * SEGKF : 0);
       const int cf = blockIdx.x, Gf = gridDim.x;
-      int csf = (int)((int64_t)cf * Tf / Gf), cef = (int)((int64_t)(cf + 1) * Tf / Gf);
+      int csf = skew_bnd(cf, Tf, Gf, p.skew), cef = skew_bnd(cf + 1, Tf, Gf, p.skew);
       if (SEGKF > 0) {   // virtual -> real: the last request whose virtual start (cum[b] + b * SEGK) is <= v
         const int vstart = excl + lane_f * SEGKF;
         const unsigned ms = __ballot_sync(FULL, lane_f < p.B && vstart <= csf);
@@ -2691,8 +2712,8 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
     cs = S.fcs;
     ce = S.fce;
   } else {
-    cs = (int)((int64_t)cpart * T / G);
-    ce = (int)((int64_t)(cpart + 1) * T / G);
+    cs = skew_bnd(cpart, T, G, p.skew);
+    ce = skew_bnd(cpart + 1, T, G, p.skew);
   }   // (a float-estimate + correction
   // version without the 64-bit division call measured slower: q_len 1 b16 full +3 us, likely code layout)
   
@@ -2928,7 +2949,8 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
   dim3 grid((unsigned)n_splits, flat ? 1u : (unsigned)B, (unsigned)(Hkv / 2));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   p.coop = (int)((tma >> 1) & 1);
-  p.pfw = (int)((tma >> 5) & 7);
+  p.pfw = (int)((tma >> 5) & 15);
+  p.skew = (int)((tma >> 9) & 255);
   const bool pdl = ((tma >> 16) & 1);   // programmatic dependent launch (off by default)
   if (L == 1) launch<1>(p, grid, stream, (int)cs, pdl);
   else launch<8>(p, grid, stream, (int)cs, pdl);
