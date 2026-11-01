@@ -1,11 +1,13 @@
-"""TSTAG: per-job TINY shares/credits; lab only, T=1 only.
+"""TSTAG: per-job TINY shares/credits; lab or fixed ship builds.
 
 Kill risks FIRST: a per-job release fence can stall behind the next job's
 prefetch (R-dsm-0b/R-vfn-1); 132 credit publishers and uneven 3/4-unit shares
 can erase the readiness lead (VMS_IL). No speed claim until paired H200 data.
 Default writes ONLY kernels/lab/k3_tstag_ab.py; --check is read-only.
 --dry-run executes real prepare nodes with tensor/compiler doubles, no GPU.
+Ship: --ship --base=<in> --out=<out> [--check]. No GPU timing claim.
 """
+import argparse
 import ast
 import builtins
 import contextlib
@@ -15,6 +17,7 @@ import inspect
 import io
 import json
 from pathlib import Path
+import runpy
 import sys
 import time
 from types import SimpleNamespace as NS
@@ -278,6 +281,110 @@ def change_report(base):
             for tag,a0,a1,b0,b1 in difflib.SequenceMatcher(None,cu.splitlines(),after.splitlines(),autojunk=False).get_opcodes() if tag != "equal"]}
 
 
+def ship_tools():
+    # Reuse the submission gates and literal editor; never import the layer.
+    return runpy.run_path(str(ROOT / "tools/mg_patches.py"))
+
+
+def ship_sources(source):
+    """Evaluate only fixed CUDA assignments, checking every tiny2 undo site."""
+    cu = literal(source, "_HYBLO_CUDA")
+    found = [n for n in ast.parse(source).body if isinstance(n, ast.Assign)
+             and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "_HYBLO_TINY2_CUDA"]
+    assert len(found) <= 1
+    if not found:
+        return {"tiny": cu, "tiny2": cu}
+
+    def evaluate(n):
+        if isinstance(n, ast.Name):
+            assert n.id == "_HYBLO_CUDA"
+            return cu
+        assert isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        assert n.func.attr == "replace" and not n.keywords and len(n.args) == 3
+        old, new, count = map(ast.literal_eval, n.args)
+        assert count == 1
+        return _tstag_sub(evaluate(n.func.value), old, new)
+
+    tiny2 = evaluate(found[0].value)
+    env = {"_HYBLO_CUDA": cu}
+    exec(compile(ast.Module(found, []), "<ship-source>", "exec"), env)
+    assert env["_HYBLO_TINY2_CUDA"] == tiny2
+    return {"tiny": cu, "tiny2": tiny2}
+
+
+def apply_ship(base):
+    """Store STAG literally; reconstruct the unchanged tiny2 source once.
+
+    The small inverse delta avoids duplicating 38 KB of CUDA. Selection happens
+    only in the existing two-build prepare loop; kernel_fn has no new branch.
+    """
+    assert "_HYBLO_TINY2_CUDA" not in base, "STAG already applied"
+    original = literal(base, "_HYBLO_CUDA")
+    stag = _tstag_source(original, "stag")
+    undo = "_HYBLO_TINY2_CUDA = (_HYBLO_CUDA\n"
+    before, after = original.splitlines(True), stag.splitlines(True)
+    current = stag
+    for group in difflib.SequenceMatcher(None, before, after, autojunk=False).get_grouped_opcodes(0):
+        old = "".join(after[group[0][3]:group[-1][4]])
+        new = "".join(before[group[0][1]:group[-1][2]])
+        current = _tstag_sub(current, old, new)
+        undo += f"    .replace({old!r}, {new!r}, 1)\n"
+    assert current == original
+    undo += ")\n"
+    s = ship_tools()["cuda_edit"](base, "_HYBLO_CUDA", lambda _: stag)
+    s = _tstag_sub(s, "HYBLO_ENABLE = True\n", undo + "HYBLO_ENABLE = True\n")
+    old = ast.get_source_segment(s, node(s, "_hyblo_build"))
+    new = _tstag_sub(old, "        fl = list(_HYBLO_FLAGS) + list(var)\n",
+                     '        cu = _HYBLO_CUDA if k == "tiny" else _HYBLO_TINY2_CUDA\n'
+                     "        fl = list(_HYBLO_FLAGS) + list(var)\n")
+    new = _tstag_sub(new, '_HYB_MOE_CPP + _HYBLO_CUDA + " ".join(fl)',
+                     '_HYB_MOE_CPP + cu + " ".join(fl)')
+    new = _tstag_sub(new, "cuda_sources=_HYBLO_CUDA,", "cuda_sources=cu,")
+    s = _tstag_sub(s, old, new)
+    assert ship_sources(s) == {"tiny": stag, "tiny2": original}
+    return s
+
+
+def ship_gates(base, source, expected):
+    mg = ship_tools()
+    size = mg["gates"](source, ship=True)
+    for token in ("TSTAG_ON", "TSTAG_ARMS", "_TSTAG =", "_tstag_prepare", "_tstag_select",
+                  "_tstag_build_one", "TINYX_ON", "TINYX_ARMS", "_TINYX =", "_tinyx_prepare",
+                  "_tinyx_select", "_tinyx_build_one", "_BANK", "tinyx_class", "tinyx_sink", "okc_set_tinyx"):
+        assert token not in source, f"lab code leaked: {token}"
+    assert ship_sources(source) == expected, "ship CUDA differs from lab transform"
+    # Fingerprint every untouched top-level node, including every timed route.
+    allowed = {"_HYBLO_CUDA", "_HYBLO_TINY2_CUDA", "_hyblo_build"}
+    def kept(s):
+        result = []
+        lines = s.splitlines(True)
+        for n in ast.parse(s).body:
+            name = getattr(n, "name", None)
+            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name):
+                name = n.targets[0].id
+            if name not in allowed:
+                part = lines[n.lineno-1:n.end_lineno]
+                part[-1] = part[-1][:n.end_col_offset]
+                part[0] = part[0][n.col_offset:]
+                result.append("".join(part))
+        return result
+    untouched = kept(base)
+    assert kept(source) == untouched, "unrelated ship code changed"
+    assert literal(source, "_HYBLO_KEYS") == literal(base, "_HYBLO_KEYS")
+    with contextlib.redirect_stdout(io.StringIO()):
+        dry = dry_run(base, source, ship_expected=expected)
+    changes = [{"kind": tag, "base_lines": [a0+1, a1] if a1 > a0 else [],
+                "insert_before_base_line": a0+1 if a0 == a1 else None,
+                "ship_lines": [b0+1, b1] if b1 > b0 else []}
+               for tag,a0,a1,b0,b1 in difflib.SequenceMatcher(
+                   None, base.splitlines(), source.splitlines(), autojunk=False).get_opcodes() if tag != "equal"]
+    return {"status": "CPU_PASS", "size": size, "margin": mg["LIMIT"] - size,
+            "sha1": hashlib.sha1(source.encode()).hexdigest(),
+            "cuda_sha1": {k: hashlib.sha1(v.encode()).hexdigest() for k,v in expected.items()},
+            "untouched_sha1": hashlib.sha1("\n".join(untouched).encode()).hexdigest(),
+            "prepare_dry_run": dry, "changes": changes, "compile_SASS_GPU": "NOT RUN"}
+
+
 def accounting():
     return {
         "scope":"EST source accounting, NOT measured SASS or a speed claim",
@@ -323,15 +430,38 @@ def accounting():
 
 
 def main():
-    base = BASE.read_text(encoding="utf-8")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--ship", action="store_true")
+    p.add_argument("--base", type=Path, default=BASE)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args()
+    if a.ship and a.out is None:
+        p.error("--ship requires --out")
+    base = a.base.read_text(encoding="utf-8")
+    out = a.out or OUT
+    if a.ship:
+        assert out.resolve() != a.base.resolve(), "ship output must differ from base"
+        source = apply_ship(base)
+        expected = {"tiny": _tstag_source(literal(base, "_HYBLO_CUDA"), "stag"),
+                    "tiny2": literal(base, "_HYBLO_CUDA")}
+        result = ship_gates(base, source, expected)
+        result["protocol"] = protocol_gate()
+        if a.check or a.dry_run:
+            assert out.read_bytes() == source.encode(), "regenerate STAG ship"
+        else:
+            out.write_bytes(source.encode())
+        print(json.dumps(result, indent=2))
+        return 0
     source = build(base)
     protocol = protocol_gate()
     with contextlib.redirect_stdout(io.StringIO()) as captured:
         dry_run(base, source)
-    if "--check" in sys.argv or "--dry-run" in sys.argv:
-        assert OUT.read_text(encoding="utf-8") == source, "regenerate TSTAG layer"
+    if a.check or a.dry_run:
+        assert out.read_text(encoding="utf-8") == source, "regenerate TSTAG layer"
     else:
-        OUT.write_bytes(source.encode())
+        out.write_bytes(source.encode())
     print(json.dumps({"status":"CPU_PASS", "protocol":protocol, "prepare_dry_run_scope":"tensor/compiler doubles ONLY",
                       "accounting":accounting(),
                       "changes":change_report(base), "layer_sha256":hashlib.sha256(source.encode()).hexdigest(),
@@ -342,7 +472,7 @@ def main():
 # CPU dry-run below is copied from the proven TINYX/PADZ pipeline and scoped
 # to this bank/arms. Tensor/compiler doubles never count as GPU evidence.
 
-def dry_run(base, patched, fixture=False):
+def dry_run(base, patched, fixture=False, ship_expected=None):
     """Execute real _hyblo_prepare/_hyb_scratch and every new host branch.
 
     Only tensor arithmetic, prepack, reference values and compiler are doubles.
@@ -369,7 +499,7 @@ def dry_run(base, patched, fixture=False):
         clone = float = contiguous
         def fill_(self, v): return self
         def data_ptr(self): return 16
-    builds, calls, failures = [], [], set()
+    builds, calls, failures, build_names = [], [], set(), {}
     class Module:
         def __init__(self, key): self.key, self.flags, self.pdl = key, 0, None
         def okc_set_pdl(self, pdl): self.pdl = pdl
@@ -389,25 +519,37 @@ def dry_run(base, patched, fixture=False):
              "_TSTAG", "_TSTAG_MAP", "_tstag_sub", "_tstag_source",
              "_tstag_build_one", "_tstag_prepare", "_tstag_select", "_hyb_scratch", "_hyb_guards_ok",
              "_hyblo_key", "_hyblo_build", "_hyblo_run", "_hyblo_route", "_hyblo_prepare")
+    if ship_expected is not None:
+        names = tuple(n for n in names if not n.startswith(("TSTAG", "_TSTAG", "_tstag")))
     for name in names:
         exec(compile(ast.Module(body=[node(patched, name)], type_ignores=[]), f"real:{name}", "exec"), ns)
+    if ship_expected is not None and "_HYBLO_TINY2_CUDA" in patched:
+        exec(compile(ast.Module([node(patched, "_HYBLO_TINY2_CUDA")], []), "real:tiny2-source", "exec"), ns)
     def load_inline(**kw):
         if kw["name"].startswith("hyblo_"):
             kind, k = "ctl", kw["name"].split("_")[1]
         else:
             _, k, kind, _ = kw["name"].split("_")
         var = next(v for key, _, v in ns["_HYBLO_KEYS"] if key == k)
-        assert kw["cuda_sources"] == _tstag_source(literal(base, "_HYBLO_CUDA"), kind)
+        expected = ship_expected[k] if ship_expected is not None else _tstag_source(literal(base, "_HYBLO_CUDA"), kind)
+        assert kw["cuda_sources"] == expected
         assert kw["extra_cuda_cflags"] == list(ns["_HYBLO_FLAGS"]) + list(var) + ([] if kind == "ctl" else ["-Xptxas=-v"])
         assert kw["functions"] == ["okc_run", "okc_set_pdl"]
         assert kw["cpp_sources"] == literal(base, "_HYB_MOE_CPP")
+        if ship_expected is not None:
+            tag = hashlib.sha1((kw["cpp_sources"] + expected + " ".join(kw["extra_cuda_cflags"])).encode()).hexdigest()[:12]
+            assert kw["name"] == f"hyblo_{k}_{tag}", "stale module cache tag"
+            previous = ship_sources(base)[k]
+            old_tag = hashlib.sha1((kw["cpp_sources"] + previous + " ".join(kw["extra_cuda_cflags"])).encode()).hexdigest()[:12]
+            assert (tag == old_tag) == (expected == previous), "changed source reused old cache tag"
+            build_names[k] = {"before": f"hyblo_{k}_{old_tag}", "after": kw["name"]}
         builds.append((k, kind))
         if (k, kind) in failures: raise RuntimeError("injected build failure")
         return Module((k, kind))
     original_import = builtins.__import__
     ns["__builtins__"] = dict(vars(builtins), __import__=lambda n, *a, **k: NS(load_inline=load_inline) if n == "torch.utils.cpp_extension" else original_import(n, *a, **k))
     # Re-create functions with the restricted per-exec imports, never sys.modules.
-    for name in ("_hyblo_build", "_tstag_build_one"):
+    for name in (("_hyblo_build",) if ship_expected is not None else ("_hyblo_build", "_tstag_build_one")):
         exec(compile(ast.Module(body=[node(patched, name)], type_ignores=[]), name, "exec"), ns)
     for name in ("_hyblo_pack_codes", "_hyblo_pack_scales", "_hyblo_fat_order", "_hyblo_unit_order"):
         ns[name] = lambda *a: Tensor()
@@ -418,6 +560,39 @@ def dry_run(base, patched, fixture=False):
     ns["_hyblo_prepare"]({}, w, "cpu-dry")
     assert ns["_HYBLO"]["ok"] == {"tiny": True, "tiny2": True}
     assert len(ns["_HYBLO"]["sc"]) == 3 and len(ns["_HYBLO"]["w"]) == 14
+    if ship_expected is not None:
+        ns["_hyblo_prepare"]({}, w, "cpu-dry")
+        assert builds == [("tiny", "ctl"), ("tiny2", "ctl")], "prepare rebuilt cached modules"
+        # Copy the proven PADZ-derived real state-layout execution below.
+        ns.update(st={}, state={}, weights={k: Tensor() for k in
+            ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs", "post_expert_norm")}, t0=0)
+        for name in ("K2A_M_MAX", "K2A_BUCKETS", "V11_K2A33_ROUTE"):
+            exec(compile(ast.Module([node(base, name)], []), name, "exec"), ns)
+        prep = node(base, "_v11_k2a33_prepare")
+        ok_stmt = next(n for n in prep.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "ok")
+        exec(compile(ast.Module([ok_stmt], []), "real-ok", "exec"), ns)
+        ret = next(n.value for n in prep.body if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict))
+        k33 = eval(compile(ast.Expression(ret), "real-return", "eval"), ns)
+        ns["_v11_k2a33_prepare"] = lambda *a: k33
+        assignment = next(n for n in ast.walk(ast.parse(base)) if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) and n.value.func.id == "_v11_k2a33_prepare")
+        exec(compile(ast.Module([assignment], []), "real-state", "exec"), ns)
+        site = next(l.strip() for l in patched.splitlines() if '_hyblo_prepare(state["k2a33"]["st"]' in l)
+        exec(site, ns)
+        exec(compile(ast.Module([node(patched, "_v11_k2a33_call")], []), "real-route", "exec"), ns)
+        for t in (1, 2, 4, 5, 8):
+            k = ns["_hyblo_key"](t)
+            for pdl in (True, False, True):
+                ns["HYBLO_PDL"] = pdl
+                args = (Tensor((t, 4096)), Tensor(), Tensor())
+                result = (ns["_v11_k2a33_call"](*args, ns["state"]["k2a33"]["st"])
+                          if t in (1, 8) else ns["_hyblo_route"](*args))
+                assert result.shape == (t, 4096)
+                assert calls[-1] == ((k, "ctl"), 0, int(pdl), t)
+        assert builds == [("tiny", "ctl"), ("tiny2", "ctl")]
+        return {"status": "PASS", "scope": "real AST/state; tensor/compiler doubles, no GPU",
+                "builds": [k for k,_ in builds], "routes": [1, 2, 4, 5, 8], "PDL": [0, 1],
+                "state_path": 'state["k2a33"]["st"]', "source_and_cache_tags": "PASS", "module_names": build_names}
     ns["_tstag_prepare"](); ns["_tstag_prepare"]()
     assert len(builds) == 3 and not ns["_TSTAG"]["errors"]
     def must_fail(f):

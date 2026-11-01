@@ -2,11 +2,13 @@
 
 CPU: python -B -I tools/tinyx_patches.py
 Compile only (no CUDA context): cudaenv.sh python -B -I tools/tinyx_patches.py --local-compile
+Ship: --ship --d1 --base=<in> --out=<out> [--check]; D1 only, including after STAG.
 All artifacts are retained under box_out/tinyx. Never runs a GPU or a pod.
 Kill risks, before measurement: TINY2 can hide issue savings under its stream;
 extra live registers / probe dispatch can change scheduling. D1 stays HOLD until
 both real W13/W2 loops fold and every compiled function is spill-free.
 """
+import argparse
 import ast
 import builtins
 import difflib
@@ -16,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 import time
@@ -418,12 +421,55 @@ def emit_artifacts(base, source):
     (ART / "protocol.json").write_text(json.dumps(protocol, indent=2))
 
 
+def ship_helpers():
+    return runpy.run_path(str(ROOT / "tools/tstag_patches.py"))
+
+
+def apply_ship(base):
+    # The STAG tiny2 undo hunks do not touch scale math. Its literal receives D1
+    # once; the fixed tiny2 source therefore inherits exactly the same D1 edit.
+    h = ship_helpers()
+    expected = {k: _tinyx_source(cu, "D1") for k,cu in h["ship_sources"](base).items()}
+    source = h["ship_tools"]()["cuda_edit"](base, "_HYBLO_CUDA", lambda cu: _tinyx_source(cu, "D1"))
+    assert h["ship_sources"](source) == expected, "D1/STAG edit sites do not compose"
+    return source
+
+
 def main():
-    base = BASE.read_text(encoding="utf-8")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--ship", action="store_true")
+    p.add_argument("--d1", action="store_true")
+    p.add_argument("--base", type=Path, default=BASE)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--local-compile", action="store_true")
+    a = p.parse_args()
+    if a.ship and (not a.d1 or a.out is None or a.local_compile):
+        p.error("--ship requires --d1 and --out; use box_out/ship_t1/run_gate.sh to compile")
+    if a.d1 and not a.ship:
+        p.error("--d1 requires --ship")
+    base = a.base.read_text(encoding="utf-8")
+    if a.ship:
+        assert a.out.resolve() != a.base.resolve(), "ship output must differ from base"
+        h = ship_helpers()
+        source = apply_ship(base)
+        exact_cpu_gate()
+        expected = {k: _tinyx_source(cu, "D1") for k,cu in h["ship_sources"](base).items()}
+        result = h["ship_gates"](base, source, expected)
+        result["D1_scale_pairs"] = 65536
+        if a.check or a.dry_run:
+            assert a.out.read_bytes() == source.encode(), "regenerate D1 ship"
+        else:
+            a.out.write_bytes(source.encode())
+        print(json.dumps(result, indent=2))
+        return 0
+    if a.out is not None or a.base != BASE or a.check or a.dry_run:
+        p.error("custom --base/--out/--check/--dry-run require --ship")
     source = build(base)
     exact_cpu_gate(); dry_run(base, source); emit_artifacts(base, source)
     print(f"[tinyx] generated {OUT.relative_to(ROOT)}, {len(source.encode())} bytes (lab only)")
-    if "--local-compile" in sys.argv:
+    if a.local_compile:
         import runpy
         return runpy.run_path(str(ROOT / "tools/box/tinyx_run.py"))["local_compile"]()
     return 0
