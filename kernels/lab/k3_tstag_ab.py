@@ -7529,17 +7529,23 @@ else okc::moe_fused<false><<<(int)grid, okc::NTL, sm, st>>>(p);
 }
 """
 
-# TSTAG LAB: ctl is ship; stag changes only M=1 in the tiny bank.
+# TSTAG LAB: bank arms change only M=1; debug arms never enter scored timings.
 _TSTAG_MAP = "// TSTAG: q is phase-local; lo/hi are one job's share, not a global range.\ntemplate<int RB>\n__device__ __forceinline__ int tstag_unit(int q, int lo, int hi) {\nconst unsigned n = (unsigned)(hi - lo), u = (unsigned)q;\n// At G=132: W13 n=3/4, W2 n=1/2. Constant divisions avoid integer DIV.\nconst unsigned j = n == 1 ? u : n == 2 ? u / 2 : n == 3 ? u / 3 : n == 4 ? u / 4 : u / n;\nreturn (int)(j * RB + lo + u - j * n);\n}\ntemplate<bool PB>\n__device__ __forceinline__ int tstag_v(const Smem& S, int q) {\nreturn tstag_unit<PB ? RB_B : RB_A>(q, S.wsr[PB ? 2 : 0], S.wsr[PB ? 3 : 1]);\n}\n"
+_TSTAG_DEBUG_EDITS = (('#define OKC_DEBUG 0', '#define OKC_DEBUG 1'), ('mbar_wait(bars + sl, (uint32_t)((q / OKC_NS) & 1));', 'mbar_wait(bars + sl, (uint32_t)((q / OKC_NS) & 1));\nif (!PB && i == 0) { DBG(6); } // TINYMK: first W13 slot observed full'), ('if (lane == 0) { while (ld_acquire(p.doneA + j) < RB_A) __nanosleep(64); }', 'if (lane == 0) { while (ld_acquire(p.doneA + j) < RB_A) __nanosleep(64);\nif (i == 0) { DBG(7); } // TINYMK: first W2 doneA spin exit\n} '))
+TSTAG_SLOTS = {0: 'entry_before_PDL_wait', 1: 'route_end_before_ss_reset_and_WS_JOIN', 2: 'W13_consumer_phase_end_helper_may_still_drain', 3: 'W2_consumer_phase_end_before_WS_JOIN_and_combine_setup', 4: 'combine_grid_barrier_exit_after_CTA_SYNC', 5: 'combine_end_TIDX0_not_all_thread_exit', 6: 'first_W13_ring_full_wait_passed_TIDX0', 7: 'first_W2_doneA_spin_exit_TIDX0_before_syncwarp', 8: 'job0_credit_publish_issued_helper_lane0_not_global_completion', 9: 'first_B_unit_of_last_job_start_TIDX0_after_acquire_x_load_and_ring_full'}
 TSTAG_ON = 'ctl'
-TSTAG_ARMS = ('ctl', 'stag')
-_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set()}
+TSTAG_ARMS = ('ctl', 'stag', 'stagr', 'ctl_dbg', 'stag_dbg', 'stagr_dbg')
+_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set(), "dbg": None, "sc_dbg": None}
 def _tstag_sub(s, old, new):
     if s.count(old) != 1:
         raise ValueError(f"TSTAG anchor count {s.count(old)}: {old[:100]!r}")
     return s.replace(old, new)
 
 def _tstag_source(source, kind):
+    if kind.endswith("_dbg"):
+        return _tstag_debug_source(_tstag_source(source, kind[:-4]), kind[:-4])
+    if kind == "stagr":
+        return _tstag_release_source(_tstag_source(source, "stag"))
     if kind == "ctl":
         return source
     if kind != "stag":
@@ -7598,6 +7604,44 @@ if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);
                   "for (int i = 0; i < n; ++i) {\nconst int v = tstag_unit<RB_A>(i, v0, v1);")
     return s
 
+def _tstag_release_source(s):
+    # PTX 8.8/8.9 + 9.7.15.2: all helper stores -> bar.warp.sync ->
+    # lane-0 release RMW -> observation-order RMW chain -> consumer acquire.
+    # No acquire is needed in the publisher. Keep the LAST job's ship fence.
+    return _tstag_sub(s, """// Every helper lane has stored its final unit of THIS job before release.
+__threadfence();
+__syncwarp();
+if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);""", """// STAG-R: final end-of-share publication retains the ship semantics.
+if (q == nA - 1) {
+__threadfence();
+__syncwarp();
+if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);
+} else {
+__syncwarp();
+if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;" :: "l"(p.doneA + j), "r"(a1 - a0) : "memory");
+}""")
+
+def _tstag_debug_source(s, kind):
+    for old, new in _TSTAG_DEBUG_EDITS:
+        s = _tstag_sub(s, old, new)
+    s = _tstag_sub(s, "p.dbg[blockIdx.x * 8 + (k)]", "p.dbg[blockIdx.x * 16 + (k)]")
+    # Lane 0 of the HELPER is logical TIDX=256, so DBG(8) would never fire.
+    stamp = "if (lane == 0 && j == 0 && p.dbg) p.dbg[blockIdx.x * 16 + 8] = gtimer();"
+    if kind == "ctl":
+        s = _tstag_sub(s, "atomicAdd(p.doneA + jj, b - a);",
+                      "atomicAdd(p.doneA + jj, b - a);\n" + stamp.replace("j == 0", "jj == 0"))
+    else:
+        # One site AFTER either publication branch; never reuse/overwrite slot 8.
+        anchor = "\n} else {\nconst float gsc = p.gsB[ce] * TWO62;"
+        s = _tstag_sub(s, anchor, "\n" + stamp.replace("j == 0", "j == 0 && rb == a1 - 1") + anchor)
+    # Compute first-unit predicate before curj is updated; stamp only after h
+    # reload and ring wait, immediately before weight LDS/math. No debug loads.
+    s = _tstag_sub(s, "const int j = njF + v / rbs;",
+                  "const int j = njF + v / rbs;\nconst bool last_job_start = PB && j == njF + S.njS - 1 && j != curj;")
+    s = _tstag_sub(s, "const unsigned char* slot = ring + sl * UNIT_BYTES;",
+                  "if (last_job_start) { DBG(9); }\nconst unsigned char* slot = ring + sl * UNIT_BYTES;")
+    return s
+
 def _tstag_build_one(k, kind, var):
     from torch.utils.cpp_extension import load_inline
     cu = _tstag_source(_HYBLO_CUDA, kind)
@@ -7606,30 +7650,35 @@ def _tstag_build_one(k, kind, var):
     return load_inline(name=f"tstag_{k}_{kind}_{tag}", cpp_sources=_HYB_MOE_CPP, cuda_sources=cu,
                        functions=["okc_run", "okc_set_pdl"], extra_cuda_cflags=flags, verbose=False)
 
-def _tstag_prepare():
+def _tstag_prepare(dev):
     _TSTAG["errors"].clear()
     _TSTAG["calls"].clear()
     if not HYBLO_ENABLE:
         return
     if _HYBLO["w"] is None or _HYBLO["sc"] is None:
         raise RuntimeError("TSTAG: ship HYBLO prepare unavailable")
+    if _TSTAG["dbg"] is None:
+        _TSTAG["dbg"] = torch.zeros(_HYB["nsm"] * 16, dtype=torch.int64, device=dev)
+    assert len(_HYBLO["sc"]) == 3
+    _TSTAG["sc_dbg"] = list(_HYBLO["sc"]) + [_TSTAG["dbg"]]  # okc_run scratch[3] -> p.dbg
     for k, _, var in _HYBLO_KEYS:
         if not _HYBLO["ok"].get(k) or k not in _HYBLO["mods"]:
             raise RuntimeError(f"TSTAG: ship {k} unavailable")
         if k != "tiny":
             continue
-        key, t0 = (k, "stag"), time.time()
-        try:
-            if key not in _TSTAG["mods"]:
-                _TSTAG["mods"][key] = _tstag_build_one(k, "stag", var)
-        except Exception as ex:
-            _TSTAG["errors"][key] = repr(ex)
-        _TSTAG["secs"][key] = time.time() - t0
+        for kind in TSTAG_ARMS[1:]:
+            key, t0 = (k, kind), time.time()
+            try:
+                if key not in _TSTAG["mods"]:
+                    _TSTAG["mods"][key] = _tstag_build_one(k, kind, var)
+            except Exception as ex:
+                _TSTAG["errors"][key] = repr(ex)
+            _TSTAG["secs"][key] = time.time() - t0
 
 def _tstag_select(k, m):
     if TSTAG_ON not in TSTAG_ARMS:
         raise RuntimeError(f"invalid TSTAG arm {TSTAG_ON!r}")
-    kind = "stag" if TSTAG_ON == "stag" and k == "tiny" and m == 1 else "ctl"
+    kind = TSTAG_ON if k == "tiny" and m == 1 else "ctl"
     if kind == "ctl":
         mod = _HYBLO["mods"][k]
     else:
@@ -7708,7 +7757,8 @@ def _hyblo_run(k, x, ids, wts):
     if _HYBLO["pdl"].get(pkey) != pdl:
         mod.okc_set_pdl(pdl)
         _HYBLO["pdl"][pkey] = pdl
-    mod.okc_run(_HYBLO["w"], _HYBLO["sc"], x, ids, wts, out, 0, 32, _HYB["nsm"])
+    sc = _TSTAG["sc_dbg"] if pkey[1].endswith("_dbg") else _HYBLO["sc"]
+    mod.okc_run(_HYBLO["w"], sc, x, ids, wts, out, 0, 32, _HYB["nsm"])
     return out
 def _hyblo_route(x, ids, wts):
     m = x.shape[0]
@@ -11320,7 +11370,7 @@ def prepare(weights):
     _pt1_join_all()
     if state.get("k2a33") is not None:   # R-hyblo ship: after every guard-timed prepare step (lab R-hyblo-1 waited inside K2A33 and pushed HYA / G2 / KS1 / SBB1 / VG-F / SU1 / GD past their prepare-time guards on a cold pod)
         _hyblo_prepare(state["k2a33"]["st"], {k: weights[k] for k in ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs")} | {"post_norm_w": weights["post_expert_norm"]}, weights["w13"].device)
-        _tstag_prepare()
+        _tstag_prepare(weights["w13"].device)
     _sk2_prepare(state, t0)
     _gft_prepare(state, t0)
     builds = " ".join(f"{k}={v:.0f}s" for k, v in _K3_BUILD_S.items()) or "none"

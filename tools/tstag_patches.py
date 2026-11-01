@@ -60,6 +60,10 @@ return tstag_unit<PB ? RB_B : RB_A>(q, S.wsr[PB ? 2 : 0], S.wsr[PB ? 3 : 1]);
 
 
 def _tstag_source(source, kind):
+    if kind.endswith("_dbg"):
+        return _tstag_debug_source(_tstag_source(source, kind[:-4]), kind[:-4])
+    if kind == "stagr":
+        return _tstag_release_source(_tstag_source(source, "stag"))
     if kind == "ctl":
         return source
     if kind != "stag":
@@ -119,9 +123,70 @@ if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);
     return s
 
 
+def _tstag_release_source(s):
+    # PTX 8.8/8.9 + 9.7.15.2: all helper stores -> bar.warp.sync ->
+    # lane-0 release RMW -> observation-order RMW chain -> consumer acquire.
+    # No acquire is needed in the publisher. Keep the LAST job's ship fence.
+    return _tstag_sub(s, """// Every helper lane has stored its final unit of THIS job before release.
+__threadfence();
+__syncwarp();
+if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);""", """// STAG-R: final end-of-share publication retains the ship semantics.
+if (q == nA - 1) {
+__threadfence();
+__syncwarp();
+if (lane == 0) atomicAdd(p.doneA + j, a1 - a0);
+} else {
+__syncwarp();
+if (lane == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;" :: "l"(p.doneA + j), "r"(a1 - a0) : "memory");
+}""")
+
+
+_TSTAG_DEBUG_EDITS = (
+    # Verbatim _TINYMK_EDITS from kernels/lab/k3_tinymk.py (CPU gate checks).
+    ('#define OKC_DEBUG 0', r"""#define OKC_DEBUG 1"""),
+    ('mbar_wait(bars + sl, (uint32_t)((q / OKC_NS) & 1));', r"""mbar_wait(bars + sl, (uint32_t)((q / OKC_NS) & 1));
+if (!PB && i == 0) { DBG(6); } // TINYMK: first W13 slot observed full"""),
+    ('if (lane == 0) { while (ld_acquire(p.doneA + j) < RB_A) __nanosleep(64); }', r"""if (lane == 0) { while (ld_acquire(p.doneA + j) < RB_A) __nanosleep(64);
+if (i == 0) { DBG(7); } // TINYMK: first W2 doneA spin exit
+} """),
+)
+TSTAG_SLOTS = {
+    0: "entry_before_PDL_wait", 1: "route_end_before_ss_reset_and_WS_JOIN",
+    2: "W13_consumer_phase_end_helper_may_still_drain",
+    3: "W2_consumer_phase_end_before_WS_JOIN_and_combine_setup",
+    4: "combine_grid_barrier_exit_after_CTA_SYNC", 5: "combine_end_TIDX0_not_all_thread_exit",
+    6: "first_W13_ring_full_wait_passed_TIDX0",
+    7: "first_W2_doneA_spin_exit_TIDX0_before_syncwarp",
+    8: "job0_credit_publish_issued_helper_lane0_not_global_completion",
+    9: "first_B_unit_of_last_job_start_TIDX0_after_acquire_x_load_and_ring_full",
+}
+
+
+def _tstag_debug_source(s, kind):
+    for old, new in _TSTAG_DEBUG_EDITS:
+        s = _tstag_sub(s, old, new)
+    s = _tstag_sub(s, "p.dbg[blockIdx.x * 8 + (k)]", "p.dbg[blockIdx.x * 16 + (k)]")
+    # Lane 0 of the HELPER is logical TIDX=256, so DBG(8) would never fire.
+    stamp = "if (lane == 0 && j == 0 && p.dbg) p.dbg[blockIdx.x * 16 + 8] = gtimer();"
+    if kind == "ctl":
+        s = _tstag_sub(s, "atomicAdd(p.doneA + jj, b - a);",
+                      "atomicAdd(p.doneA + jj, b - a);\n" + stamp.replace("j == 0", "jj == 0"))
+    else:
+        # One site AFTER either publication branch; never reuse/overwrite slot 8.
+        anchor = "\n} else {\nconst float gsc = p.gsB[ce] * TWO62;"
+        s = _tstag_sub(s, anchor, "\n" + stamp.replace("j == 0", "j == 0 && rb == a1 - 1") + anchor)
+    # Compute first-unit predicate before curj is updated; stamp only after h
+    # reload and ring wait, immediately before weight LDS/math. No debug loads.
+    s = _tstag_sub(s, "const int j = njF + v / rbs;",
+                  "const int j = njF + v / rbs;\nconst bool last_job_start = PB && j == njF + S.njS - 1 && j != curj;")
+    s = _tstag_sub(s, "const unsigned char* slot = ring + sl * UNIT_BYTES;",
+                  "if (last_job_start) { DBG(9); }\nconst unsigned char* slot = ring + sl * UNIT_BYTES;")
+    return s
+
+
 TSTAG_ON = "ctl"
-TSTAG_ARMS = ("ctl", "stag")
-_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set()}
+TSTAG_ARMS = ("ctl", "stag", "stagr", "ctl_dbg", "stag_dbg", "stagr_dbg")
+_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set(), "dbg": None, "sc_dbg": None}
 
 
 def _tstag_build_one(k, kind, var):
@@ -133,31 +198,36 @@ def _tstag_build_one(k, kind, var):
                        functions=["okc_run", "okc_set_pdl"], extra_cuda_cflags=flags, verbose=False)
 
 
-def _tstag_prepare():
+def _tstag_prepare(dev):
     _TSTAG["errors"].clear()
     _TSTAG["calls"].clear()
     if not HYBLO_ENABLE:
         return
     if _HYBLO["w"] is None or _HYBLO["sc"] is None:
         raise RuntimeError("TSTAG: ship HYBLO prepare unavailable")
+    if _TSTAG["dbg"] is None:
+        _TSTAG["dbg"] = torch.zeros(_HYB["nsm"] * 16, dtype=torch.int64, device=dev)
+    assert len(_HYBLO["sc"]) == 3
+    _TSTAG["sc_dbg"] = list(_HYBLO["sc"]) + [_TSTAG["dbg"]]  # okc_run scratch[3] -> p.dbg
     for k, _, var in _HYBLO_KEYS:
         if not _HYBLO["ok"].get(k) or k not in _HYBLO["mods"]:
             raise RuntimeError(f"TSTAG: ship {k} unavailable")
         if k != "tiny":
             continue
-        key, t0 = (k, "stag"), time.time()
-        try:
-            if key not in _TSTAG["mods"]:
-                _TSTAG["mods"][key] = _tstag_build_one(k, "stag", var)
-        except Exception as ex:
-            _TSTAG["errors"][key] = repr(ex)
-        _TSTAG["secs"][key] = time.time() - t0
+        for kind in TSTAG_ARMS[1:]:
+            key, t0 = (k, kind), time.time()
+            try:
+                if key not in _TSTAG["mods"]:
+                    _TSTAG["mods"][key] = _tstag_build_one(k, kind, var)
+            except Exception as ex:
+                _TSTAG["errors"][key] = repr(ex)
+            _TSTAG["secs"][key] = time.time() - t0
 
 
 def _tstag_select(k, m):
     if TSTAG_ON not in TSTAG_ARMS:
         raise RuntimeError(f"invalid TSTAG arm {TSTAG_ON!r}")
-    kind = "stag" if TSTAG_ON == "stag" and k == "tiny" and m == 1 else "ctl"
+    kind = TSTAG_ON if k == "tiny" and m == 1 else "ctl"
     if kind == "ctl":
         mod = _HYBLO["mods"][k]
     else:
@@ -173,23 +243,45 @@ def _tstag_select(k, m):
 
 def build(base):
     assert "TSTAG_ON" not in base
-    runtime = "\n# TSTAG LAB: ctl is ship; stag changes only M=1 in the tiny bank.\n"
-    for name in ("_TSTAG_MAP", "TSTAG_ON", "TSTAG_ARMS"):
+    runtime = "\n# TSTAG LAB: bank arms change only M=1; debug arms never enter scored timings.\n"
+    for name in ("_TSTAG_MAP", "_TSTAG_DEBUG_EDITS", "TSTAG_SLOTS", "TSTAG_ON", "TSTAG_ARMS"):
         runtime += f"{name} = {globals()[name]!r}\n"
-    runtime += '_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set()}\n'
-    for fn in (_tstag_sub, _tstag_source, _tstag_build_one, _tstag_prepare, _tstag_select):
+    runtime += '_TSTAG = {"mods": {}, "errors": {}, "secs": {}, "calls": {}, "accepted": set(), "dbg": None, "sc_dbg": None}\n'
+    for fn in (_tstag_sub, _tstag_source, _tstag_release_source, _tstag_debug_source, _tstag_build_one, _tstag_prepare, _tstag_select):
         runtime += inspect.getsource(fn) + "\n"
     s = _tstag_sub(base, "HYBLO_ENABLE = True\n", runtime + "HYBLO_ENABLE = True\n")
     run = ast.get_source_segment(s, node(s, "_hyblo_run"))
     new = _tstag_sub(run, 'mod = _HYBLO["mods"][k]', 'mod, pkey = _tstag_select(k, x.shape[0])')
     new = new.replace('_HYBLO["pdl"].get(k)', '_HYBLO["pdl"].get(pkey)').replace('_HYBLO["pdl"][k]', '_HYBLO["pdl"][pkey]')
+    new = _tstag_sub(new, 'mod.okc_run(_HYBLO["w"], _HYBLO["sc"],',
+                     'sc = _TSTAG["sc_dbg"] if pkey[1].endswith("_dbg") else _HYBLO["sc"]\n    mod.okc_run(_HYBLO["w"], sc,')
     s = _tstag_sub(s, run, new)
     anchor = next(l for l in s.splitlines(True) if '_hyblo_prepare(state["k2a33"]["st"]' in l)
-    s = _tstag_sub(s, anchor, anchor + "        _tstag_prepare()\n")
+    s = _tstag_sub(s, anchor, anchor + '        _tstag_prepare(weights["w13"].device)\n')
     ast.parse(s)
     assert literal(s, "_HYBLO_CUDA") == literal(base, "_HYBLO_CUDA")
     cu = literal(base, "_HYBLO_CUDA")
     changed = _tstag_source(cu, "stag")
+    assert hashlib.sha256(changed.encode()).hexdigest() == "42ce44c802ef64cfa9b06372c122508664a18cdef459470bdebbc208fa5fc483", "original stag changed"
+    assert _TSTAG_DEBUG_EDITS == literal((ROOT / "kernels/lab/k3_tinymk.py").read_text(encoding="utf-8"), "_TINYMK_EDITS")
+    for arm in TSTAG_ARMS:
+        variant = _tstag_source(cu, arm)
+        assert variant.count("while (ld_acquire(p.doneA + j) < RB_A)") == 1
+        if arm.endswith("_dbg"):
+            assert "#define OKC_DEBUG 1" in variant and "blockIdx.x * 8 + (k)" not in variant
+            assert variant.count("* 16 + 8] = gtimer()") == 1
+            assert variant.count("DBG(9)") == variant.count("DBG(6)") == variant.count("DBG(7)") == 1
+        if arm.startswith("stagr"):
+            early = variant.split("// STAG-R:", 1)[1].split("\n} else {", 1)[1].split("\n}", 1)[0]
+            assert "__threadfence" not in early and "__syncwarp();" in early
+            assert early.count("red.release.gpu.global.add.s32") == 1
+            assert variant.count("__threadfence();") == changed.count("__threadfence();")
+        parent = _tstag_source(cu, arm[:-4]) if arm.endswith("_dbg") else changed if arm == "stagr" else variant
+        for token in ("mbar_init(", "mbar_arrive1(", "CTA_SYNC();", "WS_JOIN();", "p.ctr", "other[i]", "p.doneA[i] = 0"):
+            assert [l for l in parent.splitlines() if token in l] == [l for l in variant.splitlines() if token in l], (arm, token)
+        for a,b in (("const unsigned char* slot = ring + sl * UNIT_BYTES;", "const int bb = q % NRB;"),
+                    ("WS_JOIN();\nasm volatile(\"griddepcontrol.launch_dependents;", "#include <torch/extension.h>")):
+            assert parent.split(a,1)[1].split(b,1)[0] == variant.split(a,1)[1].split(b,1)[0], (arm,a)
     # Zero hot math, layout, route, cleanup, combine or barrier changes.
     def section(x, a, b): return x.split(a, 1)[1].split(b, 1)[0]
     for a, b in (("const unsigned char* slot = ring + sl * UNIT_BYTES;", "const int bb = q % NRB;"),
@@ -239,6 +331,11 @@ def protocol_gate():
                     assert units == [(j,u) for j in range(jobs) for u in range(lo,hi)]
                     maps.append(units)
                 aa, bb = maps; acount.update(aa); bcount.update(bb)
+                # STAGR's uniform q==nA-1 is exactly the final job boundary.
+                publications = [(q,j) for q,(j,u) in enumerate(aa) if u == bounds[0][1]-1]
+                assert len(publications) == jobs
+                assert [j for q,j in publications if q == len(aa)-1] == ([jobs-1] if jobs else [])
+                assert [j for q,j in publications if q != len(aa)-1] == list(range(max(0,jobs-1)))
                 # FAST1 phase 0..min(2,nA) agrees with ring_issue mapping.
                 lo, hi = bounds[0]
                 assert aa[:2] == [(i//(hi-lo), lo+i % (hi-lo)) for i in range(min(2,len(aa)))]
@@ -275,10 +372,16 @@ def protocol_gate():
 def change_report(base):
     cu = literal(base, "_HYBLO_CUDA")
     start = node(base, "_HYBLO_CUDA").lineno
-    after = _tstag_source(cu, "stag")
-    return {"ctl":[], "stag":[{"base_lines":([start+a0,start+a1-1] if a1>a0 else []),
-            "insert_before_base_line":start+a0 if a1==a0 else None, "stag_cuda_lines":[b0+1,b1], "kind":tag}
-            for tag,a0,a1,b0,b1 in difflib.SequenceMatcher(None,cu.splitlines(),after.splitlines(),autojunk=False).get_opcodes() if tag != "equal"]}
+    result = {}
+    for arm in TSTAG_ARMS:
+        parent = arm[:-4] if arm.endswith("_dbg") else "stag" if arm == "stagr" else "ctl"
+        before, after = _tstag_source(cu, parent), _tstag_source(cu, arm)
+        result[arm] = {"relative_to":parent,"changes":[
+            {"before_cuda_lines":[a0+1,a1], "after_cuda_lines":[b0+1,b1], "kind":tag,
+             "before":"\n".join(before.splitlines()[a0:a1]), "after":"\n".join(after.splitlines()[b0:b1]),
+             "base_lines":([start+a0,start+a1-1] if parent == "ctl" and a1>a0 else [])}
+            for tag,a0,a1,b0,b1 in difflib.SequenceMatcher(None,before.splitlines(),after.splitlines(),autojunk=False).get_opcodes() if tag != "equal"]}
+    return result
 
 
 def ship_tools():
@@ -388,6 +491,24 @@ def ship_gates(base, source, expected):
 def accounting():
     return {
         "scope":"EST source accounting, NOT measured SASS or a speed claim",
+        "stagr_kill_risks_first":["release still drains enough co-resident traffic to hide any saving (R-vfn/R-dsm-0b)",
+                                 "max-over-132 credit tail or B reload sets the critical path instead; stamps test this"],
+        "stagr_measured":{"source":"notes/lab.md R-tstag-1 (1220), R-tinymk-1b (1214)",
+                          "d1s_ctl_stag_us":[59.9,62.4],"d1f_ctl_stag_us":[68.4,71.0],
+                          "gap_d1s_d1f_us":[2.18,2.03],"prior_gate_regs_ctl_stag":[145,145]},
+        "stagr_estimate":{"source":"user supplied co-resident fence measurements: acq_rel 1.9/3.7 vs release 0.6/1.8 us; proxy, NOT a measured STAG fence",
+                          "one_mid_A_fence_saving_us":"1.9-0.6=1.3 or 3.7-1.8=1.9; two-job case removes one SC publish/CTA; conditional target vs STAG, no ship-win claim",
+                          "critical_path":"hypothesis: helper stalls mid-A, four-slot reduction ring fills and blocks consumers; PDL cannot hide this intra-kernel dependency; debug stamps can falsify",
+                          "bytes_stage_before_after":[36864,36864],"inter_A_unit_bytes_before_after":[16,16],
+                          "ybuf_B_unit_bytes_before_after":[64,64],"credit_RMW_bytes_before_after":[4,4],
+                          "instructions_per_unit":"consumer 457 source-accounted ops -> 457; helper 8 LDS128+32 FADD -> same; unchanged from STAG, not dynamic SASS counts",
+                          "early_publish_per_helper_thread":"1 SC fence + 1 warp sync -> 1 warp sync; lane0 1 relaxed atomic -> 1 release reduction; one q==nA-1 branch added per job boundary",
+                          "last_publish":"1 SC fence + 1 warp sync per helper lane, 1 atomic lane0: unchanged",
+                          "registers":"EST near prior 145, no new persistent arrays; debug gtimer/predicate may add registers; compile/spill gates decide"},
+        "debug_accounting":{"purpose":"diagnostic only, never scored", "stride_bytes_before_after":[64,128],
+                            "stores_per_CTA_before_after_max":[6,10],"added_store_bytes_per_CTA_max":32,
+                            "instructions":"four added events each 1 gtimer read + 1 STG64 at source/PTX level on elected lane; guards/address ops compiler-dependent; no weight bytes added",
+                            "coverage":"slots0..7 unchanged; slot8 helper logical256, job0 publishers only; slot9 compute logical0, last-job owners only; slots10..15 zero; absent events remain zero"},
         "kill_risks_first":["per-job fence drains outstanding next-job weights (R-dsm-0b/R-vfn-1)",
                             "132 publishers/job and 3/4-unit imbalance erase readiness slack (VMS_IL)"],
         "measured":{"source":"R-tinymk-1 / box_out/tinymk/d1s.json, 19 rounds",
@@ -417,7 +538,7 @@ def accounting():
             "sass_status":"PENDING Linux gate; JSON dumps every real function, regs/spills/opcode counts. Whole-function counts are NOT per-unit counts."},
         "stag8":"OMITTED: at 8 jobs, each CTA changes from 1..2 jobs to 8 (6..7 extra reloads/phase); upper bound 7*16 LDG128 per active thread/phase, 7*65536=458752 B/CTA/phase at cnt=8. No T8 speed claim.",
         "protocol_consumers_and_coverage":[
-            "doneA acquire: every CTA, all eight compute warps lane0 (logical 0,32,..224), first unit of each B job; syncwarp all lanes. Remapped helper lane0 publishes that job's width AFTER every helper lane stores+fences. Sum_c(floor(512*(c+1)/132)-floor(512*c/132))=512.",
+            "doneA acquire: every CTA, all eight compute warps lane0 (logical 0,32,..224), first unit of each B job; syncwarp all lanes. STAG helpers store+fence+sync; STAGR early jobs store+sync then lane0 release; last job retains fence+sync+atomic. Sum_c(floor(512*(c+1)/132)-floor(512*c/132))=512.",
             "helper physical 0..31 (logical256..287): q=0..N-min(WSBLK,nB)-1, all A units retained; helper stores inter and B prefix, wsre releases unchanged. final WS_JOIN unchanged; no new exit.",
             "B tail: logical warp0..min(WSBLK,nB)-1, lanes0..31, ul=nB-1-warp. Same red ring slot q=nA+ul; new global unit map is used both at norm prefetch and delegated store. Helper prefix plus tail is a disjoint cover.",
             "ring consumers: every CTA logical0..255; q contiguous across A/B, seq=nA+nB. mbarriers, parity, NS=3, refill and arrival lines unchanged. FAST1 issues min(2,nA) of the same map. At zero jobs no issue/division, joins still execute.",
@@ -504,10 +625,14 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
         def __init__(self, key): self.key, self.flags, self.pdl = key, 0, None
         def okc_set_pdl(self, pdl): self.pdl = pdl
         def okc_run(self, *a):
-            assert a[0] is ns["_HYBLO"]["w"] and a[1] is ns["_HYBLO"]["sc"]
+            expected_sc = ns["_TSTAG"]["sc_dbg"] if self.key[1].endswith("_dbg") else ns["_HYBLO"]["sc"]
+            assert a[0] is ns["_HYBLO"]["w"] and a[1] is expected_sc
+            if self.key[1].endswith("_dbg"):
+                assert all(a[1][i] is ns["_HYBLO"]["sc"][i] for i in range(3))
+                assert a[1][3] is ns["_TSTAG"]["dbg"] and a[1][3].shape == (132*16,)
             assert a[-3:] == (0, 32, 132)
             calls.append((self.key, self.flags, self.pdl, a[2].shape[0]))
-    torch = NS(**{s: s for s in ("int16", "int32", "float32", "bfloat16", "uint8")},
+    torch = NS(**{s: s for s in ("int16", "int32", "int64", "float32", "bfloat16", "uint8")},
         empty=lambda s, **k: Tensor(s), zeros=lambda s, **k: Tensor(s),
         arange=lambda *a, **k: Tensor((a[0],)), stack=lambda *a, **k: Tensor(), cat=lambda *a, **k: Tensor(),
         isfinite=lambda t: t, cuda=NS(synchronize=lambda: None))
@@ -516,7 +641,8 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
     names = ("_HYB", "_HYB_MMAX", "_HYB_EMAX", "_HYB_FIXF", "_HYB_XROWS", "_HYB_GUARD",
              "_HYBLO", "_HYBLO_CUDA", "_HYB_MOE_CPP", "_HYBLO_FLAGS", "_HYBLO_KEYS", "HYBLO_ENABLE",
              "HYBLO_PDL", "HYBLO_T", "HYBLO_K", "HYBLO_SELF_TEST", "TSTAG_ON", "TSTAG_ARMS",
-             "_TSTAG", "_TSTAG_MAP", "_tstag_sub", "_tstag_source",
+             "_TSTAG", "_TSTAG_MAP", "_TSTAG_DEBUG_EDITS", "TSTAG_SLOTS", "_tstag_sub", "_tstag_source",
+             "_tstag_release_source", "_tstag_debug_source",
              "_tstag_build_one", "_tstag_prepare", "_tstag_select", "_hyb_scratch", "_hyb_guards_ok",
              "_hyblo_key", "_hyblo_build", "_hyblo_run", "_hyblo_route", "_hyblo_prepare")
     if ship_expected is not None:
@@ -529,7 +655,8 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
         if kw["name"].startswith("hyblo_"):
             kind, k = "ctl", kw["name"].split("_")[1]
         else:
-            _, k, kind, _ = kw["name"].split("_")
+            _, k, rest = kw["name"].split("_", 2)
+            kind, _ = rest.rsplit("_", 1)
         var = next(v for key, _, v in ns["_HYBLO_KEYS"] if key == k)
         expected = ship_expected[k] if ship_expected is not None else _tstag_source(literal(base, "_HYBLO_CUDA"), kind)
         assert kw["cuda_sources"] == expected
@@ -593,34 +720,37 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
         return {"status": "PASS", "scope": "real AST/state; tensor/compiler doubles, no GPU",
                 "builds": [k for k,_ in builds], "routes": [1, 2, 4, 5, 8], "PDL": [0, 1],
                 "state_path": 'state["k2a33"]["st"]', "source_and_cache_tags": "PASS", "module_names": build_names}
-    ns["_tstag_prepare"](); ns["_tstag_prepare"]()
-    assert len(builds) == 3 and not ns["_TSTAG"]["errors"]
+    prepare_bank = lambda: ns["_tstag_prepare"](w["w13"].device)
+    prepare_bank(); prepare_bank()
+    assert len(builds) == 7 and not ns["_TSTAG"]["errors"]
     def must_fail(f):
         try: f()
         except (RuntimeError, KeyError): return
         raise AssertionError("failure silently accepted")
-    ns["TSTAG_ON"] = "stag"
-    must_fail(lambda: ns["_tstag_select"]("tiny", 1))
+    for arm in TSTAG_ARMS[1:]:
+        ns["TSTAG_ON"] = arm
+        must_fail(lambda: ns["_tstag_select"]("tiny", 1))
     ns["_TSTAG"]["accepted"] = set(ns["_TSTAG"]["mods"])
     for t in (1, 2, 4, 5, 8):
         k = "tiny" if t <= 4 else "tiny2"
         for arm in TSTAG_ARMS:
-            kind, flags = ("stag" if arm == "stag" and t == 1 else "ctl"), 0
+            kind, flags = (arm if t == 1 else "ctl"), 0
             for pdl in (True, False, True):
                 ns["TSTAG_ON"], ns["HYBLO_PDL"] = arm, pdl
                 out = ns["_hyblo_route"](Tensor((t, 4096)), Tensor(), Tensor())
                 assert out.shape == (t, 4096) and calls[-1] == ((k, kind), flags, int(pdl), t)
     ns["TSTAG_ON"] = "bad"; must_fail(lambda: ns["_tstag_select"]("tiny", 1))
-    ns["TSTAG_ON"] = "stag"
-    del ns["_TSTAG"]["mods"][("tiny", "stag")]
-    failures.add(("tiny", "stag")); ns["_tstag_prepare"]()
-    must_fail(lambda: ns["_tstag_select"]("tiny", 1))
-    failures.clear(); ns["_tstag_prepare"](); ns["_tstag_select"]("tiny", 1)
+    for arm in TSTAG_ARMS[1:]:
+        ns["TSTAG_ON"] = arm
+        del ns["_TSTAG"]["mods"][("tiny", arm)]
+        failures.add(("tiny", arm)); prepare_bank()
+        must_fail(lambda: ns["_tstag_select"]("tiny", 1))
+        failures.clear(); prepare_bank(); ns["_tstag_select"]("tiny", 1)
     saved = ns["_HYBLO"]["sc"]; ns["_HYBLO"]["sc"] = None
-    must_fail(ns["_tstag_prepare"]); ns["_HYBLO"]["sc"] = saved
-    ns["_HYBLO"]["ok"]["tiny2"] = False; must_fail(ns["_tstag_prepare"])
+    must_fail(prepare_bank); ns["_HYBLO"]["sc"] = saved
+    ns["_HYBLO"]["ok"]["tiny2"] = False; must_fail(prepare_bank)
     ns["_HYBLO"]["ok"]["tiny2"] = True
-    ns["HYBLO_ENABLE"] = False; ns["_tstag_prepare"]()
+    ns["HYBLO_ENABLE"] = False; prepare_bank()
     ns["HYBLO_ENABLE"] = True; ns["TSTAG_ON"] = "ctl"
     # Execute the new prepare call site against the REAL outer return layout.
     ns.update(st={}, state={}, weights={k: Tensor() for k in
@@ -637,7 +767,7 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
         and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) and n.value.func.id == "_v11_k2a33_prepare")
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), "real-state", "exec"), ns)
     site = next(l.strip() for l in patched.splitlines() if '_hyblo_prepare(state["k2a33"]["st"]' in l)
-    exec(site + "\n_tstag_prepare()", ns)
+    exec(site + '\n_tstag_prepare(weights["w13"].device)', ns)
     # The actual layer dispatch must reach the HYBLO branch at both scored T.
     exec(compile(ast.Module(body=[node(base, "_v11_k2a33_call")], type_ignores=[]), "real-route", "exec"), ns)
     for t in (1, 8):
@@ -645,7 +775,7 @@ def dry_run(base, patched, fixture=False, ship_expected=None):
             ns["TSTAG_ON"] = arm
             assert ns["_v11_k2a33_call"](Tensor((t, 4096)), Tensor(), Tensor(), k33["st"]).shape == (t, 4096)
     ns["TSTAG_ON"] = "ctl"
-    print("[tstag] CPU dry PASS: real prepare/scratch, three builds, cache, all arms/PDL, missing gate/bank, independent failure/retry")
+    print("[tstag] CPU dry PASS: real prepare/scratch, seven builds, cache, all arms/PDL, missing gate/bank, independent failure/retry")
     if fixture:
         class ModuleProxy:
             def __getattr__(self, k):
