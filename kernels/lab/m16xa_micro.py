@@ -890,12 +890,14 @@ def gpu_correctness(mod, torch):
             out=torch.full((16,64,n),float("nan"),device="cuda",dtype=torch.float32)
             def call(): mod.launch(ARM_ID[arm],n,4,4,w.data_ptr(),px.data_ptr(),out.data_ptr(),sm.data_ptr(),err.data_ptr(),torch.cuda.current_stream().cuda_stream)
             call(); torch.cuda.synchronize()
-            assert not err.any().item(), "device protocol timeout in correctness"
+            if err.any().item():
+                results.append({"arm":arm,"n":n,"status":"FAIL","why":"device protocol timeout"}); err.zero_(); continue
             got=out.cpu()
             # FP32 reduction order differs; bound by FP32 sum |W*x|, not a loose BF16 tolerance.
             scale=torch.stack([r.abs().amax().clamp_min(1) for r in refs])[:,None,None]
             delta=(got-reference).abs()
-            assert torch.isfinite(got).all() and torch.all(delta <= 2e-5*scale), (arm,n,delta.max().item())
+            if not (torch.isfinite(got).all() and torch.all(delta <= 2e-5*scale)):   # lead: record, exclude from the verdict, keep timing
+                results.append({"arm":arm,"n":n,"status":"FAIL","max_abs_error":float(delta.nan_to_num(1e30).max().item())}); continue
             # Replays use fresh inputs and poisoned outputs to catch cached/stale data.
             stream=torch.cuda.Stream()
             with torch.cuda.stream(stream):
@@ -905,8 +907,10 @@ def gpu_correctness(mod, torch):
             for sign in (-1,1,-1):
                 px.copy_(torch.from_numpy(pack_x((sign*x).view(torch.int16).numpy().view(np.uint16)).view(np.int16)).cuda())
                 out.fill_(float("nan")); torch.cuda.synchronize(); graph.replay(); torch.cuda.synchronize()
-                assert not err.any().item()
-                assert torch.all((out.cpu()-sign*reference).abs()<=2e-5*scale)
+                ok_r=(not err.any().item()) and bool(torch.all((out.cpu()-sign*reference).abs()<=2e-5*scale))
+                if not ok_r: break
+            if not ok_r:
+                results.append({"arm":arm,"n":n,"status":"FAIL","why":"graph replay mismatch"}); err.zero_(); continue
             results.append({"arm":arm,"n":n,"max_abs_error":delta.max().item(),"status":"PASS"})
     return results
 
@@ -992,8 +996,14 @@ def benchmark(mod,args,report):
         rows.append(row)
         print(f"M16XA {arm:4s} N={n:2d} {stage:.4f} us/stage {row['weight_TBps']:.3f} TB/s null={row['ratio_null']:.3f}x",flush=True)
     report["results"]=rows
-    report["verdict"]=verdict(rows)
+    good={(c["arm"],c["n"]) for c in report["correctness"] if c["status"]=="PASS"}
+    for r in rows: r["correct"]=(r["arm"],r["n"]) in good or r["arm"]=="null"
+    try:
+        report["verdict"]=verdict([r for r in rows if r["correct"]])
+    except ValueError:
+        report["verdict"]={"status":"HOLD: some N has no correct arm","good":sorted(map(list,good))}
     print("M16XA "+report["verdict"]["status"],flush=True)
+    print("M16XA correctness "+" ".join(f'{c["arm"]}{c["n"]}:{c["status"]}' for c in report["correctness"]),flush=True)
 
 
 def main():
