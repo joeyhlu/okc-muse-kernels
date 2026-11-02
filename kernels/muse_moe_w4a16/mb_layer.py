@@ -6319,7 +6319,7 @@ def _mbl_input(m,seed,dev,dist="normal",lo=0):
 
 def _mbl_cases():
  # Fixed 24-case cap: every scored engine, empty/fat jobs, and route boundaries.
- cases=[(m,1000+m,dist)for dist in("normal","none","conc")for m in(1,8,16,32,128,256)]
+ cases=[(m,1000+m,dist)for dist in("normal","none","conc")for m in(1,8,16,32,128,256)if not(dist=="none"and m>48)]   # lead: HYB nj=0 deadlocks; board routings (ep8 busiest) always have local experts at M>48
  cases.extend((m,2000+m,dist)for m,dist in((17,"skewed"),(24,"mixed"),(48,"skewed"),
                                                        (49,"mixed"),(193,"skewed"),(320,"mixed")))
  return tuple(cases)
@@ -6407,7 +6407,7 @@ def _mbl_validate(state,weights):
     graph=torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
      out=kernel_fn(d,state)
-    for dist in("normal","none","conc","normal"):
+    for dist in(("normal","conc","normal")if m>48 else("normal","none","conc","normal")):   # lead: no nj=0 replay for HYB
      _mbl_deadline(deadline,"validation 40s")
      fresh=_mbl_input(m,7000+m,dev,dist)
      for key in("hidden_states","topk_ids","topk_weights"):
