@@ -6477,7 +6477,7 @@ def _moexs_select(m):
         return None
     H = _MOEXS[m >= HYB_T7]
     if not _hyb_on(m) or not H["ok"]:
-        raise RuntimeError("MOEXS smp disabled: " + str(H["err"]))
+        return None   # ship form: until (or unless) the smp build passed its own prepare, run the ship HYB
     return H
 
 def _moexs_budget(t0):
