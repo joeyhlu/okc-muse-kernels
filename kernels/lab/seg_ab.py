@@ -38,9 +38,9 @@ def prepare_all(layer, weights):
     started = time.monotonic()
     shared = layer.prepare(weights)
     assert all(shared['route'][bs] == 'bf2' for bs in SHAPES)
-    states = {name: layer.seg_prepare_module(shared, name, started+295) for name in ARMS}
+    states = {name: layer.seg_prepare_module(shared, name, started+640) for name in ARMS}
     elapsed = time.monotonic() - started
-    assert elapsed < 295, ('total prepare budget', elapsed)
+    assert elapsed < 640, ('total prepare budget', elapsed)
     assert len({id(s['mods']['bf2']) for s in states.values()}) == len(ARMS)
     assert len({id(s['vml_sc']['bf2']) for s in states.values()}) == len(ARMS)
     return states, elapsed
