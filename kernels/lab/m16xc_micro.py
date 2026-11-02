@@ -1212,7 +1212,7 @@ def gpu_correctness(mod, torch, results=None):
     weights["w13_sf"][0,:256,:] = np.resize(valid,(256,256))
     bank=prepare_bank(weights,4,4)
     w=torch.from_numpy(bank).cuda()
-    err=torch.empty(4,device="cuda",dtype=torch.int32)
+    err=torch.zeros(4,device="cuda",dtype=torch.int32)
     sm=torch.empty(4*5,device="cuda",dtype=torch.int32)
     if results is None: results=[]
     for n in (8,16,32):
@@ -1333,7 +1333,7 @@ def benchmark(mod,args,report):
         inputs[n]=torch.from_numpy(pack_x(x.view(torch.int16).numpy().view(np.uint16)).view(np.int16)).cuda()
     output=torch.empty((GRID,args.units,64,32),device="cuda",dtype=torch.float32)
     sm=torch.empty(GRID*5,device="cuda",dtype=torch.int32)
-    err=torch.empty_like(sm)
+    err=torch.zeros(GRID,device="cuda",dtype=torch.int32)   # lead: was empty_like(sm) = 5*GRID uninitialized -> false protocol errors
     graphs={}
     report["launch_bounds"]=[]
     # H2D preparation/allocation belongs to the current stream; captures use timer.stream.
