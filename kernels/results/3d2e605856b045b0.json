@@ -1,0 +1,73 @@
+{
+ "board": "muse_moe_w4a16",
+ "call_id": "kc-3d2e605856b045b0",
+ "cluster": "sfo3",
+ "content_hash": "0fa6c5fe6895ce1cd19395fd20c29dc8848b3951d7dbe1a59a5c9eb769c3ef11",
+ "created_at": 1793572916.846074,
+ "dedicated": false,
+ "duplicate_of": null,
+ "finished_at": 1793575684.7939916,
+ "id": "3d2e605856b045b0",
+ "mode": "check",
+ "payload_ref": "muse_moe_w4a16/0fa6c5fe6895ce1cd19395fd20c29dc8848b3951d7dbe1a59a5c9eb769c3ef11.py",
+ "result": {
+  "checks": {
+   "flagged": [],
+   "ok": true,
+   "rejected": []
+  },
+  "error": null,
+  "evaluator": {
+   "code_sha256": "c8a380059e3d1f0afaa9914d6d48b09cdc83efc7e110e7301bca3413720092c0",
+   "files": {
+    "challenge/checks.py": "9a046c3c38db28b325dcd1557baecdf6bc9ef941d2175f9a900ba4c230bb8055",
+    "challenge/nvfp4.py": "cfdf37c7bc14b10f7353aba7d4632f4767401b92b4b073941a8030d9a961aaaf",
+    "configs/muse-spark-open.yaml": "60e242544d5f5a5fc143870461f7373b85accb677a536cb337581ded938c4a48",
+    "harness/eval.py": "0051a1bfac67a9f1fad06086b306653c6643b2bb253e15a794aa672312f070a9",
+    "harness/runner.py": "c905e5c80264c6d27620b6fc7d55b162dccdb8ed7282f8a513a4d2e6f2f226f2",
+    "harness/static_checks.py": "c5588b69e9e86229459a525c61b30096f6f13ff2add6cadf98f272c4ac8ca0c2",
+    "harness/worker.py": "950437610f57ddffbc1176b65d9c2ae909c47bf67b1e3fe0716a81946986f568",
+    "problems/muse_moe_w4a16/baseline.py": "4fc48bd9cdfd749863c93a2dbf4e556e0c38fb04acc4fa48a53ef34cbf6c92a1",
+    "problems/muse_moe_w4a16/reference.py": "a7e0b4fa86aa477a4e7bb5745b2b258954d72636b6da153bd239a717927cba44",
+    "problems/muse_moe_w4a16/task.yml": "cc6870087c1a115e69f40093478553e0a03c1b3e92f527c2e55c4115e2db42ad"
+   },
+   "image": "localhost:30500/kc/judge@sha256:4b146294503891e0315a38db9a291989a679afb5c3dd47bb7a28df1371e4283f"
+  },
+  "flags": [],
+  "gpu": "H200",
+  "log_tail": "",
+  "machine": {
+   "gpu_after": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "595.91.07",
+    "name": "NVIDIA H200",
+    "power.draw": 125.66,
+    "power.limit": 700,
+    "temperature.gpu": 37
+   },
+   "gpu_before": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "595.91.07",
+    "name": "NVIDIA H200",
+    "power.draw": 136.07,
+    "power.limit": 700,
+    "temperature.gpu": 38
+   },
+   "node": "n-pe2w4ezypgo3uplzzi5nvj4iag"
+  },
+  "passed": false,
+  "records": [],
+  "returncode": -9,
+  "score_us": null,
+  "speedup": null,
+  "speedup_ci": null,
+  "status": "timeout"
+ },
+ "started_at": 1793574745.8905444,
+ "status": "done",
+ "team": "joeyhlu"
+}

@@ -1,0 +1,309 @@
+{
+ "board": "muse_attention_decode",
+ "call_id": "kc-4ab7074d6cfd4a46",
+ "cluster": "sfo3",
+ "content_hash": "856412dab3abe2e1798ed221b9a008ce6c346e8f939b45bcce4b4c78e47a7086",
+ "created_at": 1793511327.3124833,
+ "dedicated": false,
+ "duplicate_of": null,
+ "finished_at": 1793511417.339161,
+ "id": "4ab7074d6cfd4a46",
+ "mode": "check",
+ "payload_ref": "muse_attention_decode/856412dab3abe2e1798ed221b9a008ce6c346e8f939b45bcce4b4c78e47a7086.py",
+ "result": {
+  "checks": {
+   "flagged": [],
+   "ok": true,
+   "rejected": []
+  },
+  "error": null,
+  "evaluator": {
+   "code_sha256": "1d519ebf2014fef91b41ffea9bcd7e9c5066784ef5a2a5e2cf06a8cec554d188",
+   "files": {
+    "challenge/checks.py": "9a046c3c38db28b325dcd1557baecdf6bc9ef941d2175f9a900ba4c230bb8055",
+    "challenge/nvfp4.py": "cfdf37c7bc14b10f7353aba7d4632f4767401b92b4b073941a8030d9a961aaaf",
+    "configs/muse-spark-open.yaml": "98f07230e4e64fe91b7c76d9a3ce04948053c043d494d5f1fae56cfe2de033af",
+    "harness/eval.py": "0051a1bfac67a9f1fad06086b306653c6643b2bb253e15a794aa672312f070a9",
+    "harness/runner.py": "c905e5c80264c6d27620b6fc7d55b162dccdb8ed7282f8a513a4d2e6f2f226f2",
+    "harness/static_checks.py": "c5588b69e9e86229459a525c61b30096f6f13ff2add6cadf98f272c4ac8ca0c2",
+    "harness/worker.py": "950437610f57ddffbc1176b65d9c2ae909c47bf67b1e3fe0716a81946986f568",
+    "problems/muse_attention_decode/baseline.py": "37f51207283f85a65eb393b1dfb1344759d7df0bdec5450e34d24e7139f56ecc",
+    "problems/muse_attention_decode/reference.py": "386f7f67a1d788501e8fb9005d340423d098a0946e23810ba10878228c11a37b",
+    "problems/muse_attention_decode/task.yml": "645f889fbbd52d1d731bf5eb53356aa7ef6eea8fab3073f0a2a3dd582fe6e4bb"
+   },
+   "image": "localhost:30500/kc/judge@sha256:9a7f287b80d772c6f636bbcb57422c619fe326e2aabc53803b85007bca93f68e"
+  },
+  "flags": [],
+  "gpu": "H200",
+  "log_tail": "",
+  "machine": {
+   "gpu_after": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "580.159.03",
+    "name": "NVIDIA H200",
+    "power.draw": 127.79,
+    "power.limit": 700,
+    "temperature.gpu": 39
+   },
+   "gpu_before": {
+    "clocks.max.sm": 1980,
+    "clocks.mem": 3201,
+    "clocks.sm": 1980,
+    "driver_version": "580.159.03",
+    "name": "NVIDIA H200",
+    "power.draw": 148.08,
+    "power.limit": 700,
+    "temperature.gpu": 37
+   },
+   "node": "n-a7mrueimlxikptbjpbpxdclo6z"
+  },
+  "passed": false,
+  "records": [
+   {
+    "case": {
+     "batch": 1,
+     "ctx": 10,
+     "heads": "tp8",
+     "layer": "sliding",
+     "seed": 6882089547524392477
+    },
+    "event": "test",
+    "index": 0,
+    "message": "relative L2 error 4.705e-03 (worst row 4.705e-03) [bound 0.125: 2.5 x the reference's 0.044 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 3,
+     "ctx": 2047,
+     "heads": "tp8",
+     "layer": "sliding",
+     "seed": 6882356385036826394
+    },
+    "event": "test",
+    "index": 1,
+    "message": "relative L2 error 4.767e-03 (worst row 6.158e-03) [bound 0.150: 2.5 x the reference's 0.087 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 5,
+     "ctx": 5000,
+     "heads": "tp8",
+     "layer": "sliding",
+     "page": 1,
+     "q_len": 8,
+     "seed": 6882623222549260312,
+     "spread": "mixed"
+    },
+    "event": "test",
+    "index": 2,
+    "message": "relative L2 error 8.115e-02 (worst row 1.194e-01) [bound 0.150: 2.5 x the reference's 0.081 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 3000,
+     "heads": "tp8",
+     "layer": "full",
+     "seed": 6882890060061694231
+    },
+    "event": "test",
+    "index": 3,
+    "message": "relative L2 error 3.897e-01 > 0.15 [bound 0.150: 2.5 x the reference's 0.076 with FP8 E4M3 queries + 0.015]",
+    "status": "fail"
+   },
+   {
+    "case": {
+     "batch": 8,
+     "ctx": 8192,
+     "heads": "dp",
+     "layer": "full",
+     "seed": 6883156897574128151,
+     "spread": "mixed"
+    },
+    "event": "test",
+    "index": 4,
+    "message": "relative L2 error 3.849e-01 > 0.15 [bound 0.150: 2.5 x the reference's 0.079 with FP8 E4M3 queries + 0.015]",
+    "status": "fail"
+   },
+   {
+    "case": {
+     "batch": 2,
+     "ctx": 100000,
+     "heads": "tp8",
+     "layer": "full",
+     "page": 1,
+     "q_len": 8,
+     "seed": 6883423735086562072
+    },
+    "event": "test",
+    "index": 5,
+    "message": "relative L2 error 9.545e-02 (worst row 1.287e-01) [bound 0.150: 2.5 x the reference's 0.094 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 6000,
+     "dist": "edges",
+     "heads": "tp8",
+     "layer": "sliding",
+     "page": 1,
+     "seed": 6883690572598995994
+    },
+    "event": "test",
+    "index": 6,
+    "message": "relative L2 error 4.545e-03 (worst row 4.648e-03) [bound 0.150: 2.5 x the reference's 0.065 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 6000,
+     "dist": "edges",
+     "heads": "tp8",
+     "layer": "full",
+     "q_len": 8,
+     "seed": 6883957410111429917
+    },
+    "event": "test",
+    "index": 7,
+    "message": "relative L2 error 8.553e-02 (worst row 1.230e-01) [bound 0.150: 2.5 x the reference's 0.086 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 1,
+     "ctx": 1048576,
+     "heads": "tp8",
+     "layer": "full",
+     "q_len": 8,
+     "seed": 6884224247623863841
+    },
+    "event": "test",
+    "index": 8,
+    "message": "relative L2 error 8.630e-02 (worst row 9.368e-02) [bound 0.150: 2.5 x the reference's 0.086 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 3,
+     "ctx": 4000,
+     "heads": "tp8",
+     "kv_scale": 0.015625,
+     "layer": "sliding",
+     "page": 1,
+     "q_len": 8,
+     "seed": 6885825272698467406
+    },
+    "event": "test",
+    "index": 9,
+    "message": "relative L2 error 7.819e-02 (worst row 1.212e-01) [bound 0.150: 2.5 x the reference's 0.078 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 2,
+     "ctx": 9000,
+     "heads": "tp8",
+     "kv_scale": 0.015625,
+     "layer": "full",
+     "seed": 6886092110210901337
+    },
+    "event": "test",
+    "index": 10,
+    "message": "relative L2 error 3.746e-01 > 0.15 [bound 0.150: 2.5 x the reference's 0.085 with FP8 E4M3 queries + 0.015]",
+    "status": "fail"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 80000,
+     "dist": "soft",
+     "heads": "tp8",
+     "layer": "full",
+     "seed": 6884491085136297766,
+     "spread": "mixed"
+    },
+    "event": "test",
+    "index": 11,
+    "message": "relative L2 error 3.863e-01 > 0.15 [bound 0.150: 2.5 x the reference's 0.067 with FP8 E4M3 queries + 0.015]",
+    "status": "fail"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 6000,
+     "dist": "soft",
+     "heads": "tp8",
+     "layer": "sliding",
+     "page": 1,
+     "q_len": 8,
+     "seed": 6884757922648731692
+    },
+    "event": "test",
+    "index": 12,
+    "message": "relative L2 error 7.098e-02 (worst row 1.005e-01) [bound 0.150: 2.5 x the reference's 0.071 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 2,
+     "ctx": 20000,
+     "dist": "soft",
+     "heads": "dp",
+     "layer": "full",
+     "q_len": 8,
+     "seed": 6885024760161165619
+    },
+    "event": "test",
+    "index": 13,
+    "message": "relative L2 error 7.215e-02 (worst row 8.233e-02) [bound 0.150: 2.5 x the reference's 0.070 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   },
+   {
+    "case": {
+     "batch": 4,
+     "ctx": 80000,
+     "dist": "coherent",
+     "heads": "tp8",
+     "layer": "full",
+     "page": 1,
+     "seed": 6885291597673599547,
+     "spread": "mixed"
+    },
+    "event": "test",
+    "index": 14,
+    "message": "relative L2 error 3.914e-01 > 0.145285 [bound 0.145: 2.5 x the reference's 0.052 with FP8 E4M3 queries + 0.015]",
+    "status": "fail"
+   },
+   {
+    "case": {
+     "batch": 2,
+     "ctx": 20000,
+     "dist": "coherent",
+     "heads": "dp",
+     "layer": "full",
+     "q_len": 8,
+     "seed": 6885558435186033476
+    },
+    "event": "test",
+    "index": 15,
+    "message": "relative L2 error 4.035e-02 (worst row 4.574e-02) [bound 0.113: 2.5 x the reference's 0.039 with FP8 E4M3 queries + 0.015]",
+    "status": "pass"
+   }
+  ],
+  "returncode": 112,
+  "score_us": null,
+  "speedup": null,
+  "speedup_ci": null,
+  "status": "ok"
+ },
+ "started_at": 1793511339.8137572,
+ "status": "done",
+ "team": "joeyhlu"
+}
