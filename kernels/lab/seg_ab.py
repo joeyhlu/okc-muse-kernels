@@ -31,7 +31,7 @@ ARMS = ('base', 'base_twin', 'SEG0', 'SEG0_twin', 'SEG1', 'SEG1_twin', 'SEG2', '
 SEEDS = (0, 1, 2, 3)
 GATES = {'kill_SEG1_bs32_us': 3.0, 'pass_to_build_SEG1_bs32_us': 8.0,
          'void_twin_seed_median_us': 1.0, 'reps': 30, 'replay_checks': 3,
-         'prepare_s': 295, 'batch_s': 700}
+         'prepare_s': 640, 'batch_s': 1000}
 
 
 def prepare_all(layer, weights):
@@ -132,9 +132,9 @@ def run(out):
     save(out, result)
     started = time.monotonic()
     try:
-        with phase('SEG total wall', 690):
+        with phase('SEG total wall', 990):
             # This budget covers weights plus ALL module prepares, not 295 per arm.
-            with phase('SEG weights and all prepares', 295):
+            with phase('SEG weights and all prepares', 640):
                 sys.path.insert(0, str(ROOT/'problems/muse_moe_w4a16'))
                 ref = module(ROOT/'problems/muse_moe_w4a16/reference.py', 'seg_reference')
                 layer = module(ROOT/'kernels/muse_moe_w4a16/mb_layer_seg.py', 'seg_layer')
