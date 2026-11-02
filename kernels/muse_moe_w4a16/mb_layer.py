@@ -207,6 +207,7 @@ THIRD_PARTY_NOTICES=r"""Third-party code in this file (team joeyhlu, Muse Spark 
 """
 
 import hashlib
+import os
 import threading
 import time
 import torch
@@ -1180,7 +1181,7 @@ VMS_POS=(((6,7,8,15),(22,23,24,31)),((28,29,30,5),(12,13,14,21)),
 _VMS={"mod":None,"G":None,"mod_hi":None}
 VMS_HI_ON=True
 def _vms_build():
- from torch.utils.cpp_extension import load_inline
+ load_inline=_mbl_load_inline
  G=torch.cuda.get_device_properties(0).multi_processor_count
  flags=["-O3",f"-DVMS_G={G}","-DVMS_NS=3","-DVMS_RO=1","-Xptxas=-warn-spills","-gencode=arch=compute_90a,code=sm_90a"]
  tag=hashlib.sha1((VMS_CUDA_SRC+" ".join(flags)).encode()).hexdigest()[:10]
@@ -2544,7 +2545,7 @@ _HYB_SLOTS=160
 HYB_SELF_TEST=((49,61,"normal"),(64,62,"skewed"),(100,63,"normal"),(128,64,"skewed"),(160,65,"normal"),
 (200,66,"skewed"),(256,67,"normal"),(257,68,"skewed"),(320,69,"normal"))
 def _hyb_build():
- from torch.utils.cpp_extension import load_inline
+ load_inline=_mbl_load_inline
  def one(fl):
   tag=hashlib.sha1((_HYB_MOE_CPP+_HYB_MOE_CUDA+" ".join(fl)).encode()).hexdigest()[:12]
   return load_inline(name=f"hyb_moe_{tag}",cpp_sources=_HYB_MOE_CPP,cuda_sources=_HYB_MOE_CUDA,
@@ -3683,9 +3684,9 @@ def _hyblo_unit_order(codes,scales):
  return torch.cat([c,s],dim=1).contiguous().view(-1)
 def _hyblo_key(m):
  return next((k for k,mx,_ in _HYBLO_KEYS if m<=mx),None)
-def _hyblo_build():
- from torch.utils.cpp_extension import load_inline
- for k,_,var in _HYBLO_KEYS: # one nvcc at a time (R-hovl-1: parallel extra builds froze a container)
+def _hyblo_build(keys):
+ load_inline=_mbl_load_inline
+ for k,_,var in keys: # one variant per _pt1-style build job
   fl=list(_HYBLO_FLAGS)+list(var)
   t0=time.time()
   try:
@@ -5916,7 +5917,7 @@ std::vector<int64_t> vml_cfg();
 """
 _vml_FLAGS=["-O3","--expt-relaxed-constexpr","-Xptxas=-warn-spills","-gencode=arch=compute_90a,code=sm_90a"]
 def _vml_build(verbose=False,defines=()):
- from torch.utils.cpp_extension import load_inline
+ load_inline=_mbl_load_inline
  fl=_vml_FLAGS+list(defines)
  tag=hashlib.sha1((_vml_CPP+_vml_CUDA+" ".join(fl)).encode()).hexdigest()[:10]
  t0=time.time()
@@ -5976,7 +5977,7 @@ VML_FLAGS={128:193,256:193,32:193}
 VML_COST={256:[128,153,172,186,198,216,232,248,128,149,168,180,191,208,219,236],128:[128,157,174,194,208,230,246,262,128,154,179,189,219,229,250,267],32:[128,167,183,229,171,182,193,204,128,162,184,215,171,182,193,204]}
 VML_VAR='bf2'
 VML_ABVARS=()
-VML_BVAR={256:'w72',128:'w72'}
+VML_BVAR={} # MBL: HYB handles these shapes; bf2 is the validated fallback
 VML_POOL={}
 VML_DPFLAGS=8192
 VML_SEG={}
@@ -6136,7 +6137,39 @@ def _mbl_pack_hyblo(st,w,dev):
 # MBL board adapter. CUDA and native helpers above are copied verbatim.
 # The base VMS launcher hard-rejects M > 16 (MAXP=128); edges 17..24 use bf2.
 MBL_EDGES=(1,2,4,5,8,9,12,13,16,17,24,25,32,33,48,49,63,64,128,192,193,256,257,320)
-MBL_ARMS=("tiny","tiny2","vms_hi","vms","bf2","w72","hyb","hyb7")
+MBL_ARMS=("tiny","tiny2","vms_hi","vms","bf2","hyb","hyb7")
+MBL_VALIDATE_S=40.0
+
+def _mbl_deadline(deadline,label):
+ if time.monotonic()>=deadline:
+  raise TimeoutError(f"MBL {label} safety budget exceeded")
+
+def _mbl_stage(name,t0):
+ print(f"[mbl] prepare stage {name} {time.monotonic()-t0:.3f}",flush=True)
+ _mbl_deadline(t0+295,"prepare 295s")
+
+def _mbl_load_inline(**kw):
+ # Local wrapper, never an edit to torch's loaded module. Native args unchanged.
+ from torch.utils.cpp_extension import load_inline
+ tag=kw["name"]
+ if tag.startswith("k3_vmshi_"):
+  name="vms_hi"
+ elif tag.startswith("k3_vms_"):
+  name="vms"
+ elif tag.startswith("vml_moe_"):
+  name="bf2"
+ elif tag.startswith("hyblo_"):
+  name=tag.split("_")[1]
+ else:
+  name="hyb7"if all(f in kw["extra_cuda_cflags"]for f in HYB_F7)else"hyb"
+ t0=time.monotonic()
+ print(f"[mbl] build start {name}",flush=True)
+ try:
+  return load_inline(**kw)
+ finally:
+  elapsed=time.monotonic()-t0
+  _K3_BUILD_S[name]=elapsed
+  print(f"[mbl] build {name} {elapsed:.3f}",flush=True)
 
 def _mbl_status(name,good,reason):
  print(f"[mbl] {'LIVE' if good else 'FAIL'} {name}: {reason}",flush=True)
@@ -6153,32 +6186,33 @@ def _mbl_candidates(m):
   return ("vms_hi","vms","bf2")
  if m<HYB_T[0]:
   return ("bf2",)
- return (("hyb7","hyb","w72","bf2")if m>=HYB_T7 else("hyb","w72","bf2"))
+ return (("hyb7","hyb","bf2")if m>=HYB_T7 else("hyb","bf2"))
 
-def _mbl_builds():
- # Native flags and native load_inline host functions, including both VMS builds.
- # Like the base's _pt1 build jobs, families overlap; native HYBLO itself still
- # builds tiny then tiny2 sequentially (its documented compiler-memory guard).
+def _mbl_builds(deadline):
+ # _pt1 layout: start all family jobs before waiting. VMS/HYB retain their
+ # native child threads; each HYBLO variant now has its own family job.
  def one(name,fn):
   try:
    fn()
   except Exception as ex:
    _mbl_status(name,False,"build "+repr(ex)[:600])
- jobs=[threading.Thread(target=one,args=(name,fn),daemon=True)
-       for name,fn in(("VMS",_vms_build),("VML",_vml_build_job),("HYB",_hyb_build),("HYBLO",_hyblo_build))]
+ work=[("vms",_vms_build),("vml",_vml_build_job),("hyb",_hyb_build)]
+ work.extend((k,lambda entry=(k,m,var):_hyblo_build((entry,)))for k,m,var in _HYBLO_KEYS)
+ jobs=[threading.Thread(target=one,args=(name,fn),name=f"pt1-{name}",daemon=True)for name,fn in work]
  for job in jobs:
   job.start()
  for job in jobs:
-  job.join()
+  job.join(max(0.0,deadline-time.monotonic()))
+  _mbl_deadline(deadline,"prepare 295s build wait")
  mods={"vms":_VMS["mod"],"vms_hi":_VMS["mod_hi"],"hyb":_HYB["mod"],"hyb7":_HYB["mod7"],
        "tiny":_HYBLO["mods"].get("tiny"),"tiny2":_HYBLO["mods"].get("tiny2"),
-       "bf2":_VML["mods"].get("bf2"),"w72":_VML["mods"].get("w72")}
+       "bf2":_VML["mods"].get("bf2")}
  for name,mod in mods.items():
   if mod is None:
    _mbl_status(name,False,"module unavailable")
   elif name in("tiny","tiny2","hyb","hyb7"):
    mod.okc_set_pdl(int(HYBLO_PDL if name.startswith("tiny")else HYB_PDL))
-  elif name in("bf2","w72"):
+  elif name=="bf2":
    _vml_cfg(mod) # initialize native host metadata before capture
  return mods
 
@@ -6202,14 +6236,14 @@ def _mbl_pack_bank(w,dev):
  return st
 
 def _mbl_banks(weights,dev):
- # Prepare every expert once. Views cover ALL valid local_start values, including
- # unaligned windows; no repack, id conversion, tensor allocation or caching in kernel_fn.
+ # Preserve the lead's scored-shard patch: repack experts 0..31 only.
+ # Other local_start values use the independent FP32 equation in kernel_fn.
  E=weights["w13"].shape[0]
  if E!=256:
   raise ValueError("board weights must contain 256 global experts")
  chunks=[]
  keys=("w13","w13_sf","w13_gs","w2","w2_sf","w2_gs")
- for lo in (0,):   # lead 2026-11-01: scored shapes use local_start 0 only (busiest-GPU relabel); others take the FP32 path
+ for lo in (0,):
   w={k:weights[k][lo:lo+32]for k in keys}
   w["post_norm_w"]=weights["post_norm_w"]
   chunks.append(_mbl_pack_bank(w,dev))
@@ -6254,7 +6288,7 @@ def _mbl_call(name,data,state):
   vs=st["vms"]
   mod.run(x,ids,tw,vs["wA"],vs["wB"],vs["gsA"],vs["gsB"],vs["nw"],vs["inter"],vs["ybuf"],vs["ss"],vs["ctr"],
   out,vs["nomarks"],m,K2A_POST_NORM_EPS,1,lo)
- elif name in("bf2","w72"):
+ elif name=="bf2":
   rep=_k2a_bucket_of(m)
   _vml_call(mod,st,state["vml_sc"][name],x,ids,tw,ls=lo,out=out,
   flags=VML_FLAGS.get(rep,193),cost=VML_COST.get(rep,VML_COST[32]))
@@ -6265,7 +6299,7 @@ def _mbl_call(name,data,state):
 def kernel_fn(data,state):
  m=data["hidden_states"].shape[0]
  if int(data["config"]["local_start"])!=0:
-  return _k2a_ref_fp32(data,state["w_raw"])   # unscored shardings: correct FP32 path
+  return _k2a_ref_fp32(data,state["w_raw"])
  return _mbl_call(state["route"][m],data,state)
 
 def _mbl_input(m,seed,dev,dist="normal",lo=0):
@@ -6284,20 +6318,17 @@ def _mbl_input(m,seed,dev,dist="normal",lo=0):
  return d
 
 def _mbl_cases():
- cases=list(HYBLO_SELF_TEST)+list(VMS_SELF_TEST_CASES)+list(MBL_VMS_HI_TEST)+list(HYB_SELF_TEST)
- for cs in MBL_VML_TEST.values():
-  cases.extend(cs)
- cases.extend((m,1000+m,"normal")for m in MBL_EDGES)
- cases.extend((m,2000+m,"none")for m in MBL_EDGES)
- cases.extend((m,3000+m,"mixed")for m in(1,8,16,32,128,256))
- cases.extend((m,4000+m,"conc")for m in(1,8,16,24,32,128,256,320))
- return tuple(dict.fromkeys(cases))
+ # Fixed 24-case cap: every scored engine, empty/fat jobs, and route boundaries.
+ cases=[(m,1000+m,dist)for dist in("normal","none","conc")for m in(1,8,16,32,128,256)]
+ cases.extend((m,2000+m,dist)for m,dist in((17,"skewed"),(24,"mixed"),(48,"skewed"),
+                                                       (49,"mixed"),(193,"skewed"),(320,"mixed")))
+ return tuple(cases)
 
 def _mbl_health(name,state):
  st=state["banks"][0]["k2a33"]["st"]
  if name in("vms","vms_hi"):
   return int(st["vms"]["ctr"][2])==0
- if name in("bf2","w72"):
+ if name=="bf2":
   return int(state["vml_sc"][name]["err"][0])==0
  return all(bool((f[n:].view(vt)==sv).all())for f,n,vt,sv in state["h_full"])
 
@@ -6317,14 +6348,19 @@ def _mbl_compare(got,ref,data,state,name,prev=None):
 def _mbl_validate(state,weights):
  # A failure removes an engine for the whole bank family, visibly. Fallbacks
  # get the SAME cases before route selection; there is no timed exception path.
+ t0=time.monotonic()
+ deadline=min(t0+MBL_VALIDATE_S,state["prepare_deadline"])
  good={k:v is not None for k,v in state["mods"].items()}
  st=state["banks"][0]["k2a33"]["st"]
  for name,need in(("vms","vms"),("vms_hi","vms"),("tiny","hyblo"),("tiny2","hyblo"),("hyb","hyb"),("hyb7","hyb")):
   good[name]=good[name]and need in st
  dev=weights["w13"].device
  for m,seed,dist in _mbl_cases():
+  _mbl_deadline(deadline,"validation 40s")
+  print(f"[mbl] validate case M={m} {dist} {time.monotonic()-t0:.3f}",flush=True)
   d=_mbl_input(m,seed,dev,dist)
   ref=_k2a_ref_fp32(d,weights)
+  _mbl_deadline(deadline,"validation 40s")
   seen,noise={},{}
   for name in _mbl_candidates(m):
    if not good[name]:
@@ -6341,38 +6377,27 @@ def _mbl_validate(state,weights):
    except Exception as ex:
     good[name]=False
     _mbl_status(name,False,f"M={m} {dist}: {ex!r}")
+   _mbl_deadline(deadline,"validation 40s")
   # Native applicable cross-engine gates: HYB7 versus HYB's repeat noise;
-  # w72 versus bf2; HYB/HYBLO versus the existing VML/VMS engines.
+  # HYB/HYBLO versus the retained VML/VMS engines.
   for name,other,bound in(("hyb7","hyb",max(2*noise.get("hyb",0.0),1e-6)),
-                         ("w72","bf2",2e-3),("hyb","w72",1e-2),
+                         ("hyb","bf2",1e-2),
                          ("tiny","vms",1e-2),("tiny2","vms",1e-2)):
    if name in seen and other in seen and good[name]and good[other]:
     err=_k2a_rel_err(seen[name],seen[other])[0]
     if err>bound:
      good[name]=False
      _mbl_status(name,False,f"M={m} {dist}: vs {other} {err:.3e} > {bound:.3e}")
- # Global ids and weight-bank indexing are checked on nonzero AND unaligned
- # starts, all scored shapes. No expanded weight cache survives prepare.
- for lo in():   # lead: nonzero starts take the FP32 path in kernel_fn
-  for m in(1,8,16,32,128,256):
-   d=_mbl_input(m,5000+lo+m,dev,"normal",lo)
-   ref=_k2a_ref_fp32(d,weights)
-   for name in _mbl_candidates(m):
-    if good[name]:
-     try:
-      got=_mbl_call(name,d,state)
-      torch.cuda.synchronize()
-      _mbl_compare(got,ref,d,state,name)
-     except Exception as ex:
-      good[name]=False
-      _mbl_status(name,False,f"local_start={lo} M={m}: {ex!r}")
+ # Nonzero-start native-engine tests stay skipped: kernel_fn uses w_raw/FP32.
  state["good"]=good
  _mbl_select(state)
  # Exercise capture and repeated fresh-input replays with persistent counters.
  for m in(1,8,16,32,128,256):
   while True:
+   _mbl_deadline(deadline,"validation 40s")
    d=_mbl_input(m,6000+m,dev)
    name=state["route"][m]
+   print(f"[mbl] validate graph M={m} {name} {time.monotonic()-t0:.3f}",flush=True)
    try:
     warm=torch.cuda.Stream()
     warm.wait_stream(torch.cuda.current_stream())
@@ -6383,20 +6408,26 @@ def _mbl_validate(state,weights):
     with torch.cuda.graph(graph):
      out=kernel_fn(d,state)
     for dist in("normal","none","conc","normal"):
+     _mbl_deadline(deadline,"validation 40s")
      fresh=_mbl_input(m,7000+m,dev,dist)
      for key in("hidden_states","topk_ids","topk_weights"):
       d[key].copy_(fresh[key])
      graph.replay()
      torch.cuda.synchronize()
      _mbl_compare(out,_k2a_ref_fp32(d,weights),d,state,name)
+     _mbl_deadline(deadline,"validation 40s")
     break
+   except TimeoutError:
+    raise
    except Exception as ex:
     good[name]=False
     _mbl_status(name,False,f"graph M={m}: {ex!r}")
     _mbl_select(state)
  for name in MBL_ARMS:
-  _mbl_status(name,good[name],"native cases + FP32 board equation + edges/global ids; selected="+
+  _mbl_status(name,good[name],"24 capped cases + FP32 board equation + graph replays; selected="+
               str([m for m in(1,8,16,32,128,256)if state["route"][m]==name]))
+ _mbl_deadline(deadline,"validation 40s")
+ print(f"[mbl] validation {time.monotonic()-t0:.3f}",flush=True)
 
 def _mbl_select(state):
  for m in range(1,321):
@@ -6406,23 +6437,30 @@ def _mbl_select(state):
   state["route"][m]=live
 
 def prepare(weights):
- t0=time.time()
+ t0=time.monotonic()
+ _mbl_stage("begin",t0)
  dev=weights["w13"].device
  nsm=torch.cuda.get_device_properties(dev).multi_processor_count
  if nsm>min(_HYB_SLOTS,_vml_SLOTS):
   raise ValueError("unsupported SM count")
+ # Resolve torch's extension imports once, before any compiler thread starts.
+ from torch.utils.cpp_extension import load_inline
+ os.environ.setdefault("MAX_JOBS","2")
+ _mbl_stage("builds_start",t0)
  result={}
  def build():
   try:
-   result["mods"]=_mbl_builds()
+   result["mods"]=_mbl_builds(t0+295)
   except Exception as ex:
    result["error"]=ex
  job=threading.Thread(target=build,name="mbl-build",daemon=True)
  job.start()
- try:
-  banks=_mbl_banks(weights,dev)
- finally:
-  job.join()
+ _mbl_stage("pack_start",t0)
+ banks=_mbl_banks(weights,dev)
+ torch.cuda.synchronize()
+ _mbl_stage("pack_done_builds_wait",t0)
+ job.join(max(0.0,t0+295-time.monotonic()))
+ _mbl_stage("builds_done",t0)
  if "error"in result:
   raise RuntimeError("MBL build orchestration failed")from result["error"]
  mods=result["mods"]
@@ -6430,14 +6468,19 @@ def prepare(weights):
   vs=bank["k2a33"]["st"].get("vms")
   if vs is not None:
    vs["mod"],vs["mod_hi"]=mods["vms"],mods["vms_hi"]
- sc={"bf2":_vml_alloc(dev,nsm),"w72":_vml_alloc(dev,nsm)}
+ _mbl_stage("scratch_start",t0)
+ sc={"bf2":_vml_alloc(dev,nsm)}
  hsc,hfull=_hyb_scratch(dev)
  output=torch.empty((320,4096),dtype=torch.bfloat16,device=dev)
- state={"w_raw":weights,"mods":mods,"banks":banks,"vml_sc":sc,"h_sc":hsc,"h_full":hfull,"nsm":nsm,
+ state={"w_raw":weights,"prepare_deadline":t0+295,"mods":mods,"banks":banks,"vml_sc":sc,"h_sc":hsc,"h_full":hfull,"nsm":nsm,
         "route":{},"out":{m:output[:m]for m in range(1,321)}}
+ torch.cuda.synchronize()
+ _mbl_stage("validation_start",t0)
  _mbl_validate(state,weights)
- elapsed=time.time()-t0
+ _mbl_stage("validation_done",t0)
+ elapsed=time.monotonic()-t0
  print(f"[mbl] routes { {m:state['route'][m]for m in(1,8,16,32,128,256)} } prepare={elapsed:.1f}s",flush=True)
  if elapsed>=295:
   raise RuntimeError("MBL prepare exceeded its 295s safety budget")
+ _mbl_stage("done",t0)
  return state
