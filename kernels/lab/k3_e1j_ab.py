@@ -928,18 +928,18 @@ def _E1J_EMPTY(dev):
  if t is None:
   t = _E1J_E[str(dev)] = torch.empty(0, dtype=torch.int32, device=dev)
  return t
-def _e1j_flag(state, cond):
+def _e1j_flag(state, cond, dev):
  f = state.get('e1j_flag')
  if state.get('_e1j') and cond and f is not None:
   return f
- return _E1J_EMPTY(state['router'].device)
+ return _E1J_EMPTY(dev)
 def _v8_logits(mode,ffn_input,router_input,state):
  st=state.get("r1b")
  if mode=="f32":
   part=torch.empty((8,router_input.shape[0],N_EXPERTS),dtype=torch.float32,device=router_input.device)
   kind=VF_ROUTER.get(1 if router_input.shape[0]==1 else 8,"r32")
   if kind!="r32" and _VF["r8"]and _SBB1["mod"]is not None:
-   _SBB1["mod"].vf_router32(router_input,state["router"],part,{"lean4":1,"lean5":2}.get(kind,0),_e1j_flag(state,router_input.shape[0]==1 and kind not in("lean4","lean5")))
+   _SBB1["mod"].vf_router32(router_input,state["router"],part,{"lean4":1,"lean5":2}.get(kind,0),_e1j_flag(state,router_input.shape[0]==1 and kind not in("lean4","lean5"),router_input.device))
   else:
    state["v8"]["mod"].v8_router32(router_input,state["router"],part)
   return part
@@ -1516,7 +1516,7 @@ def _v8_tail(y,logits,state,data,ftf=None):
  else:
   lg,la,lb,l_ld=logits,0,-1,logits.stride(0)
  v8["mod"].v8_tail(y,lg,la,lb,l_ld,ns,sstride,v8["nw"],v8["bias"],data["local_start"],xn,tw,tid,lid,
- RMS_EPS,0.1767766952966369,1.0,1e-15,_e1j_flag(state,True),(1 if V9_TAIL_PDL else 0)|(2 if TL1_TAIL2 else 0)
+ RMS_EPS,0.1767766952966369,1.0,1e-15,_e1j_flag(state,True,y.device),(1 if V9_TAIL_PDL else 0)|(2 if TL1_TAIL2 else 0)
  |(_ft_flag(tokens)if ftf is None else ftf))
  return xn,tw,tid,lid
 TIE1_GAP=2e-5

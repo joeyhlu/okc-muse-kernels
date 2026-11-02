@@ -51,22 +51,22 @@ def main():
     old_r = ("_SBB1[" + Q + "mod" + Q + "].vf_router32(router_input,state[" + Q + "router" + Q + "],part,{" + Q + "lean4" + Q + ":1,"
              + Q + "lean5" + Q + ":2}.get(kind,0))")
     s = once(s, old_r, old_r[:-1] + ",_e1j_flag(state,router_input.shape[0]==1 and kind not in(" + Q + "lean4" + Q + "," + Q + "lean5"
-             + Q + ")))")
+             + Q + "),router_input.device))")
     s = once(s, "mod.vf_router32(z,state[" + Q + "router" + Q + "],got,kind)",
              "mod.vf_router32(z,state[" + Q + "router" + Q + "],got,kind,_E1J_EMPTY(z.device))")
     old_t = " RMS_EPS,0.1767766952966369,1.0,1e-15,(1 if V9_TAIL_PDL else 0)"
-    s = once(s, old_t, " RMS_EPS,0.1767766952966369,1.0,1e-15,_e1j_flag(state,True),(1 if V9_TAIL_PDL else 0)")
+    s = once(s, old_t, " RMS_EPS,0.1767766952966369,1.0,1e-15,_e1j_flag(state,True,y.device),(1 if V9_TAIL_PDL else 0)")
     glue = ("E1J_ON = 0\n_E1J_E = {}\n"
             "def _E1J_EMPTY(dev):\n"
             " t = _E1J_E.get(str(dev))\n"
             " if t is None:\n"
             "  t = _E1J_E[str(dev)] = torch.empty(0, dtype=torch.int32, device=dev)\n"
             " return t\n"
-            "def _e1j_flag(state, cond):\n"
+            "def _e1j_flag(state, cond, dev):\n"
             " f = state.get('e1j_flag')\n"
             " if state.get('_e1j') and cond and f is not None:\n"
             "  return f\n"
-            " return _E1J_EMPTY(state['router'].device)\n")
+            " return _E1J_EMPTY(dev)\n")
     s = once(s, "def _v8_logits(mode,ffn_input,router_input,state):\n", glue + "def _v8_logits(mode,ffn_input,router_input,state):\n")
     side = "   main_stream,side_stream=torch.cuda.current_stream(),state[" + Q + "side_stream" + Q + "]\n"
     s = once(s, side, side
