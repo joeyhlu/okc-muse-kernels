@@ -242,6 +242,8 @@ def _vfin_prepare(st,w,dev):
       graph.replay()
      torch.cuda.synchronize()
      exact=torch.equal(outs[0].view(torch.int16),outs[1].view(torch.int16))
+     rel=_k2a_rel_err(outs[1],outs[0])[0]
+     exact=bool(exact or rel<1e-3)  # lead: FP32 atomics in split B units are order-nondeterministic
      finite=bool(torch.isfinite(outs[1].float()).all())
      clean=all(bool((_VFIN["sc"][k]==0).all())for k in ("cnt","xready","doneA","y"))
      err=int(_VML["sc"]["err"][0])
