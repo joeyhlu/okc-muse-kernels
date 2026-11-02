@@ -6459,12 +6459,1604 @@ def _moexr_scratch(dev, mfin):
     return sc, full
 MOEXR = False
 _MOEXR_SHIP = {'mod': None, 'ok': False, 'w': None, 'sc': None, 'full': None, 'nsm': 0, 'err': None, 'build_s': 0.0, 'pdl': -1, 'mod7': None, 'pdl7': -1}
-# HPF admission gate: no progressive-finalize CUDA build was admitted.
+_HPF_CUDA=r"""#include <cuda_bf16.h>
+#include <type_traits>
+#include <cuda_runtime.h>
+#include <stdint.h>
+#define OKC_DEBUG 0
+#define OKC_USE_TMA 1
+#define OKC_RLOAD 1
+#define OKC_F1EARLY 1
+#define OKC_WGSFINSS 1
+#define OKC_B4FIN 0
+#define B4_EARLY_Y 1
+#define OKC_FINCOL 1
+#define OKC_WGMIN 9
+#define OKC_XPRE 1
+#define FAST1_ARCH 1
+#define FAST1_ON (OKC_FAST1 > 0 && OKC_TINY && FAST1_ARCH && OKC_USE_TMA)
+#define OKC_CPFF 1
+#define OKC_FCOSTBB OKC_FCOSTB
+#define OKC_FCOSTSB OKC_FCOST
+#define OKC_DYN 1
+#define OKC_DYNK 4
+#define OKC_TDYN 0
+#define SKDYN (OKC_DYN && (!OKC_TINY || OKC_TDYN) && FAST1_ARCH && OKC_USE_TMA && OKC_SKT == 8 && !OKC_XPF && !OKC_NOLOAD)
+#define OKC_FT_T 64
+#define OKC_SPLIT 0
+#define OKC_TINY 0
+#define OKC_EARLYN 1
+#define OKC_BIGM 64
+#define OKC_XPF 0
+#define OKC_CPF 1
+#define OKC_FATSTATIC 1
+#define OKC_FCOST 40
+#define OKC_FCOSTB 40
+#define OKC_WS 0
+#define OKC_WGSX 0
+#define SILU_DIV(a, b) __fdividef((a), (b))
+#define OKC_UWARP 1
+#define WARP_IDX(t) __shfl_sync(0xffffffffu, (t) >> 5, 0)
+#define OKC_FINPF 0
+#define OKC_WSNR 4
+#define OKC_NOLOAD 0
+#ifndef OKC_HYBST
+#define OKC_HYBST 0
+#endif
+#ifndef OKC_HYBFB
+#define OKC_HYBFB 4
+#endif
+#ifndef OKC_PADZ
+#define OKC_PADZ 0
+#endif
+#if OKC_PADZ == 2
+#define HYB_PZ (p.pzr != 0)
+#else
+#define HYB_PZ (OKC_PADZ != 0)
+#endif
+#ifndef OKC_SC6
+#define OKC_SC6 0
+#endif
+#ifndef OKC_MFIN
+#define OKC_MFIN 0
+#endif
+#ifndef OKC_PLAN
+#define OKC_PLAN 0
+#endif
+namespace okc {
+#define OKC_L2H 1
+#define L2H_SUFFIX ".L2::cache_hint"
+#define L2H_OPERAND ", %4"
+#define L2H_ARG , "l"(0x12F0000000000000ull)
+__device__ __forceinline__ void st_keep_bf16(__nv_bfloat16* a, __nv_bfloat16 v) {
+asm volatile("st.global.L2::cache_hint.b16 [%0], %1, %2;\n" ::"l"(a), "h"(*reinterpret_cast<unsigned short*>(&v)), "l"(0x14F0000000000000ull) : "memory");
+}
+__device__ __forceinline__ void st_keep_f32(float* a, float v) {
+asm volatile("st.global.L2::cache_hint.b32 [%0], %1, %2;\n" ::"l"(a), "f"(v), "l"(0x14F0000000000000ull) : "memory");
+}
+constexpr int HD = 4096, ID = 4096;
+constexpr int NW = OKC_NW, NT = NW * 32;
+constexpr int NTL = NT + (OKC_WGS ? 64 : OKC_WS ? 32 : 0);
+constexpr int NRB = OKC_WS ? OKC_WSNR : 2;
+#define CTA_SYNC() asm volatile("bar.sync 1, %0;\n" ::"n"(NT) : "memory")
+#define WS_JOIN() asm volatile("bar.sync 2, %0;\n" ::"n"(NTL) : "memory")
+constexpr int NCH = 64 / NW;
+#define OKC_SKT 8
+constexpr int SK_T = OKC_SKT;
+constexpr int RED_W = OKC_SKT > 8 ? 8 : 4;
+static_assert(!OKC_WS || OKC_SKT == 8, "OKC_WS assumes single-tile skinny jobs");
+constexpr int FT_T = OKC_FT_T;
+constexpr int RB_A = 2 * ID / 16, RB_B = HD / 16;
+constexpr int UB_A = RB_A / 16, UB_B = RB_B / 16;
+constexpr int RB_A_LOG = 9, RB_B_LOG = 8;
+static_assert((1 << RB_B_LOG) == RB_B, "RB_B must be 256");
+constexpr int BFLAG = 1 << 30;
+__device__ __forceinline__ int dyn_pool(int nS, int G) { const int d = G * OKC_DYNK; return SKDYN ? (d < nS ? d : nS) : 0; }
+static_assert((1 << RB_A_LOG) == RB_A, "RB_A must be 512");
+static_assert(OKC_NSF <= 7 && OKC_NS <= 5, "barrier slots");
+constexpr int MMAX = 384, EMAX = MMAX * 8, JMAX = 32 + EMAX / FT_T + 8;
+constexpr int XP_SK = HD + 8;
+constexpr int KS = 256;
+constexpr int XP_FT = KS + 8;
+constexpr int NST = 3;
+constexpr float TWO62 = 4.611686018427388e18f;
+struct Params {
+const uint4* wA; const uint4* sA; const float* gsA;
+const uint4* wB; const uint4* sB; const float* gsB;
+const uint32_t* lut; const __nv_bfloat16* normw;
+const unsigned char* wAf; const unsigned char* wBf;
+const unsigned char* wAu; const unsigned char* wBu;
+const unsigned char* wAn; const unsigned char* wBn;
+const unsigned char* wAs; const unsigned char* wBs;
+__nv_bfloat16* xA; __nv_bfloat16* xB;
+int* xready;
+int* doneAs;
+#if OKC_MFIN
+int* mfl;
+#endif
+uint32_t zero;
+const __nv_bfloat16* x; const int* topk_ids; const float* topk_w;
+int M, lo, nloc;
+int* ctr;
+int* doneA;
+__nv_bfloat16* inter;
+float* ybuf;
+float* ss;
+float* ss1;
+__nv_bfloat16* out;
+unsigned long long* dbg;
+#if OKC_PADZ == 2
+int pzr;
+#endif
+float* sspart;
+float* hacc;
+int* htok;
+};
+struct Smem {
+uint32_t lut[256];
+float red[1][1][1][RED_W];
+uint64_t bars[24];
+int wglast[4];
+float hred[4][16];
+int hlast[4];
+int wcp[JMAX + 1];
+int wcpB[JMAX + 1];
+int jrow[JMAX + 1];
+uint32_t wtot;
+uint32_t wtotB;
+int wgr[4];
+int seq, fseq, preissued, preissuedB;
+int fcnt[32];
+void* xbuf_ptr;
+int cnt[64], off[64];
+int wc[NW][32];
+int jE[JMAX], jS[JMAX], jC[JMAX], forder[JMAX];
+int njF, njS, unit;
+int gen;
+float* ssp;
+int uslot[8];
+int dync[JMAX];
+int unit_next, unit_next2;
+signed char eid[EMAX];
+short ent[EMAX];
+short pos[EMAX];
+};
+__device__ __forceinline__ int muldiv_g(int a, int c, int G, float rG) {
+const int p = a * c;
+int q = __float2int_rz((float)p * rG);
+if (q * G > p) --q;
+else if ((q + 1) * G <= p) ++q;
+return q;
+}
+__device__ __forceinline__ uint32_t bmul2l(uint32_t a, uint32_t b) {
+__nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __low2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+return *reinterpret_cast<uint32_t*>(&r);
+}
+__device__ __forceinline__ uint32_t bmul2h(uint32_t a, uint32_t b) {
+__nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), __high2bfloat162(*reinterpret_cast<__nv_bfloat162*>(&b)));
+return *reinterpret_cast<uint32_t*>(&r);
+}
+__device__ __forceinline__ unsigned long long gtimer() {
+unsigned long long t;
+asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+return t;
+}
+#define DBG(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[blockIdx.x * 8 + (k)] = gtimer(); } while (0)
+extern __shared__ __align__(16) unsigned char smem_raw[];
+__device__ __forceinline__ float* ss_cur();
+__device__ __forceinline__ int ld_acquire(const int* p) {
+int v;
+asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p));
+return v;
+}
+__device__ __forceinline__ void dq4(uint32_t q, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+constexpr uint32_t M = 0x81C081C0u;
+r0 = q & M;
+r1 = __funnelshift_r(q, q, 6) & M;
+r2 = __funnelshift_r(q, q, 10) & M;
+r1 = (q * 16u) & M;
+r2 = __funnelshift_l(q, q, 10) & M;
+r3 = ((q * 64u) & 0x80C080C0u) | (__funnelshift_l(q, q, 14) & 0x01000100u);
+return;
+r3 = ((q * 16u) & 0x81808180u) | (__funnelshift_r(q, q, 4) & 0x00400040u);
+}
+__device__ void early_issue(const Params& p, Smem& S);
+__device__ void route(const Params& p, Smem& S) {
+const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+const int E = p.M * 8;
+const int CH = ((E + NW * 32 - 1) / (NW * 32)) * 32;
+const int i0 = warp * CH, i1 = min(E, i0 + CH);
+if (tid < NW * 32) S.wc[tid >> 5][tid & 31] = 0;
+{
+constexpr int LPT = (EMAX / 4 + NT - 1) / NT;
+int4 ev[LPT];
+const int E4 = E >> 2;
+#pragma unroll
+for (int k = 0; k < LPT; ++k) {
+const int i4 = tid + k * NT;
+ev[k] = i4 < E4 ? __ldg(reinterpret_cast<const int4*>(p.topk_ids) + i4) : make_int4(0, 0, 0, 0);
+}
+#pragma unroll
+for (int k = 0; k < LPT; ++k) {
+const int i4 = tid + k * NT;
+if (i4 < E4) {
+const int v[4] = {ev[k].x - p.lo, ev[k].y - p.lo, ev[k].z - p.lo, ev[k].w - p.lo};
+char4 c;
+c.x = (signed char)((v[0] >= 0 && v[0] < p.nloc) ? v[0] : -1);
+c.y = (signed char)((v[1] >= 0 && v[1] < p.nloc) ? v[1] : -1);
+c.z = (signed char)((v[2] >= 0 && v[2] < p.nloc) ? v[2] : -1);
+c.w = (signed char)((v[3] >= 0 && v[3] < p.nloc) ? v[3] : -1);
+*reinterpret_cast<char4*>(&S.eid[i4 * 4]) = c;
+}
+}
+}
+CTA_SYNC();
+for (int base = i0; base < i1; base += 32) {
+const int i = base + lane;
+const int e = (i < i1) ? (int)S.eid[i] : -1;
+const unsigned peers = __match_any_sync(0xffffffffu, e);
+if (e >= 0 && lane == __ffs(peers) - 1) S.wc[warp][e] += __popc(peers);
+}
+CTA_SYNC();
+if (warp == 0) {
+int c[NW];
+int tot = 0;
+#pragma unroll
+for (int w = 0; w < NW; ++w) { c[w] = (lane < p.nloc) ? S.wc[w][lane] : 0; tot += c[w]; }
+int incl = tot;
+#pragma unroll
+for (int d = 1; d < 32; d <<= 1) { int v = __shfl_up_sync(0xffffffffu, incl, d); if (lane >= d) incl += v; }
+int off = incl - tot;
+S.cnt[lane] = tot;
+S.off[lane] = off;
+int o2 = off;
+#pragma unroll
+for (int w = 0; w < NW; ++w) { S.wc[w][lane] = o2; o2 += c[w]; }
+const int nfj = tot > SK_T ? (tot + FT_T - 1) / FT_T : 0;
+const int nsj = (tot > 0 && tot <= SK_T) ? 1 : 0;
+int fi = nfj, si = nsj;
+#pragma unroll
+for (int d = 1; d < 32; d <<= 1) {
+int v1 = __shfl_up_sync(0xffffffffu, fi, d), v2 = __shfl_up_sync(0xffffffffu, si, d);
+if (lane >= d) { fi += v1; si += v2; }
+}
+const int nfTot = __shfl_sync(0xffffffffu, fi, 31), nsTot = __shfl_sync(0xffffffffu, si, 31);
+int fj = fi - nfj, sj = nfTot + si - nsj;
+for (int q = 0; q < nfj; ++q) {
+S.jE[fj + q] = lane; S.jS[fj + q] = off + q * FT_T; S.jC[fj + q] = min(FT_T, tot - q * FT_T);
+}
+if (nsj) { S.jE[sj] = lane; S.jS[sj] = off; S.jC[sj] = tot; }
+if (lane == 0) { S.njF = nfTot; S.njS = nsTot; }
+__syncwarp();
+}
+CTA_SYNC();
+early_issue(p, S);
+for (int base = i0; base < i1; base += 32) {
+const int i = base + lane;
+const int e = (i < i1) ? (int)S.eid[i] : -1;
+const unsigned peers = __match_any_sync(0xffffffffu, e);
+if (e >= 0) {
+const int q = S.wc[warp][e] + __popc(peers & ((1u << lane) - 1u));
+S.ent[q] = (short)i;
+S.pos[i] = (short)q;
+} else if (i < i1) {
+S.pos[i] = -1;
+}
+__syncwarp();
+if (e >= 0 && lane == __ffs(peers) - 1) S.wc[warp][e] += __popc(peers);
+__syncwarp();
+}
+CTA_SYNC();
+}
+__device__ __forceinline__ float probe_q(float v) {
+return v;
+}
+constexpr int UNIT_CODES = 32768, UNIT_SC = 4096, UNIT_BYTES = UNIT_CODES + UNIT_SC;
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+#define SCD(word, b) (__byte_perm((word), 0u, 0x4040u | ((b) * 0x0101u)) * 16u + 0x5C005C00u)
+#define SCDK(word, b, k16) (__byte_perm((word), 0u, 0x4040u | ((b) * 0x0101u)) * (k16) + 0x5C005C00u)
+__device__ __forceinline__ void mbar_init(uint64_t* bar, int count) {
+asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(count));
+}
+__device__ __forceinline__ void mbar_arrive1(uint64_t* bar) {
+asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(smem_u32(bar)) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+asm volatile(
+"{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+::"r"(smem_u32(bar)), "r"(parity) : "memory");
+}
+template <bool PB>
+__device__ __forceinline__ void ring_issue(const Params& p, const Smem& S, int v, unsigned char* slot, uint64_t* bar) {
+const int rbs = PB ? RB_B : RB_A;
+const int njF = S.njF;
+const int j = njF + v / rbs, rb = v - (v / rbs) * rbs;
+const size_t blk = (size_t)S.jE[j] * rbs + rb;
+const unsigned char* src = (PB ? p.wBu : p.wAu) + blk * (size_t)UNIT_BYTES;
+asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(UNIT_BYTES) : "memory");
+asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
+::"r"(smem_u32(slot)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(bar)) L2H_ARG : "memory");
+}
+constexpr int X1P = 512 + 8;
+constexpr int NSF = OKC_NSF;
+__device__ __forceinline__ uint64_t wg_desc(uint32_t saddr, uint32_t lbo, uint32_t sbo) {
+return (uint64_t)((saddr >> 4) & 0x3FFF) | ((uint64_t)((lbo >> 4) & 0x3FFF) << 16) | ((uint64_t)((sbo >> 4) & 0x3FFF) << 32);
+}
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory"); }
+__device__ void early_issue(const Params& p, Smem& S) {
+return;
+if (OKC_FATSTATIC && S.njF > 0) {
+if (threadIdx.x == 0) S.preissued = 0;
+return;
+}
+const int nS = S.njS * RB_A - dyn_pool(S.njS * RB_A, gridDim.x);
+const float rG = __fdividef(1.f, (float)gridDim.x);
+const int v0 = muldiv_g(nS, blockIdx.x, gridDim.x, rG), v1 = muldiv_g(nS, blockIdx.x + 1, gridDim.x, rG);
+unsigned char* ring = reinterpret_cast<unsigned char*>(S.xbuf_ptr);
+const int n = min(OKC_EARLYN, v1 - v0);
+if (threadIdx.x == NT - 32) {
+asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+for (int i = 0; i < n; ++i) { ring_issue<false>(p, S, v0 + i, ring + i * UNIT_BYTES, S.bars + i); S.uslot[i] = v0 + i; }
+S.preissued = n > 0 ? n : 0;
+}
+}
+#define OKC_WGSNX 3
+constexpr int WGS_NS = 3;
+constexpr int WGS_NX = OKC_WGSNX;
+constexpr int WGS_NT = FT_T / 8;
+// MOEX:SC6
+#if OKC_SC6
+constexpr int WGS_PIECE = 8960;
+#define WGS_COPY_BYTES 35840
+#else
+constexpr int WGS_PIECE = 9216;
+#define WGS_COPY_BYTES UNIT_BYTES
+#endif
+constexpr int WGS_XS = WGS_NT * 4096;
+constexpr int BW_F = 0, BW_E = 3, BX_F = 6, BX_E = 6 + WGS_NX;
+static_assert(BX_E + WGS_NX <= 24, "WGS barriers");
+constexpr int WGS_SLOTS = 160;
+constexpr int WGS_FIXW = WGS_NT * 512;
+constexpr size_t WGS_FIXF = (size_t)2 * WGS_SLOTS * 4 * WGS_FIXW + 2 * WGS_SLOTS * 4 + 136 * 16;
+__device__ __forceinline__ float* wgs_fix(const Params& p, int pb) {
+return p.ybuf + (size_t)EMAX * HD + (size_t)pb * WGS_SLOTS * 4 * WGS_FIXW;
+}
+__device__ __forceinline__ int* wgs_cnt(const Params& p, int pb) {
+return reinterpret_cast<int*>(p.ybuf + (size_t)EMAX * HD + (size_t)2 * WGS_SLOTS * 4 * WGS_FIXW) + pb * WGS_SLOTS * 4;
+}
+// MOEX:MFIN
+#if OKC_MFIN
+constexpr int MF_CE = 0, MF_EXIT = 64, MF_XR = 128, MF_XRS = 96, MF_DA = 384, MF_INTS = 4096;
+static_assert(JMAX <= MF_XRS && MF_DA + 2 * JMAX * 16 <= MF_INTS, "MFIN flag region");
+// phase-A hand-off flags: one set per launch parity under MFIN (the old code zeroed them after the grid barrier)
+// (volatile shared load: a plain S.gen load is loop-invariant and would stay live in a register across the stage loops)
+__device__ __forceinline__ int mf_gen(const Smem& S) {
+#if 1
+  int v;
+  asm volatile("ld.volatile.shared.s32 %0, [%1];\n" : "=r"(v) : "r"(smem_u32(&S.gen)));
+  return v;
+#else
+  return S.gen;
+#endif
+}
+__device__ __forceinline__ int* mf_xr(const Params& p, const Smem& S) { return p.xready + (OKC_MFIN ? mf_gen(S) * MF_XRS : 0); }
+__device__ __forceinline__ int* mf_da(const Params& p, const Smem& S) { return p.doneAs + (OKC_MFIN ? mf_gen(S) * (JMAX * 16) : 0); }
+constexpr int MF_ERR = 65; // sticky device error, never silently consume an incomplete expert
+#else
+#define mf_xr(p, S) p.xready
+#define mf_da(p, S) p.doneAs
+#endif
+#define OKC_WGSA 112, 135, 140, 158, 173, 185, 200, 207
+#define OKC_WGSB 100, 104, 115, 123, 132, 144, 156, 174
+constexpr unsigned long long wgs_pack8(const int (&c)[8]) {
+unsigned long long r = 0;
+for (int i = 0; i < 8; ++i) r |= (unsigned long long)(c[i] & 255) << (8 * i);
+return r;
+}
+constexpr int WGS_CA[8] = {OKC_WGSA};
+constexpr int WGS_CB[8] = {OKC_WGSB};
+constexpr unsigned long long WGS_PA = wgs_pack8(WGS_CA), WGS_PB = wgs_pack8(WGS_CB);
+static_assert(WGS_CA[0] > 0 && WGS_CA[7] < 256 && WGS_CB[0] > 0 && WGS_CB[7] < 256, "WGS cost tables: 1..255");
+__device__ __forceinline__ int wgs_cost(int pb, int cnt) {
+return (int)(((pb ? WGS_PB : WGS_PA) >> (8 * (((cnt + 7) >> 3) - 1))) & 255ull);
+}
+#define OKC_WGSREORD 1
+#define OKC_GATHB 8
+#define OKC_WGSPR 1
+#define OKC_WGSDFIN 2
+#define OKC_WGSFCI 3
+#define OKC_WGSGS 2
+__device__ __forceinline__ void wgs_wait(uint64_t* bar, uint32_t parity, int tag) {
+(void)tag;
+mbar_wait(bar, parity);
+}
+template <int NTT> struct WGSMMA;
+template <> struct WGSMMA<1> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 {%0, %1, %2, %3}, {%4, %5, %6, %7}, %8, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 {%0, %1, %2, %3}, {%4, %5, %6, %7}, %8, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<2> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11}, %12, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11}, %12, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<3> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n24k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, %16, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n24k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, %16, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<4> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19}, %20, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]), "=f"(d[3][0]), "=f"(d[3][1]), "=f"(d[3][2]), "=f"(d[3][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19}, %20, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<5> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n40k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19}, {%20, %21, %22, %23}, %24, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]), "=f"(d[3][0]), "=f"(d[3][1]), "=f"(d[3][2]), "=f"(d[3][3]), "=f"(d[4][0]), "=f"(d[4][1]), "=f"(d[4][2]), "=f"(d[4][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n40k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19}, {%20, %21, %22, %23}, %24, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<6> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, {%24, %25, %26, %27}, %28, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]), "=f"(d[3][0]), "=f"(d[3][1]), "=f"(d[3][2]), "=f"(d[3][3]), "=f"(d[4][0]), "=f"(d[4][1]), "=f"(d[4][2]), "=f"(d[4][3]), "=f"(d[5][0]), "=f"(d[5][1]), "=f"(d[5][2]), "=f"(d[5][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, {%24, %25, %26, %27}, %28, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<7> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n56k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27}, {%28, %29, %30, %31}, %32, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]), "=f"(d[3][0]), "=f"(d[3][1]), "=f"(d[3][2]), "=f"(d[3][3]), "=f"(d[4][0]), "=f"(d[4][1]), "=f"(d[4][2]), "=f"(d[4][3]), "=f"(d[5][0]), "=f"(d[5][1]), "=f"(d[5][2]), "=f"(d[5][3]), "=f"(d[6][0]), "=f"(d[6][1]), "=f"(d[6][2]), "=f"(d[6][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n56k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27}, {%28, %29, %30, %31}, %32, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+template <> struct WGSMMA<8> {
+static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 0, 1, 1, 0;\n"
+: "=f"(d[0][0]), "=f"(d[0][1]), "=f"(d[0][2]), "=f"(d[0][3]), "=f"(d[1][0]), "=f"(d[1][1]), "=f"(d[1][2]), "=f"(d[1][3]), "=f"(d[2][0]), "=f"(d[2][1]), "=f"(d[2][2]), "=f"(d[2][3]), "=f"(d[3][0]), "=f"(d[3][1]), "=f"(d[3][2]), "=f"(d[3][3]), "=f"(d[4][0]), "=f"(d[4][1]), "=f"(d[4][2]), "=f"(d[4][3]), "=f"(d[5][0]), "=f"(d[5][1]), "=f"(d[5][2]), "=f"(d[5][3]), "=f"(d[6][0]), "=f"(d[6][1]), "=f"(d[6][2]), "=f"(d[6][3]), "=f"(d[7][0]), "=f"(d[7][1]), "=f"(d[7][2]), "=f"(d[7][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+static __device__ __forceinline__ void mma(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
+asm volatile("wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n"
+: "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc));
+}
+};
+__device__ __forceinline__ int wgs_split(int pb, int g0, int g1) {
+const int ue = ((g1 - 1) >> 4) << 4;
+return (OKC_WGSREORD && pb == 0 && (g1 & 15) != 0 && ue > g0) ? ue : g0;
+}
+#ifndef OKC_HN
+#define OKC_HN 0
+#endif
+#if OKC_HN
+__device__ __forceinline__ unsigned long long hk_pol(const Smem& S, int j) {
+const int e = S.jE[j], tot = S.cnt[e];
+const int n = tot > SK_T ? (tot + FT_T - 1) / FT_T : 1;
+const int q = n > 1 ? (S.jS[j] - S.off[e]) / FT_T : 0;
+return q < n - 1 ? 0x1000000000000000ull : 0x12F0000000000000ull;
+}
+#define HN_ARG , "l"(hkpol)
+#else
+#define HN_ARG L2H_ARG
+#endif
+__device__ void wgs_ranges(const Params& p, Smem& S);
+__device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
+WS_JOIN();
+if ((threadIdx.x & 31) != 0) return;
+int ws = 0, n = 0;
+uint32_t wph = 0;
+#pragma unroll 1
+for (int pb = 0; pb < 2; ++pb) {
+const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
+const int ubl = pb ? 4 : 5;
+const unsigned char* base = pb ? p.wBs : p.wAs;
+#pragma unroll 1
+for (int i = 0, gs = sp; i < g1 - g0; ++i, ++gs, ++n) {
+if (gs == g1) gs = g0;
+const int u = gs >> 4, st = gs & 15;
+const int j = u >> ubl, ub = u & ((1 << ubl) - 1);
+#if OKC_HN
+const unsigned long long hkpol = hk_pol(S, j);
+#endif
+if (n >= WGS_NS) wgs_wait(S.bars + BW_E + ws, wph ^ 1, 1000 + gs);
+uint64_t* bar = S.bars + BW_F + ws;
+const unsigned char* src = base + ((size_t)(((S.jE[j] << ubl) + ub) * 16 + st)) * (size_t)WGS_COPY_BYTES;
+asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(WGS_COPY_BYTES) : "memory");
+asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
+::"r"(smem_u32(ring + ws * UNIT_BYTES)), "l"(src), "r"(WGS_COPY_BYTES), "r"(smem_u32(bar)) HN_ARG : "memory");
+if (++ws == WGS_NS) { ws = 0; wph ^= 1; }
+}
+}
+}
+constexpr int WGS_XROWS = EMAX + 8 * JMAX;
+__device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
+asm volatile("bar.sync 7, %0;\n" ::"n"(NT + 32) : "memory");
+// MOEX:PLAN
+#if OKC_PLAN
+wgs_ranges(p, S);
+#else
+if ((threadIdx.x & 31) == 0) wgs_ranges(p, S);
+#endif
+__syncwarp();
+WS_JOIN();
+if ((threadIdx.x & 31) != 0) return;
+unsigned char* xring = ring + WGS_NS * UNIT_BYTES;
+int xs = 0, n = 0;
+uint32_t xph = 0;
+#pragma unroll 1
+for (int pb = 0; pb < 2; ++pb) {
+const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
+const int ubl = pb ? 4 : 5;
+const __nv_bfloat16* xsrc = pb ? p.xB : p.xA;
+int curj = -1, npad = 8;
+const __nv_bfloat16* jb = xsrc;
+#pragma unroll 1
+for (int i = 0, gs = sp; i < g1 - g0; ++i, ++gs, ++n) {
+if (gs == g1) gs = g0;
+const int u = gs >> 4, st = gs & 15;
+const int j = u >> ubl;
+if (n >= WGS_NX) wgs_wait(S.bars + BX_E + xs, xph ^ 1, 2000000 + gs);
+if (j != curj) {
+curj = j;
+npad = ((S.jC[j] + 7) >> 3) << 3;
+jb = xsrc + (size_t)S.jrow[j] * HD;
+if (!pb && !(OKC_WGSX & 8)) { while (ld_acquire(mf_xr(p, S) + j) < npad) __nanosleep(32); }
+}
+if (pb && !(OKC_WGSX & 8)) { while (ld_acquire(mf_da(p, S) + j * 16 + st) < 8) __nanosleep(32); }
+uint64_t* bar = S.bars + BX_F + xs;
+const uint32_t bytes = (uint32_t)npad * 512u;
+asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
+asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+::"r"(smem_u32(xring + xs * WGS_XS)), "l"(jb + (size_t)st * npad * 256), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+if (++xs == WGS_NX) { xs = 0; xph ^= 1; }
+}
+}
+}
+__device__ void wgs_gather(const Params& p, Smem& S) {
+const int tid = threadIdx.x, nj = S.njF + S.njS;
+const int R = S.jrow[nj];
+const float rG = __fdividef(1.f, (float)gridDim.x);
+const int q0 = muldiv_g(R, blockIdx.x, gridDim.x, rG), q1 = muldiv_g(R, blockIdx.x + 1, gridDim.x, rG);
+int j = 0;
+static_assert(NT * 8 == HD, "one 16 B chunk per thread per row");
+constexpr int GB = OKC_GATHB;
+for (int qb = q0; qb < q1; qb += GB) {
+uint4 v[GB];
+uint4* d[GB];
+#pragma unroll
+for (int k = 0; k < GB; ++k) {
+const int q = qb + k;
+d[k] = nullptr;
+if (q < q1) {
+while (S.jrow[j + 1] <= q) ++j;
+const int r = q - S.jrow[j], cnt = S.jC[j];
+#if OKC_PADZ
+if (r < cnt || HYB_PZ) {
+const int ntt = (cnt + 7) >> 3;
+d[k] = reinterpret_cast<uint4*>(p.xA + (size_t)S.jrow[j] * HD) + ((((tid >> 5) * ntt + (r >> 3)) * 32 + (tid & 31)) * 8 + (r & 7));
+v[k] = make_uint4(0u, 0u, 0u, 0u);
+if (r < cnt) {
+#else
+if (r < cnt) {
+const int ntt = (cnt + 7) >> 3;
+d[k] = reinterpret_cast<uint4*>(p.xA + (size_t)S.jrow[j] * HD) + ((((tid >> 5) * ntt + (r >> 3)) * 32 + (tid & 31)) * 8 + (r & 7));
+{
+#endif
+const int G = tid & 31;
+const unsigned* xs32 = reinterpret_cast<const unsigned*>(p.x + (size_t)(S.ent[S.jS[j] + r] >> 3) * HD + (tid >> 5) * 256)
++ (8 * ((G >> 1) & 3) + 2 * (G >> 3) + (G & 1));
+v[k] = make_uint4(__ldg(xs32), __ldg(xs32 + 32), __ldg(xs32 + 64), __ldg(xs32 + 96));
+}
+}
+}
+}
+#pragma unroll
+for (int k = 0; k < GB; ++k)
+if (d[k]) *d[k] = v[k];
+}
+CTA_SYNC();
+if (tid == 0) {
+int jj = 0;
+for (int q = q0; q < q1;) {
+while (S.jrow[jj + 1] <= q) ++jj;
+const int e = min(q1, S.jrow[jj + 1]);
+asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(mf_xr(p, S) + jj), "r"(e - q) : "memory");
+q = e;
+}
+}
+}
+
+// HPF: the counter covers ALL B column blocks of ALL jobs for this expert.
+__device__ __noinline__ void hpf_finalize(const Params& p, Smem& S, int e) {
+const int wt = threadIdx.x & 127, wg = threadIdx.x >> 7;
+const int lane = wt & 31, wp = wt >> 5;
+const int total = S.cnt[e];
+asm volatile("fence.acquire.gpu;\n" ::: "memory");
+// One completed expert's actual rows, never a final pass over all tokens.
+for (int q = S.off[e]; q < S.off[e] + total; ++q) {
+ const int route = S.ent[q], tk = route >> 3;
+ float4 a[4], b[4];
+ // Four virtual groups of 128 reproduce ship's 512-thread RMS tree exactly.
+ #pragma unroll
+ for (int h = 0; h < 4; ++h) {
+  const float4* src = reinterpret_cast<const float4*>(p.ybuf + (size_t)q * HD) + (wt + h * 128) * 2;
+  a[h] = __ldcg(src); b[h] = __ldcg(src + 1);
+  float ps = a[h].x*a[h].x + a[h].y*a[h].y + a[h].z*a[h].z + a[h].w*a[h].w
+           + b[h].x*b[h].x + b[h].y*b[h].y + b[h].z*b[h].z + b[h].w*b[h].w;
+  #pragma unroll
+  for (int d = 16; d > 0; d >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, d);
+  if (lane == 0) S.hred[wg][h * 4 + wp] = ps;
+ }
+ asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+ if (wt == 0) {
+  float sum = 0.f;
+  for (int w = 0; w < NW; ++w) sum += S.hred[wg][w];
+  S.hred[wg][0] = p.topk_w[route] * rsqrtf(sum * (1.f / HD) + 1e-8f);
+ }
+ asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+ const float scale = S.hred[wg][0];
+ #pragma unroll
+ for (int h = 0; h < 4; ++h) {
+  const float v[8] = {a[h].x,a[h].y,a[h].z,a[h].w,b[h].x,b[h].y,b[h].z,b[h].w};
+  #pragma unroll
+  for (int c = 0; c < 8; ++c) {
+   const float value = scale * v[c];
+   asm volatile("red.relaxed.gpu.global.add.f32 [%0], %1;\n"
+    ::"l"(p.hacc + (size_t)tk * HD + (wt + h * 128) * 8 + c), "f"(value) : "memory");
+  }
+ }
+ // Every lane drains its atomics before the leader publishes completion.
+ asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+ asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+ if (wt == 0) {
+  int need = 0;
+  #pragma unroll
+  for (int sl = 0; sl < 8; ++sl) need += S.pos[tk * 8 + sl] >= 0;
+  int old;
+  asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n"
+   : "=r"(old) : "l"(p.htok + tk), "r"(1) : "memory");
+  S.hlast[wg] = old + 1 == need;
+ }
+ asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+ if (S.hlast[wg]) {
+  asm volatile("fence.acquire.gpu;\n" ::: "memory");
+  #pragma unroll
+  for (int h = 0; h < 4; ++h) {
+   float4* src = reinterpret_cast<float4*>(p.hacc + (size_t)tk * HD) + (wt + h * 128) * 2;
+   const float4 va = __ldcg(src), vb = __ldcg(src + 1);
+   const float v[8] = {va.x,va.y,va.z,va.w,vb.x,vb.y,vb.z,vb.w};
+   uint4 out;
+   uint32_t* words = reinterpret_cast<uint32_t*>(&out);
+   #pragma unroll
+   for (int c = 0; c < 4; ++c) {
+    __nv_bfloat162 pair = __floats2bfloat162_rn(v[c*2],v[c*2+1]);
+    words[c] = *reinterpret_cast<uint32_t*>(&pair);
+   }
+   *reinterpret_cast<uint4*>(p.out + (size_t)tk * HD + (wt + h * 128) * 8) = out;
+   *src = make_float4(0.f,0.f,0.f,0.f);
+   *(src + 1) = make_float4(0.f,0.f,0.f,0.f);
+  }
+  asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+  if (wt == 0) p.htok[tk] = 0;
+ }
+ // No lane can reuse hred/hlast before this row's other lanes finish.
+ asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+}
+}
+__device__ __forceinline__ void hpf_complete(const Params& p, Smem& S, int e) {
+const int wt = threadIdx.x & 127, wg = threadIdx.x >> 7, total = S.cnt[e];
+const int target = 64 * (total > SK_T ? (total + FT_T - 1) / FT_T : 1);
+if (wt == 0) {
+ int old;
+ asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n"
+  : "=r"(old) : "l"(p.mfl + MF_CE + mf_gen(S) * 32 + e), "r"(1) : "memory");
+ S.hlast[wg] = old + 1 == target;
+}
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+if (S.hlast[wg]) {
+ // Completion can be published while the NEXT unit has one in-flight group.
+ // Drain before an out-of-line call can save live WGMMA accumulator registers.
+ wg_wait<0>();
+ hpf_finalize(p, S, e);
+}
+}
+
+struct WgsPend { int kind, u, slot, nst; };
+template <bool PB>
+__device__ __forceinline__ void wgs_epi_tile(const Params& p, const Smem& S, int j, int r16, int nt, const float* d4) {
+const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+const int cnt = S.jC[j], jst = S.jS[j], e = S.jE[j];
+if (!PB) {
+const int col = r16 * 8 + g, ntt = (cnt + 7) >> 3;
+const float gsc = p.gsA[e] * TWO62;
+__nv_bfloat16* xb = p.xB + (size_t)S.jrow[j] * HD + (col & 7);
+#pragma unroll
+for (int h = 0; h < 2; ++h) {
+const int tk = nt * 8 + 2 * t + h;
+#if OKC_PADZ
+if (tk < cnt || HYB_PZ) {
+const float gt = d4[h] * gsc, up = d4[2 + h] * gsc;
+const float v = SILU_DIV(gt, 1.f + __expf(-gt)) * up;
+st_keep_bf16(xb + (size_t)((((col >> 8) * ntt + (tk >> 3)) * 32 + ((col & 255) >> 3)) * 64 + (tk & 7) * 8),
+__float2bfloat16(probe_q(tk < cnt ? v : 0.f)));
+}
+#else
+if (tk < cnt) {
+const float gt = d4[h] * gsc, up = d4[2 + h] * gsc;
+const float v = SILU_DIV(gt, 1.f + __expf(-gt)) * up;
+st_keep_bf16(xb + (size_t)((((col >> 8) * ntt + (tk >> 3)) * 32 + ((col & 255) >> 3)) * 64 + (tk & 7) * 8),
+__float2bfloat16(probe_q(v)));
+}
+#endif
+}
+} else {
+const int n0 = r16 * 16 + g, tok0 = nt * 8 + 2 * t;
+const float gsc = p.gsB[e] * TWO62;
+const float w0 = (1.f + __bfloat162float(__ldg(p.normw + n0))) * gsc, w1 = (1.f + __bfloat162float(__ldg(p.normw + n0 + 8))) * gsc;
+#pragma unroll
+for (int h = 0; h < 2; ++h) {
+const int tk = tok0 + h;
+if (tk < cnt) {
+st_keep_f32(p.ybuf + ((size_t)(jst + tk) * HD + n0), d4[h] * w0);
+st_keep_f32(p.ybuf + ((size_t)(jst + tk) * HD + n0 + 8), d4[2 + h] * w1);
+}
+}
+}
+}
+template <bool PB>
+__device__ __forceinline__ void wgs_flush(const Params& p, Smem& S, WgsPend& pd) {
+if (pd.kind == 0) return;
+const int tid = threadIdx.x, warp = WARP_IDX(tid), wg = warp >> 2, wp = warp & 3, wt = tid & 127;
+constexpr int UBL = PB ? 4 : 5;
+const int j = pd.u >> UBL, ub = pd.u & ((1 << UBL) - 1);
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+#if OKC_MFIN
+if (pd.kind == 4) {
+hpf_complete(p, S, S.jE[j]);
+pd.kind = 0;
+return;
+}
+#endif
+if (pd.kind == 1) {
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(mf_da(p, S) + j * 16 + (ub >> 1)), "r"(1) : "memory");
+pd.kind = 0;
+return;
+}
+int* fc = wgs_cnt(p, PB) + pd.slot * 4 + wg;
+constexpr bool DF = (OKC_WGSDFIN >> (PB ? 1 : 0)) & 1;
+if constexpr (DF) {
+if (pd.kind == 2) {
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(fc), "r"(pd.nst) : "memory");
+pd.kind = 0;
+return;
+}
+if (wt == 0) { while (ld_acquire(fc) < 16 - pd.nst) __nanosleep(32); }
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+pd.kind = 0;
+} else {
+if (wt == 0) {
+int old;
+asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n" : "=r"(old) : "l"(fc), "r"(pd.nst) : "memory");
+S.wglast[wg] = old + pd.nst == 16;
+}
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+const bool last = S.wglast[wg];
+pd.kind = 0;
+if (!last) return;
+}
+asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+float* fb = wgs_fix(p, PB) + (size_t)(pd.slot * 4 + wg) * WGS_FIXW + wt * 4;
+const int ntt = (S.jC[j] + 7) >> 3, r16 = ub * 16 + wg * 4 + wp;
+for (int nt0 = 0; nt0 < ntt; nt0 += 2) {
+float4 v[2];
+#pragma unroll
+for (int k = 0; k < 2; ++k)
+if (nt0 + k < ntt) v[k] = __ldcg(reinterpret_cast<const float4*>(fb + (nt0 + k) * 512));
+#pragma unroll
+for (int k = 0; k < 2; ++k)
+if (nt0 + k < ntt) {
+*reinterpret_cast<float4*>(fb + (nt0 + k) * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+const float d4[4] = {v[k].x, v[k].y, v[k].z, v[k].w};
+wgs_epi_tile<PB>(p, S, j, r16, nt0 + k, d4);
+}
+}
+if (wt == 0) *fc = 0;
+#if OKC_MFIN
+if (PB) {
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+hpf_complete(p, S, S.jE[j]);
+}
+#endif
+if (!PB) {
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(mf_da(p, S) + j * 16 + (ub >> 1)), "r"(1) : "memory");
+}
+}
+struct WgsEpi { float c0, c1; int cnt, jst, jrow; };
+template <bool PB>
+__device__ __forceinline__ void wgs_epi_consts(const Params& p, const Smem& S, int j, int r16, WgsEpi& c) {
+const int g = (threadIdx.x & 31) >> 2, e = S.jE[j];
+c.cnt = S.jC[j]; c.jst = S.jS[j]; c.jrow = S.jrow[j];
+if (!PB) {
+c.c0 = p.gsA[e] * TWO62; c.c1 = 0.f;
+} else {
+const int n0 = r16 * 16 + g;
+const float gsc = p.gsB[e] * TWO62;
+c.c0 = (1.f + __bfloat162float(__ldg(p.normw + n0))) * gsc; c.c1 = (1.f + __bfloat162float(__ldg(p.normw + n0 + 8))) * gsc;
+}
+}
+template <bool PB>
+__device__ __forceinline__ void wgs_epi_tile_c(const Params& p, const WgsEpi& c, int r16, int nt, const float* d4) {
+const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+const int cnt = c.cnt;
+if (!PB) {
+const int col = r16 * 8 + g, ntt = (cnt + 7) >> 3;
+const float gsc = c.c0;
+__nv_bfloat16* xb = p.xB + (size_t)c.jrow * HD + (col & 7);
+#pragma unroll
+for (int h = 0; h < 2; ++h) {
+const int tk = nt * 8 + 2 * t + h;
+#if OKC_PADZ
+if (tk < cnt || HYB_PZ) {
+const float gt = d4[h] * gsc, up = d4[2 + h] * gsc;
+const float v = SILU_DIV(gt, 1.f + __expf(-gt)) * up;
+st_keep_bf16(xb + (size_t)((((col >> 8) * ntt + (tk >> 3)) * 32 + ((col & 255) >> 3)) * 64 + (tk & 7) * 8),
+__float2bfloat16(probe_q(tk < cnt ? v : 0.f)));
+}
+#else
+if (tk < cnt) {
+const float gt = d4[h] * gsc, up = d4[2 + h] * gsc;
+const float v = SILU_DIV(gt, 1.f + __expf(-gt)) * up;
+st_keep_bf16(xb + (size_t)((((col >> 8) * ntt + (tk >> 3)) * 32 + ((col & 255) >> 3)) * 64 + (tk & 7) * 8),
+__float2bfloat16(probe_q(v)));
+}
+#endif
+}
+} else {
+const int n0 = r16 * 16 + g, tok0 = nt * 8 + 2 * t;
+const float w0 = c.c0, w1 = c.c1;
+#pragma unroll
+for (int h = 0; h < 2; ++h) {
+const int tk = tok0 + h;
+if (tk < cnt) {
+st_keep_f32(p.ybuf + ((size_t)(c.jst + tk) * HD + n0), d4[h] * w0);
+st_keep_f32(p.ybuf + ((size_t)(c.jst + tk) * HD + n0 + 8), d4[2 + h] * w1);
+}
+}
+}
+}
+template <bool PB>
+__device__ __forceinline__ void wgs_flush_end(const Params& p, Smem& S, WgsPend& pd) {
+if (pd.kind == 0) return;
+const int tid = threadIdx.x, warp = WARP_IDX(tid), wg = warp >> 2, wp = warp & 3, wt = tid & 127;
+constexpr int UBL = PB ? 4 : 5;
+const int j = pd.u >> UBL, ub = pd.u & ((1 << UBL) - 1);
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+#if OKC_MFIN
+if (pd.kind == 4) {
+hpf_complete(p, S, S.jE[j]);
+pd.kind = 0;
+return;
+}
+#endif
+if (pd.kind == 1) {
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(mf_da(p, S) + j * 16 + (ub >> 1)), "r"(1) : "memory");
+pd.kind = 0;
+return;
+}
+int* fc = wgs_cnt(p, PB) + pd.slot * 4 + wg;
+constexpr bool DF = (OKC_WGSDFIN >> (PB ? 1 : 0)) & 1;
+if constexpr (DF) {
+if (pd.kind == 2) {
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(fc), "r"(pd.nst) : "memory");
+pd.kind = 0;
+return;
+}
+if (wt == 0) { while (ld_acquire(fc) < 16 - pd.nst) __nanosleep(32); }
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+pd.kind = 0;
+} else {
+if (wt == 0) {
+int old;
+asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n" : "=r"(old) : "l"(fc), "r"(pd.nst) : "memory");
+S.wglast[wg] = old + pd.nst == 16;
+}
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+const bool last = S.wglast[wg];
+pd.kind = 0;
+if (!last) return;
+}
+asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+float* fb = wgs_fix(p, PB) + (size_t)(pd.slot * 4 + wg) * WGS_FIXW + wt * 4;
+const int ntt = (S.jC[j] + 7) >> 3, r16 = ub * 16 + wg * 4 + wp;
+WgsEpi c;
+#pragma unroll 1
+for (int nt0 = 0; nt0 < ntt; nt0 += OKC_HYBFB) {
+float4 v[OKC_HYBFB];
+#pragma unroll
+for (int k = 0; k < OKC_HYBFB; ++k)
+if (nt0 + k < ntt) v[k] = __ldcg(reinterpret_cast<const float4*>(fb + (nt0 + k) * 512));
+if (nt0 == 0) wgs_epi_consts<PB>(p, S, j, r16, c);
+#pragma unroll
+for (int k = 0; k < OKC_HYBFB; ++k)
+if (nt0 + k < ntt) {
+*reinterpret_cast<float4*>(fb + (nt0 + k) * 512) = make_float4(0.f, 0.f, 0.f, 0.f);
+const float d4[4] = {v[k].x, v[k].y, v[k].z, v[k].w};
+wgs_epi_tile_c<PB>(p, c, r16, nt0 + k, d4);
+}
+}
+if (wt == 0) *fc = 0;
+#if OKC_MFIN
+if (PB) {
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+hpf_complete(p, S, S.jE[j]);
+}
+#endif
+if (!PB) {
+asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
+if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(mf_da(p, S) + j * 16 + (ub >> 1)), "r"(1) : "memory");
+}
+}
+template <bool PB, int NTT>
+__device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char* ring, int u, int s0, int s1, int slot,
+int& seq, WgsPend& pd) {
+const int tid = threadIdx.x, lane = tid & 31;
+const int warp = WARP_IDX(tid);
+const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, wt = tid & 127;
+constexpr int UBL = PB ? 4 : 5;
+// MOEX:SC6
+#if OKC_SC6
+const uint32_t k16c = 4u + p.zero;
+#else
+const uint32_t k16c = 16u + p.zero;
+#endif
+const uint32_t xring_s = smem_u32(ring + WGS_NS * UNIT_BYTES);
+float d[WGS_NT][4];
+constexpr int GS = OKC_WGSGS;
+uint32_t af[2][GS][4];
+int prev = -1;
+const uint64_t xd0 = wg_desc(xring_s, 128, 4096);
+const unsigned char* pc0 = ring + wg * WGS_PIECE;
+auto stage = [&](auto first) {
+constexpr bool FIRST = decltype(first)::value;
+const int ws = seq % WGS_NS, xs = seq % WGS_NX;
+wgs_wait(S.bars + BW_F + ws, (uint32_t)(seq / WGS_NS) & 1u, 3000000 + seq);
+const unsigned char* pc = pc0 + ws * UNIT_BYTES;
+wgs_wait(S.bars + BX_F + xs, (uint32_t)(seq / WGS_NX) & 1u, 4000000 + seq);
+const uint64_t xd = xd0 + (uint64_t)(uint32_t)(xs * (WGS_XS >> 4));
+uint4 cwn = *reinterpret_cast<const uint4*>(pc + (wp * 32 + lane) * 16);
+// MOEX:SC6 keell0renz scale-pair reconstruction
+#if OKC_SC6
+    // SC6: 768 B of scales per piece: plane W (uint32 per thread) | plane H (uint16 per thread); the 4 scale pairs of the stage
+    // (bytes of 4 v, see harness/make_sc6.py) are built here once and stay in registers for the 4 load groups
+    uint32_t sgs[4];
+    {
+      const int tt = wp * 32 + lane;
+      const uint32_t W = *reinterpret_cast<const uint32_t*>(pc + 8192 + tt * 4);
+      const uint32_t H = static_cast<uint32_t>(*reinterpret_cast<const unsigned short*>(pc + 8192 + 512 + tt * 2));
+      const uint32_t X = W & 0xFCFCFCFCu, Hm = H & 0xFCFCu;
+      const uint32_t p6 = (W & 0x00030303u) * 0x04104000u;
+      const uint32_t p7 = ((H & 0x0303u) | (W & 0x03000000u)) * 0x10400004u;
+      sgs[0] = __byte_perm(X, 0u, 0x4140u) * k16c + 0x60006000u;
+      sgs[1] = __byte_perm(X, 0u, 0x4342u) * k16c + 0x60006000u;
+      sgs[2] = __byte_perm(Hm, 0u, 0x4140u) * k16c + 0x60006000u;
+      sgs[3] = __byte_perm(p6, p7, 0x0703u) * k16c + 0x60006000u;
+    }
+#else
+    const uint2 scs = *reinterpret_cast<const uint2*>(pc + 8192 + (wp * 32 + lane) * 8);
+#endif
+#pragma unroll
+for (int lg = 0; lg < 4; ++lg) {
+const uint4 cwg = cwn;
+#if !OKC_SC6
+const uint2 scg = scs;
+#endif
+if (lg < 3) {
+cwn = *reinterpret_cast<const uint4*>(pc + (((lg + 1) * 4 + wp) * 32 + lane) * 16);
+} else if (lane == 0) {
+mbar_arrive1(S.bars + BW_E + ws);
+}
+#pragma unroll
+for (int h = 0; h < 4 / GS; ++h) {
+const int ci = lg * (4 / GS) + h;
+#pragma unroll
+for (int jj = 0; jj < GS; ++jj) {
+const int js = h * GS + jj;
+const uint32_t q = js == 0 ? cwg.x : js == 1 ? cwg.y : js == 2 ? cwg.z : cwg.w;
+uint32_t r0, r1, r2, r3;
+dq4(q, r0, r1, r2, r3);
+// MOEX:SC6
+#if OKC_SC6
+const uint32_t sgp = sgs[js];
+#else
+const uint32_t sw = js < 2 ? scg.x : scg.y, sb = (uint32_t)(js & 1) * 2u;
+const uint32_t sgp = __byte_perm(sw, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16c + 0x5C005C00u;
+#endif
+af[ci & 1][jj][0] = bmul2l(r0, sgp); af[ci & 1][jj][1] = bmul2h(r1, sgp);
+af[ci & 1][jj][2] = bmul2l(r2, sgp); af[ci & 1][jj][3] = bmul2h(r3, sgp);
+}
+wg_fence();
+#pragma unroll
+for (int jj = 0; jj < GS; ++jj) {
+if (FIRST && ci == 0 && jj == 0)
+WGSMMA<NTT>::mma0(d, af[0][0][0], af[0][0][1], af[0][0][2], af[0][0][3], xd);
+else
+WGSMMA<NTT>::mma(d, af[ci & 1][jj][0], af[ci & 1][jj][1], af[ci & 1][jj][2], af[ci & 1][jj][3],
+xd + (uint64_t)((lg * 4 + h * GS + jj) * 16));
+}
+wg_commit();
+wg_wait<1>();
+if (ci == 0) {
+if (prev >= 0) {
+if (lane == 0) mbar_arrive1(S.bars + BX_E + prev);
+prev = -1;
+}
+}
+if (FIRST && ci == OKC_WGSFCI && pd.kind) wgs_flush<PB>(p, S, pd);
+}
+}
+prev = xs;
+++seq;
+};
+#if OKC_HYBST & 1
+if (slot < 0) {
+const int je = S.jE[u >> UBL];
+asm volatile("prefetch.global.L1 [%0];\n" ::"l"((PB ? p.gsB : p.gsA) + je));
+if (PB) asm volatile("prefetch.global.L1 [%0];\n" ::"l"(p.normw + ((u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp) * 16 + g));
+}
+#endif
+stage(std::true_type{});
+#pragma unroll 1
+for (int st = s0 + 1; st < s1; ++st) stage(std::false_type{});
+wg_wait<0>();
+if (lane == 0) mbar_arrive1(S.bars + BX_E + prev);
+if (OKC_WGSX & 8) { if (d[0][0] == 1234.5f) S.wglast[0] = 7; return; }
+if (slot >= 0) {
+float* fb = wgs_fix(p, PB) + (size_t)(slot * 4 + wg) * WGS_FIXW + wt * 4;
+#pragma unroll
+for (int nt = 0; nt < NTT; ++nt)
+asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"(fb + nt * 512), "f"(d[nt][0]), "f"(d[nt][1]),
+"f"(d[nt][2]), "f"(d[nt][3]) : "memory");
+pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (PB ? s0 == 0 : s1 == 16)) ? 3 : 2, u, slot, s1 - s0};
+return;
+}
+const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
+#if OKC_HYBST & 1
+{
+WgsEpi ec;
+wgs_epi_consts<PB>(p, S, j, r16, ec);
+#pragma unroll
+for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile_c<PB>(p, ec, r16, nt, d[nt]);
+}
+#else
+#pragma unroll
+for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile<PB>(p, S, j, r16, nt, d[nt]);
+#endif
+if (!PB) pd = WgsPend{1, u, -1, 0};
+#if OKC_MFIN
+else pd = WgsPend{4, u, (int)(mf_gen(S) * 32 + S.jE[j]), 0};
+#endif
+}
+template <bool PB>
+__device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned char* ring, int g0, int g1, int& seq) {
+constexpr int UBL = PB ? 4 : 5;
+WgsPend pd{0, 0, 0, 0};
+#pragma unroll 1
+for (int gs = wgs_split(PB, g0, g1), ge = g1;;) {
+if (gs >= ge) {
+const int a0 = S.wgr[2 * PB], a1 = S.wgr[2 * PB + 1], sp = wgs_split(PB, a0, a1);
+if (ge == a1 && sp > a0) { gs = a0; ge = sp; } else break;
+}
+const int u = gs >> 4, s0 = gs & 15, s1 = min(16, s0 + (ge - gs));
+const int slot = (s1 - s0 == 16) ? -1 : (s0 == 0 ? (int)blockIdx.x : wgs_cta_of(S, PB, u << 4, gridDim.x));
+const int ntt = (S.jC[u >> UBL] + 7) >> 3;
+switch (ntt) {
+case 1: wgs_seg<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 2: wgs_seg<PB, 2>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 3: wgs_seg<PB, 3>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 4: wgs_seg<PB, 4>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 5: wgs_seg<PB, 5>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 6: wgs_seg<PB, 6>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+case 7: wgs_seg<PB, 7>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+default: wgs_seg<PB, 8>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+}
+gs += s1 - s0;
+}
+#if OKC_HYBST & 2
+if constexpr (PB) wgs_flush_end<PB>(p, S, pd);
+else wgs_flush<PB>(p, S, pd);
+#else
+wgs_flush<PB>(p, S, pd);
+#endif
+}
+// MOEX:PLAN
+#if OKC_PLAN
+#define OKC_WGSU 160   // cepi: per-unit cost, phase A (zhebrak SK_CEPI)
+#define OKC_WGSUB 140  // cepi: per-unit cost, phase B
+__device__ __forceinline__ int wgs_unitc(int pb) { return pb ? OKC_WGSUB : OKC_WGSU; }
+__device__ __forceinline__ void wgs_prefix(Smem& S, int nj) {
+  uint32_t acc = 0, accB = 0;
+  for (int j = 0; j < nj; ++j) {
+    S.wcp[j] = (int)acc; S.wcpB[j] = (int)accB;
+    acc += ((uint32_t)wgs_cost(0, S.jC[j]) * 16u + OKC_WGSU) << 5;  // cepi: 32 units x (16 stages + unit cost)
+    accB += ((uint32_t)wgs_cost(1, S.jC[j]) * 16u + OKC_WGSUB) << 4;
+  }
+  S.wcp[nj] = (int)acc; S.wcpB[nj] = (int)accB;
+  S.wtot = acc; S.wtotB = accB;
+}
+// stage at cost position x (phase pb), the stage whose cost interval holds x
+__device__ __forceinline__ int wgs_stage_at(const Smem& S, int nj, int pb, uint32_t x) {
+  const int* pre = pb ? S.wcpB : S.wcp;
+  int lo = 0, hi = nj;  // job: last j with prefix(j) <= x
+  while (hi - lo > 1) { const int mid = (lo + hi) >> 1; if ((uint32_t)pre[mid] <= x) lo = mid; else hi = mid; }
+  const uint32_t cs = (uint32_t)wgs_cost(pb, S.jC[lo]), U = (uint32_t)wgs_unitc(pb), cu = 16u * cs + U;
+  const uint32_t r = x - (uint32_t)pre[lo], un = r / cu, rem = r - un * cu;
+  const uint32_t st = rem < U ? 0u : min(15u, (rem - U) / cs);  // cepi: the unit cost sits before its stage 0
+  return (lo << (9 - pb)) + (int)(un * 16u + st);
+}
+__device__ __forceinline__ void wgs_range(const Smem& S, int nj, int pb, int c, int G, int& g0, int& g1) {
+  const uint32_t tot = pb ? S.wtotB : S.wtot;
+  g0 = wgs_stage_at(S, nj, pb, tot * (uint32_t)c / (uint32_t)G);
+  g1 = c == G - 1 ? (nj << (9 - pb)) : wgs_stage_at(S, nj, pb, tot * (uint32_t)(c + 1) / (uint32_t)G);
+}
+// this CTA's stage ranges (stream-K over 256-row units x 16 stages), one thread: the producers stream the same
+// this CTA's stage ranges, warp-parallel (all 32 lanes of the x-producer warp; bs256-hot E457): the job-cost prefix as a
+// shuffle scan over 32-job chunks, then the four stage_at searches on lanes 0..3 (lane = 2 pb + k). The serial one-lane version
+// was the prologue's critical path (~1500 instructions before the weight stream can start)
+__device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
+  const int lane = threadIdx.x & 31;
+  const int nj = S.njF + S.njS;
+  const int G = gridDim.x, c = blockIdx.x;
+  if (nj == 0) { if (lane < 4) S.wgr[lane] = 0; __syncwarp(); return; }
+  uint32_t carryA = 0, carryB = 0;
+  for (int j0 = 0; j0 < nj; j0 += 32) {
+    const int j = j0 + lane;
+    uint32_t ia = 0, ib = 0;
+    if (j < nj) {
+      ia = ((uint32_t)wgs_cost(0, S.jC[j]) * 16u + OKC_WGSU) << 5;
+      ib = ((uint32_t)wgs_cost(1, S.jC[j]) * 16u + OKC_WGSUB) << 4;
+    }
+    uint32_t sa = ia, sb = ib;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const uint32_t va = __shfl_up_sync(0xffffffffu, sa, d), vb = __shfl_up_sync(0xffffffffu, sb, d);
+      if (lane >= d) { sa += va; sb += vb; }
+    }
+    if (j < nj) { S.wcp[j] = (int)(carryA + sa - ia); S.wcpB[j] = (int)(carryB + sb - ib); }
+    carryA += __shfl_sync(0xffffffffu, sa, 31);
+    carryB += __shfl_sync(0xffffffffu, sb, 31);
+  }
+  if (lane == 0) { S.wcp[nj] = (int)carryA; S.wcpB[nj] = (int)carryB; S.wtot = carryA; S.wtotB = carryB; }
+  __syncwarp();
+  const int l4 = lane & 3, pbl = l4 >> 1, kk = l4 & 1;
+  const uint32_t tot = pbl ? carryB : carryA;
+  int res;
+  if (kk == 1 && c == G - 1) res = nj << (9 - pbl);
+  else res = wgs_stage_at(S, nj, pbl, tot * (uint32_t)(c + kk) / (uint32_t)G);
+  if (lane < 4) S.wgr[lane] = res;
+  __syncwarp();
+}
+// the CTA whose range holds stage s (the fixup slot of a split unit is the CTA holding its first stage)
+__device__ __forceinline__ int wgs_cta_of(const Smem& S, int pb, int s, int G) {
+  const uint32_t tot = pb ? S.wtotB : S.wtot;
+  const int j = s >> (9 - pb);
+  const uint32_t sj = (uint32_t)(s & ((1 << (9 - pb)) - 1)), cs = (uint32_t)wgs_cost(pb, S.jC[j]), U = (uint32_t)wgs_unitc(pb);
+  const uint32_t xe = (uint32_t)(pb ? S.wcpB : S.wcp)[j] + (sj >> 4) * (16u * cs + U) + U + ((sj & 15u) + 1u) * cs;  // cepi
+  // largest c with floor(tot * c / G) < xe
+  int c = (int)(((xe - 1) * (unsigned long long)G) / tot);
+  if (c > G - 1) c = G - 1;
+  while (c + 1 < G && tot * (uint32_t)(c + 1) / (uint32_t)G < xe) ++c;
+  while (c > 0 && tot * (uint32_t)c / (uint32_t)G >= xe) --c;
+  return c;
+}
+#else
+__device__ __forceinline__ void wgs_prefix(Smem& S, int nj) {
+uint32_t acc = 0, accB = 0;
+for (int j = 0; j < nj; ++j) {
+S.wcp[j] = (int)acc; S.wcpB[j] = (int)accB;
+acc += (uint32_t)wgs_cost(0, S.jC[j]) << 9;
+accB += (uint32_t)wgs_cost(1, S.jC[j]) << 8;
+}
+S.wcp[nj] = (int)acc; S.wcpB[nj] = (int)accB;
+S.wtot = acc; S.wtotB = accB;
+}
+__device__ __forceinline__ int wgs_stage_at(const Smem& S, int nj, int pb, uint32_t x) {
+const int* pre = pb ? S.wcpB : S.wcp;
+int lo = 0, hi = nj;
+while (hi - lo > 1) { const int mid = (lo + hi) >> 1; if ((uint32_t)pre[mid] <= x) lo = mid; else hi = mid; }
+const uint32_t cs = (uint32_t)wgs_cost(pb, S.jC[lo]);
+return (lo << (9 - pb)) + (int)((x - (uint32_t)pre[lo]) / cs);
+}
+__device__ __forceinline__ void wgs_range(const Smem& S, int nj, int pb, int c, int G, int& g0, int& g1) {
+const uint32_t tot = pb ? S.wtotB : S.wtot;
+g0 = wgs_stage_at(S, nj, pb, tot * (uint32_t)c / (uint32_t)G);
+g1 = c == G - 1 ? (nj << (9 - pb)) : wgs_stage_at(S, nj, pb, tot * (uint32_t)(c + 1) / (uint32_t)G);
+}
+__device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
+const int nj = S.njF + S.njS;
+#if OKC_MFIN
+if (nj == 0) { for (int k = 0; k < 4; ++k) S.wgr[k] = 0; return; }
+#endif
+wgs_prefix(S, nj);
+wgs_range(S, nj, 0, blockIdx.x, gridDim.x, S.wgr[0], S.wgr[1]);
+wgs_range(S, nj, 1, blockIdx.x, gridDim.x, S.wgr[2], S.wgr[3]);
+}
+__device__ __forceinline__ int wgs_cta_of(const Smem& S, int pb, int s, int G) {
+const uint32_t tot = pb ? S.wtotB : S.wtot;
+const int j = s >> (9 - pb);
+const uint32_t xe = (uint32_t)(pb ? S.wcpB : S.wcp)[j] + (uint32_t)((s & ((1 << (9 - pb)) - 1)) + 1) * (uint32_t)wgs_cost(pb, S.jC[j]);
+int c = (int)(((xe - 1) * (unsigned long long)G) / tot);
+if (c > G - 1) c = G - 1;
+while (c + 1 < G && tot * (uint32_t)(c + 1) / (uint32_t)G < xe) ++c;
+while (c > 0 && tot * (uint32_t)c / (uint32_t)G >= xe) --c;
+return c;
+}
+#endif
+__device__ __forceinline__ float* ss_cur() {
+unsigned long long v;
+asm volatile("ld.volatile.shared.u64 %0, [%1];\n" : "=l"(v) : "r"(smem_u32(&reinterpret_cast<const Smem*>(smem_raw)->ssp)));
+return reinterpret_cast<float*>(v);
+}
+template <bool BIG>
+__global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
+Smem& S = *reinterpret_cast<Smem*>(smem_raw);
+__nv_bfloat16* xbuf = reinterpret_cast<__nv_bfloat16*>(smem_raw + ((sizeof(Smem) + 127) / 128) * 128);
+const int tid = threadIdx.x;
+DBG(0);
+asm volatile("griddepcontrol.wait;\n" ::: "memory");
+if (tid >= NT) {
+if (tid < NT + 32) wgs_wproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
+else wgs_xproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
+return;
+}
+for (int li = blockIdx.x * NT + tid; li < p.M * (HD * 2 / 128); li += gridDim.x * NT)
+asm volatile("prefetch.global.L2 [%0];\n" ::"l"(reinterpret_cast<const char*>(p.x) + (size_t)li * 128));
+for (int i = tid; i < (OKC_PRMTSC ? 0 : 256); i += NT) {
+const int sgn = i >> 7, ex = (i >> 3) & 15, mt = i & 7;
+uint32_t b;
+if (ex == 15 && mt == 7) {
+b = 0xFFFFu;
+} else {
+float v = ex == 0 ? (float)mt * 0x1p-9f : (1.f + (float)mt * 0.125f) * __int_as_float((ex - 7 + 127) << 23);
+v *= 0x1p64f;
+b = __float_as_uint(sgn ? -v : v) >> 16;
+}
+S.lut[i] = b | (b << 16);
+}
+if (tid == 0) {
+for (int k = 0; k < BX_E + WGS_NX; ++k) mbar_init(S.bars + k, k < BW_E ? 1 : k < BX_F ? NW : k < BX_E ? 1 : NW);
+asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+S.preissued = 0;
+S.seq = 0;
+S.fseq = 0;
+S.preissuedB = 0;
+S.xbuf_ptr = xbuf;
+// MOEX:MFIN
+#if OKC_MFIN
+const int gen = atomicInc(reinterpret_cast<unsigned*>(p.mfl + MF_EXIT), 2u * gridDim.x - 1u) >= gridDim.x ? 1 : 0;
+#else
+const int gen = *reinterpret_cast<volatile const int*>(p.ctr + 3);
+#endif
+S.gen = gen;
+S.ssp = (gen & 1) ? p.ss1 : p.ss;
+}
+for (int i = tid; i < JMAX; i += NT) S.dync[i] = 0;
+route(p, S);
+// HPF zero-local tokens have no completion owner; their prologue owner writes 0.
+for (int tk = blockIdx.x; tk < p.M; tk += gridDim.x) {
+ int n = 0;
+ #pragma unroll
+ for (int sl = 0; sl < 8; ++sl) n += S.pos[tk * 8 + sl] >= 0;
+ if (n == 0) {
+  for (int c = tid; c < HD; c += NT) p.out[(size_t)tk * HD + c] = __float2bfloat16(0.f);
+ }
+}
+__threadfence_block();
+asm volatile("bar.arrive 7, %0;\n" ::"n"(NT + 32) : "memory");
+DBG(1);
+// MOEX:MFIN
+#if OKC_MFIN
+  {  // the other parity's counters and hand-off flags belong to the next launch (the previous launch is over): zero them
+    const int o = 1 - S.gen;
+    for (int i = blockIdx.x * NT + tid; i < 32 + MF_XRS + JMAX * 16; i += gridDim.x * NT) {
+      if (i < 32) p.mfl[MF_CE + o * 32 + i] = 0;
+      else if (i < 32 + MF_XRS) p.mfl[MF_XR + o * MF_XRS + (i - 32)] = 0;
+      else p.mfl[MF_DA + o * (JMAX * 16) + (i - 32 - MF_XRS)] = 0;
+    }
+  }
+#else
+{
+float* other = (S.gen & 1) ? p.ss : p.ss1;
+for (int i = blockIdx.x * NT + tid; i < EMAX; i += gridDim.x * NT) other[i] = 0.f;
+if (blockIdx.x == 0 && tid == 0) p.ctr[4 + ((S.gen + 1) & 1)] = 0;
+}
+#endif
+if (tid < 32) {
+const int nj = S.njF + S.njS;
+int carry = 0;
+for (int j0 = 0; j0 < nj; j0 += 32) {
+const int j = j0 + tid;
+const int v = j < nj ? (((S.jC[j] + 7) >> 3) << 3) : 0;
+int incl = v;
+#pragma unroll
+for (int d = 1; d < 32; d <<= 1) { const int t = __shfl_up_sync(0xffffffffu, incl, d); if (tid >= d) incl += t; }
+if (j < nj) S.jrow[j] = carry + incl - v;
+carry += __shfl_sync(0xffffffffu, incl, 31);
+}
+if (tid == 0) S.jrow[nj] = carry;
+}
+CTA_SYNC();
+wgs_gather(p, S);
+DBG(7);
+WS_JOIN();
+DBG(6);
+{
+unsigned char* ring = reinterpret_cast<unsigned char*>(xbuf);
+int seq = 0;
+wgs_phase<false>(p, S, ring, S.wgr[0], S.wgr[1], seq);
+DBG(2);
+wgs_phase<true>(p, S, ring, S.wgr[2], S.wgr[3], seq);
+DBG(3);
+}
+asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+// MOEX:MFIN
+#if OKC_MFIN
+#else
+CTA_SYNC();
+if (tid == 0) {
+int* bc = p.ctr + 4 + (S.gen & 1);
+__threadfence();
+const int old = atomicAdd(bc, 1);
+if (old == (int)gridDim.x - 1) atomicAdd(p.ctr + 3, 1);
+while (ld_acquire(bc) < (int)gridDim.x) __nanosleep(64);
+}
+CTA_SYNC();
+DBG(4);
+{
+const int G = gridDim.x, i0 = blockIdx.x * NT + tid;
+if (i0 < 2) p.ctr[i0] = 0;
+for (int i = i0; i < JMAX; i += G * NT) p.doneA[i] = 0;
+for (int i = i0; i < JMAX; i += G * NT) p.xready[i] = 0;
+for (int i = i0; i < JMAX * 16; i += G * NT) p.doneAs[i] = 0;
+}
+#endif
+// HPF: all nonempty outputs were finalized at expert completion.
+DBG(5);
+}
+}
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+static size_t okc_smem_bytes() {
+size_t base = ((sizeof(okc::Smem) + 127) / 128) * 128;
+return base + (size_t)okc::WGS_NS * okc::UNIT_BYTES + (size_t)okc::WGS_NX * okc::WGS_XS;
+size_t xa = (size_t)OKC_NS * okc::UNIT_BYTES + (OKC_SKT > 8 ? (size_t)okc::NW * 8 * okc::X1P * 2 : 0);
+size_t xb = (size_t)okc::NSF * okc::UNIT_BYTES + 2 * (size_t)okc::FT_T * okc::XP_FT * 2;
+return base + (xa > xb ? xa : xb);
+}
+static int g_okc_pdl = 0;
+void okc_set_pdl(int64_t on) { g_okc_pdl = on ? 1 : 0; }
+void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
+torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid) {
+okc::Params p;
+p.wA = (const uint4*)w[0].data_ptr(); p.sA = (const uint4*)w[1].data_ptr(); p.gsA = (const float*)w[2].data_ptr();
+p.wB = (const uint4*)w[3].data_ptr(); p.sB = (const uint4*)w[4].data_ptr(); p.gsB = (const float*)w[5].data_ptr();
+p.lut = (const uint32_t*)w[6].data_ptr(); p.normw = (const __nv_bfloat16*)w[7].data_ptr();
+p.wAf = (const unsigned char*)w[8].data_ptr(); p.wBf = (const unsigned char*)w[9].data_ptr();
+p.wAu = (const unsigned char*)w[10].data_ptr(); p.wBu = (const unsigned char*)w[11].data_ptr();
+if (w.size() > 13) { p.wAn = (const unsigned char*)w[12].data_ptr(); p.wBn = (const unsigned char*)w[13].data_ptr(); }
+else { p.wAn = p.wAf; p.wBn = p.wBf; }
+TORCH_CHECK(w.size() > 13, "OKC_WGS needs the WGS weight copies (w[12], w[13])");
+TORCH_CHECK((size_t)scratch[1].numel() >= (size_t)okc::EMAX + (size_t)okc::EMAX * okc::HD + okc::WGS_FIXF,
+"OKC_WGS needs the stream-K fixup area after ybuf (scratch[1])");
+p.wAs = (const unsigned char*)w[12].data_ptr(); p.wBs = (const unsigned char*)w[13].data_ptr();
+p.zero = 0;
+p.x = (const __nv_bfloat16*)x.data_ptr(); p.topk_ids = (const int*)ids.data_ptr(); p.topk_w = (const float*)tw.data_ptr();
+p.M = (int)x.size(0); p.lo = (int)lo; p.nloc = (int)nloc;
+TORCH_CHECK(((uintptr_t)ids.data_ptr() & 15) == 0 && ids.is_contiguous(), "topk_ids must be 16 B aligned and contiguous");
+int* ib = (int*)scratch[0].data_ptr();
+p.ctr = ib; p.doneA = ib + 8;
+p.ss = (float*)scratch[1].data_ptr();
+TORCH_CHECK(scratch[0].numel() >= 8 + 1024 + okc::EMAX, "scratch[0] needs the second ss copy");
+p.ss1 = reinterpret_cast<float*>(ib + 8 + 1024);
+#if OKC_MFIN
+TORCH_CHECK(scratch[0].numel() >= 8 + 1024 + okc::EMAX + okc::MF_INTS, "MOEX MFIN flags");
+p.mfl = ib + 8 + 1024 + okc::EMAX;
+#endif
+p.ybuf = p.ss + okc::EMAX;
+p.sspart = nullptr;
+p.inter = (__nv_bfloat16*)scratch[2].data_ptr();
+TORCH_CHECK((size_t)scratch[2].numel() >= ((size_t)okc::EMAX + 2 * (size_t)okc::WGS_XROWS) * okc::HD,
+"OKC_WGS needs xA / xB after inter (scratch[2])");
+p.xA = p.inter + (size_t)okc::EMAX * okc::HD;
+p.xB = p.xA + (size_t)okc::WGS_XROWS * okc::HD;
+p.xready = ib + 8 + 512;
+p.doneAs = reinterpret_cast<int*>(p.ybuf + (size_t)okc::EMAX * okc::HD + (size_t)2 * okc::WGS_SLOTS * 4 * okc::WGS_FIXW) + 2 * okc::WGS_SLOTS * 4;
+#if OKC_MFIN
+p.xready = p.mfl + okc::MF_XR;
+p.doneAs = p.mfl + okc::MF_DA;
+#endif
+p.out = (__nv_bfloat16*)out.data_ptr();
+static_assert(OKC_MFIN && OKC_SC6 && OKC_PLAN, "HPF requires smp");
+TORCH_CHECK((p.M == 128 || p.M == 256) && scratch.size() == 5, "HPF shape/scratch");
+TORCH_CHECK(scratch[3].scalar_type() == torch::kFloat32 && scratch[3].numel() >= okc::MMAX * okc::HD, "HPF accumulator");
+TORCH_CHECK(scratch[4].scalar_type() == torch::kInt32 && scratch[4].numel() >= okc::MMAX, "HPF token counters");
+p.hacc = (float*)scratch[3].data_ptr();
+p.htok = (int*)scratch[4].data_ptr();
+p.dbg = nullptr;
+#if OKC_PADZ == 2
+p.pzr = scratch.size() > 4 ? 1 : 0;
+#endif
+static bool attr = false;
+size_t sm = okc_smem_bytes();
+if (!attr) {
+cudaError_t e0 = cudaFuncSetAttribute(okc::moe_fused<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+cudaError_t e1 = cudaFuncSetAttribute(okc::moe_fused<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+(void)e0; (void)e1;
+attr = true;
+}
+cudaStream_t st = at::cuda::getCurrentCUDAStream();
+if (g_okc_pdl) {
+cudaLaunchConfig_t cfg = {};
+cfg.gridDim = dim3((unsigned)grid);
+cfg.blockDim = dim3(okc::NTL);
+cfg.dynamicSmemBytes = sm;
+cfg.stream = st;
+cudaLaunchAttribute at[1];
+at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+at[0].val.programmaticStreamSerializationAllowed = 1;
+cfg.attrs = at;
+cfg.numAttrs = 1;
+if (p.M >= OKC_BIGM) cudaLaunchKernelEx(&cfg, okc::moe_fused<true>, p);
+else cudaLaunchKernelEx(&cfg, okc::moe_fused<false>, p);
+return;
+}
+if (p.M >= OKC_BIGM) okc::moe_fused<true><<<(int)grid, okc::NTL, sm, st>>>(p);
+else okc::moe_fused<false><<<(int)grid, okc::NTL, sm, st>>>(p);
+}
+"""
+# HPF is read at call/capture time. Set MOEXR=True for smp controls.
 HPF = False
-_HPF = {"ok": False, "reason": 'HPF dropped: progressive FP32 accumulation increases finalize traffic; T256 mod7 already retains its first-pass ybuf loads. The standing byte-growth rule prohibits this arm.'}
+_HPF = {t: dict(_HYB, mod=None, mod7=None, ok=False, sc=None, full=None,
+               attempted=False, checks=[], err=None, pdl=-1, pdl7=-1) for t in (128,256)}
+def _hpf_flags(t):
+ return list(HYB_FLAGS)+(list(HYB_F7)if t==256 else[])+['-DOKC_SC6=1','-DOKC_MFIN=1','-DOKC_PLAN=1','-DOKC_HPF=1']
+def _hpf_build(t,H):
+ if H['attempted']:
+  return
+ from torch.utils.cpp_extension import load_inline
+ H['attempted']=True
+ try:
+  fl=_hpf_flags(t)
+  tag=hashlib.sha1((_HYB_MOE_CPP+_HPF_CUDA+' '.join(fl)).encode()).hexdigest()[:12]
+  start=time.time()
+  H['mod']=load_inline(name=f'hyb_hpf_{tag}',cpp_sources=_HYB_MOE_CPP,cuda_sources=_HPF_CUDA,
+   functions=['okc_run','okc_set_pdl'],extra_cuda_cflags=fl,verbose=False)
+  H['build_s']=time.time()-start
+ except Exception as ex:
+  H['mod']=None
+  H['err']=repr(ex)[:500]
+def _hpf_scratch(dev):
+ sc,full=_moexr_scratch(dev,True)
+ for n,dt in ((_HYB_MMAX*4096,torch.float32),(_HYB_MMAX,torch.int32)):
+  f=torch.zeros(n+_HYB_GUARD,dtype=dt,device=dev)
+  f[n:].view(torch.int32).fill_(0x5EADBEEF)
+  sc.append(f[:n])
+  full.append((f,n,torch.int32,0x5EADBEEF))
+ return sc,full
+def _hpf_cases(t,dev):
+ for name in ('normal','skewed','conc69','eight_local','none','one'):
+  d=_k2a_self_test_inputs(t,8461+t,dev,name if name in ('normal','skewed')else 'normal')
+  if name not in ('normal','skewed'):
+   rows=[]
+   for tk in range(t):
+    rows.append(list(range(8))if name=='eight_local'else
+      ([0]+[-1]*7 if name=='one' or(name=='conc69' and tk<69)else [-1]*8))
+   d['topk_ids']=torch.tensor(rows,dtype=torch.int32,device=dev)
+  yield name,{'hidden_states':d['hidden_states'].contiguous(),'topk_ids':d['topk_ids'].to(torch.int32).contiguous(),
+   'topk_weights':d['topk_weights'].float().contiguous(),'config':{'local_start':0,'local_count':K2A_E_LOC}}
+def _hpf_clean(H):
+ return (_moexr_guards(H) and int(H['sc'][0][8+1024+_HYB_EMAX+65])==0
+  and bool((H['sc'][3]==0).all()) and bool((H['sc'][4]==0).all()))
+def _hpf_compare(a,b,ref,ship,ship2,control):
+ tot,row=_k2a_rel_err(a,ref)
+ ev,er=_k2a_rel_err(a,ship)
+ rp,_=_k2a_rel_err(b,a)
+ sr,_=_k2a_rel_err(ship2,ship)
+ ce,cr=_k2a_rel_err(a,control)
+ finite=bool(torch.isfinite(a.float()).all() and torch.isfinite(b.float()).all())
+ ok=finite and tot<1e-2 and row<5e-2 and ev<2e-3 and er<1e-2 and ce<2e-3 and cr<1e-2 and rp<1e-3
+ return dict(ok=bool(ok),fp32=tot,row=row,ship=ev,ship_row=er,smp=ce,smp_row=cr,repeat=rp,ship_repeat=sr,finite=finite)
+def _hpf_prepare(st,w,dev):
+ # Accessor at the hook is copied verbatim from MOEXR / padz. st is the real inner state.
+ for t,H in _HPF.items():
+  H['ok']=False
+  H['checks']=[]
+  if not HYB_ENABLE or not _HYB['ok'] or not _MOEXR_SHIP['ok']:
+   H['err']='smp / ship control unavailable'
+   continue
+  try:
+   _hpf_build(t,H)
+   if H['mod'] is None:
+    continue
+   H['w'],H['nsm']=_HYB['w'],_HYB['nsm']
+   H['sc'],H['full']=_hpf_scratch(dev)
+   good=True
+   for name,d in _hpf_cases(t,dev):
+    x,ids,tw=d['hidden_states'],d['topk_ids'],d['topk_weights']
+    ref=_k2a_ref_fp32(d,w)
+    ship=_moexr_call_bank(_MOEXR_SHIP,x,ids,tw).clone()
+    ship2=_moexr_call_bank(_MOEXR_SHIP,x,ids,tw).clone()
+    control=_moexr_call_bank(_HYB,x,ids,tw).clone()
+    a=_moexr_call_bank(H,x,ids,tw).clone()
+    b=_moexr_call_bank(H,x,ids,tw).clone()
+    torch.cuda.synchronize()
+    row=_hpf_compare(a,b,ref,ship,ship2,control)
+    row.update(case=name,graph=False,clean=bool(_hpf_clean(H)))
+    good &= row['ok'] and row['clean']
+    H['checks'].append(row)
+    # Capture exercises the same bank/launch body; eight launches cover both
+    # MFIN parities repeatedly, without host resets between graph replays.
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+     gout=_moexr_call_bank(H,x,ids,tw)
+    for replay in range(8):
+     graph.replay()
+     torch.cuda.synchronize()
+     grow=_hpf_compare(gout,a,ref,ship,ship2,control)
+     grow.update(case=name,graph=True,replay=replay,clean=bool(_hpf_clean(H)))
+     H['checks'].append(grow)
+     good &= grow['ok'] and grow['clean']
+   H['ok']=bool(good)
+   if not H['ok']:
+    H['err']='HPF numerical / graph / scratch gate failed'
+   else:
+    H['err']=None
+  except Exception as ex:
+   H['ok']=False
+   H['err']=repr(ex)[:500]
+  print(f"[hpf] T={t} {'LIVE' if H['ok'] else 'OFF'} {H['err']} checks={len(H['checks'])}",flush=True)
+def _hpf_bank(m):
+ if HPF and MOEXR and m in _HPF:
+  H=_HPF[m]
+  if not H['ok']:
+   raise RuntimeError(f"HPF T={m} disabled: {H['err']}")
+  return H
+ return _moexr_bank()
+
 def _moexr_bank():
- if HPF:
-  raise RuntimeError(_HPF["reason"])
  return _HYB if MOEXR else _MOEXR_SHIP
 def _moexr_call_bank(H,x,ids,wts):
  m=x.shape[0]
@@ -6668,9 +8260,9 @@ def _hyb_scratch(dev):
 def _hyb_guards_ok():
  return all(bool((f[n:].view(vt)==sv).all())for f,n,vt,sv in _HYB["full"])
 def _hyb_call(x,ids,wts):
- return _moexr_call_bank(_moexr_bank(),x,ids,wts)
+ return _moexr_call_bank(_hpf_bank(x.shape[0]),x,ids,wts)
 def _hyb_on(m):
- H=_moexr_bank()
+ H=_hpf_bank(m)
  return HYB_ENABLE and H is not None and H["ok"]and HYB_T[0]<=m<=HYB_T[1]
 """[HYBLO] R-hyblo-1 lab (tools/hyblo_patches.py): alygg77's small-M MoE builds (MOE_TINY M <= 4, MOE_TINY2 M <= 8, MOE_MID
 M <= 16 of their _MA_ALT_SRCS["moe_helper0"]; Apache-2.0, _HYBLO_NOTICE), routed ahead of VMS at
@@ -10582,6 +12174,7 @@ def prepare(weights):
  _rq_prepare(state)
  if state.get("k2a33")is not None:
   _moexr_ship_prepare(state["k2a33"]["st"],{k:weights[k]for k in("w13","w13_sf","w13_gs","w2","w2_sf","w2_gs")}|{"post_norm_w":weights["post_expert_norm"]},weights["w13"].device)
+  _hpf_prepare(state["k2a33"]["st"],{k:weights[k]for k in("w13","w13_sf","w13_gs","w2","w2_sf","w2_gs")}|{"post_norm_w":weights["post_expert_norm"]},weights["w13"].device)
  builds=" ".join(f"{k}={v:.0f}s" for k,v in _K3_BUILD_S.items())or "none"
  print(f"[k3] attention={'HYA' if state.get('hya') else 'r1-FA3'} experts={'K2A v3.3' if state.get('k2a33') is not None else 'K2A v3.1' if state.get('k2a31') is not None else 'K2A v3' if state.get('k2a3') is not None else ('K2A' if state['k2a'] is not None else 'r1-Marlin')}"
  f" (USE_K2A={USE_K2A}); nvcc {builds};"
