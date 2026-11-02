@@ -121,6 +121,9 @@ def main():
             for v in VARIANTS:
                 arms.append((f"{v}_n{n}", n, v))
         graphs = {}
+        # cudaFuncSetAttribute (dynamic smem) happens inside info(); the F3 benchmark calls it for every arm before launching
+        for key in (("null", 8, NS), ("null", 16, NS), ("ms", 8, NS), ("ms", 16, NS), ("ms_twin", 16, NS)):
+            mod.info(mc.ARM_ID[key[0]], key[1], key[2])
         for name, n, v in arms:
             key = ("null", n, NS) if v == "null" else (("ms_twin", 16, NS) if (v == "twin" and n == 16) else ("ms", n, NS))
             px = xs[n]["base" if v == "null" else v]
