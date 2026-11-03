@@ -32,7 +32,8 @@ def arg(name, default):
 
 def keyfix(v):
     if isinstance(v, dict) and any(isinstance(k, str) and "," in k for k in v):   # "sliding,16,8" -> ("sliding", 16, 8)
-        return {tuple(int(p) if p.isdigit() else p for p in k.split(",")): keyfix(x) for k, x in v.items()}
+        return {tuple(int(p) if p.isdigit() else (p == "True") if p in ("True", "False") else p for p in k.split(",")): keyfix(x)
+                for k, x in v.items()}   # "1,1,False,1" -> (1, 1, False, 1) (HYA_TUNED)
     if isinstance(v, dict):
         return {(int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else k): keyfix(x) for k, x in v.items()}
     return v

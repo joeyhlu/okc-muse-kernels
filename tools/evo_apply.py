@@ -141,6 +141,19 @@ def main():
         print(f"[apply] {name}: {old[:150]} -> {new[:150]}")
     dst.write_text(out, encoding="utf-8", newline="\n")
     print(f"[apply] wrote {dst} ({len(out.encode())} B)")
+    vp = arg("variants")
+    if vp:   # in-process A/B on the BASE file: layer_ab3 variants that set the changed globals (tuple keys -> "a,b,c")
+        def enc(v):
+            if isinstance(v, dict):
+                return {(",".join(str(x) for x in k) if isinstance(k, tuple) else str(k)): enc(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [enc(x) for x in v]
+            return v
+        st = {k: enc(v) for k, v in merged.items() if v != getg(k)}
+        var = [{"name": "base", "set": {}}, {"name": "evo", "set": st}, {"name": "twin", "set": {}},
+               {"name": "evo2", "set": st}, {"name": "base2", "set": {}}]
+        Path(vp).write_text(json.dumps(var) + "\n", encoding="utf-8")
+        print(f"[apply] variants -> {vp}: {sorted(st)}")
 
 
 if __name__ == "__main__":
