@@ -1,0 +1,6 @@
+muse_decode_layer kernels/muse_decode_layer/k3_clean_c3.py
+muse_decode_layer kernels/muse_decode_layer/k3_fin7c_c2.py
+muse_decode_layer kernels/muse_decode_layer/k3_clean_c4.py
+muse_decode_layer kernels/muse_decode_layer/k3_fin7c_c3.py
+muse_decode_layer kernels/muse_decode_layer/k3_clean_c5.py
+muse_decode_layer kernels/muse_decode_layer/k3_fin7c_c4.py
