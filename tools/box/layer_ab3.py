@@ -107,6 +107,11 @@ def main():
                 beq.setdefault(i, []).append(bool(torch.equal(a, b)))
             if chk is not None:
                 for i, v in enumerate(variants):
+                    # the layer's output / scratch buffers are shared module state: replay THIS variant right before its check,
+                    # otherwise the check reads whatever variant replayed last (2026-11-03: VML_FLAGS 449 garbage passed this way)
+                    J.copy_into(statics[i], chk)
+                    graphs[i][0].replay()
+                    torch.cuda.synchronize()
                     ok, msg = J.check_output(ref, chk, statics[i], graphs[i][1], weights)
                     if not ok:
                         bad[v["name"]] = msg
