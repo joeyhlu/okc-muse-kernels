@@ -25,6 +25,17 @@ def arg(name, default=None):
     return default
 
 
+def keyfix(v):   # same decoding as tools/box/layer_ab3.py keyfix (JSON arm -> the layer's Python globals)
+    if isinstance(v, dict) and any(isinstance(k, str) and "," in k for k in v):
+        return {tuple(int(p) if p.isdigit() else (p == "True") if p in ("True", "False") else p for p in k.split(",")): keyfix(x)
+                for k, x in v.items()}
+    if isinstance(v, dict):
+        return {(int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else k): keyfix(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return tuple(keyfix(x) for x in v)
+    return v
+
+
 def top_assigns(src):
     tree = ast.parse(src)
     out = {}
@@ -55,6 +66,14 @@ def main():
         return lit[name]
 
     merged = {}
+    fv = arg("from-variants")   # <variants.json>@<arm name>: write that layer_ab3 arm's globals instead of T.json winners
+    if fv:
+        vpath, vname = fv.rsplit("@", 1)
+        arm = next(x["set"] for x in json.loads(Path(vpath).read_text(encoding="utf-8")) if x["name"] == vname)
+        for name, val in arm.items():
+            getg(name)
+            merged[name] = (keyfix(val), f"variant {vname}")
+        tfiles = []
     for tf in tfiles:
         d = json.loads(tf.read_text(encoding="utf-8"))
         T = d["T"]
