@@ -36,6 +36,8 @@ def keyfix(v):
                 for k, x in v.items()}   # "1,1,False,1" -> (1, 1, False, 1) (HYA_TUNED)
     if isinstance(v, dict):
         return {(int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else k): keyfix(x) for k, x in v.items()}
+    if isinstance(v, list):   # JSON has no tuples: route / geometry / pin values are tuples in the layer source
+        return tuple(keyfix(x) for x in v)
     return v
 
 
