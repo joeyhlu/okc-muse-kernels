@@ -1,0 +1,8 @@
+muse_decode_layer box_out/stress/k3_tinys7_r1.py
+muse_decode_layer box_out/stress/k3_tinys7_r2.py
+muse_decode_layer box_out/stress/k3_tinys7_r3.py
+muse_decode_layer box_out/stress/k3_tinys7_r4.py
+muse_decode_layer box_out/stress/k3_tinys7_r5.py
+muse_decode_layer box_out/stress/k3_tinys7_r6.py
+muse_decode_layer box_out/stress/k3_tinys7_r7.py
+muse_decode_layer box_out/stress/k3_tinys7_r8.py
