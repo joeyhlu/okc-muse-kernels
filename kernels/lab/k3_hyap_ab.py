@@ -19670,7 +19670,7 @@ def _hyap_prepare(state, t0):
         if k != "twin":
             H["resources"] = list(mod.hyap_resources())
             reg, local, static, dynamic, occ, cr, pr = H["resources"]
-            print(f'[hyap-sp] {k} resources {H["resources"]}', flush=True)  # lead: spill tolerated in this timing lab (round 3: 92 B in bounded-wait paths)
+            print(f"[hyap-sp] {k} resources {H['resources']}", flush=True)  # lead: spill tolerated in this timing lab (round 3: 92 B, bounded-wait paths)
             if reg > 96 or occ < 1 or cr != _HYAP_CREGS or pr != 24 or static + dynamic > 227*1024:
                 raise RuntimeError(f"HYAP {k} resource gate: {H['resources']}")
             # setmaxnreg redistributes the CTA's launch allocation; an SM-wide
