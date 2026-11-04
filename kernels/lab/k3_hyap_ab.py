@@ -19460,25 +19460,28 @@ def _hya_prepare(state,t0):
     x.zero_()
 "HYA END (derived code above: HYA_CPP_SRC, HYA_CUDA_SRC, _hya_plan, _hya_launch; see _HYA_NOTICE)"
 
-CUDA_SUPPORT = '\n// HYAP: 0..255 / 256..511 consumers; 512..639 producer. Named barriers:\n// 1 = finalize (512 consumers), 2 = producer, 3..6 = individual WGs,\n// 7/8 = consumer teams, 9 = producer drain + consumer rendezvous (640).\n// Barrier 0 is only the full-CTA prologue, before register redistribution.\ntemplate<int ROLE> __device__ __forceinline__ void hyap_sync() {\n  if constexpr (ROLE == 1) asm volatile("bar.sync 2, 128;" ::: "memory");\n  else asm volatile("bar.sync %0, 256;" :: "r"(7 + (int(threadIdx.x) >> 8)) : "memory");\n}\n__device__ __forceinline__ void hyap_wgsync(int wg) {\n  asm volatile("bar.sync %0, 128;" :: "r"(3 + 2 * (int(threadIdx.x) >> 8) + wg) : "memory");\n}\n'
+CUDA_SUPPORT = '\n// HYAP: 0..255 / 256..511 consumers; 512..639 producer. Named barriers:\n// 1 = finalize (512 consumers), 2 = producer, 3..6 = individual WGs,\n// 7/8 = consumer teams, 9 = producer drain + consumer rendezvous (640).\n// Barrier 0 is only the full-CTA prologue, before register redistribution.\ntemplate<int ROLE> __device__ __forceinline__ void hyap_sync() {\n  if constexpr (ROLE == 1) asm volatile("bar.sync 2, 128;" ::: "memory");\n  else asm volatile("bar.sync %0, 256;" :: "r"(7 + (int(threadIdx.x) >> 8)) : "memory");\n}\n__device__ __forceinline__ void hyap_wgsync(int wg) {\n  asm volatile("bar.sync %0, 128;" :: "r"(3 + 2 * (int(threadIdx.x) >> 8) + wg) : "memory");\n}\n// Fixed ring addresses, like ship\'s embedded Smem arrays: no cached generic\n// pointers from HyapView survive the QK/softmax/PV register-pressure peak.\n// HyapShared\'s offsetof assertions below check every byte of this ABI.\n__device__ __forceinline__ uint8_t* hyap_raw() {\n  extern __shared__ __align__(1024) uint8_t raw[];\n  return raw;\n}\n__device__ __forceinline__ uint8_t* hyap_k() { return hyap_raw(); }\n__device__ __forceinline__ uint8_t* hyap_v() { return hyap_raw() + 4 * STAGE_BYTES; }\n__device__ __forceinline__ uint64_t* hyap_full() {\n  return reinterpret_cast<uint64_t*>(hyap_raw() + 8 * STAGE_BYTES);\n}\n__device__ __forceinline__ uint64_t* hyap_empty() { return hyap_full() + 4; }\n__device__ __forceinline__ int* hyap_counter() {\n  return reinterpret_cast<int*>(hyap_empty() + 4);\n}\n__device__ __forceinline__ int hyap_read(const volatile int* ptr) {\n  // Volatile shared load prevents ptxas carrying scheduler/flush metadata\n  // through the math. Broadcast preserves ship\'s proven warp uniformity.\n  return __shfl_sync(0xffffffffu, *ptr, 0);\n}\n'
 CUDA_PATCH = '\n__device__ __forceinline__ bool hyap_patch(const Params& p, HyapView& S,\n    int i, int st, int start, int seq, int end, int tid, int pair) {\n  const int t0 = start + i * TILE;\n  const int lo = max(t0, seq), hi = min(t0 + TILE, end);\n  for (int e = tid; e < (hi - lo) * 8; e += 256) {\n    const int pos = lo + (e >> 3), c = e & 7, r = pos - t0;\n    const int sw = ((c ^ (r & 7)) << 4);\n    const uint4 k = *reinterpret_cast<const uint4*>(S.kn + (pos - seq) * ROWB + c * 16);\n    const uint4 v = *reinterpret_cast<const uint4*>(S.vn + (pos - seq) * ROWB + c * 16);\n    *reinterpret_cast<uint4*>(S.k + st * STAGE_BYTES + r * ROWB + sw) = k;\n    *reinterpret_cast<uint4*>(S.v + st * STAGE_BYTES + r * ROWB + sw) = v;\n    const int64_t row = S.cloc[pos - seq];\n    *reinterpret_cast<uint4*>(const_cast<uint8_t*>(cache_row(p.k_cache, p, row, pair * 128 + c * 16))) = k;\n    *reinterpret_cast<uint4*>(const_cast<uint8_t*>(cache_row(p.v_cache, p, row, pair * 128 + c * 16))) = v;\n  }\n  if (lo < hi) fence_proxy_async();\n  return lo < hi;\n}\n'
-CUDA_KERNEL = '\nstruct alignas(1024) HyapShared {\n  alignas(1024) uint8_t k[4 * STAGE_BYTES], v[4 * STAGE_BYTES];\n  uint64_t full[4], empty[4];\n  int counter, sense, total, nseg;\n  int cum[33], seg[32][3], tile[33];\n  HyapView team[2];\n};\nstatic_assert(sizeof(HyapShared) <= 227 * 1024, "HYAP exceeds H200 smem");\nstatic_assert(HYAP_CREGS == 112 || HYAP_CREGS == 120, "HYAP consumer budget");\nstatic_assert(512 * HYAP_CREGS + 128 * 24 <= 65536, "HYAP role register budget");\n\ntemplate<int CHUNK>\n__global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Params p) {\n  extern __shared__ __align__(1024) uint8_t raw[];\n  auto& A = *reinterpret_cast<HyapShared*>(raw);\n  const int tid = threadIdx.x, pair = blockIdx.z;\n  if (tid == 0) {\n    A.counter = 0; A.cum[0] = 0;\n    // The base reads seq_lens before its dependency wait as well.\n    for (int b = 0; b < p.B; ++b) A.cum[b + 1] = A.cum[b] + __ldg(p.seq_lens + b) + 8;\n    const int64_t T = int64_t(A.cum[p.B]) + (p.B - 1) * 600;\n    // c/G == (2*c)/(2*G): exact union of adjacent ship ranges, same SEGK.\n    auto vmap = [&](int v) {\n      int lo = 0, hi = p.B - 1;\n      while (lo < hi) {\n        const int mid = (lo + hi + 1) >> 1;\n        if (A.cum[mid] + mid * 600 <= v) lo = mid; else hi = mid - 1;\n      }\n      return min(v - lo * 600, A.cum[lo + 1]);\n    };\n    const int cs = vmap(int(int64_t(blockIdx.x) * T / gridDim.x));\n    const int ce = vmap(int(int64_t(blockIdx.x + 1) * T / gridDim.x));\n    int n = 0, tiles = 0;\n    A.tile[0] = 0;\n    for (int b = 0; b < p.B; ++b) {\n      const int lo = max(cs, A.cum[b]) - A.cum[b];\n      const int hi = min(ce, A.cum[b + 1]) - A.cum[b];\n      if (lo < hi) {\n        A.seg[n][0] = b; A.seg[n][1] = lo; A.seg[n][2] = hi;\n        tiles += (hi - lo + 63) / 64;\n        A.tile[++n] = tiles;\n      }\n    }\n    A.nseg = n; A.total = tiles;\n    for (int s = 0; s < 4; ++s) {\n      mbar_init_n(&A.full[s], 128);\n      mbar_init_n(&A.empty[s], 1); // exactly one elected arrival per owning team\n    }\n    for (int t = 0; t < 2; ++t) {\n      auto& S = A.team[t];\n      S.k = A.k; S.v = A.v; S.full = A.full; S.empty = A.empty;\n      S.counter = &A.counter; S.ticket = 0; S.claim_end = 0; S.prepared_b = -1;\n    }\n    mbar_fence_init();\n    cp_async4(smem_u32(&A.sense), p.ws_cnt + 30022);\n    cp_commit(); cp_wait<0>();\n  }\n  __syncthreads();\n  if (tid >= 512) {\n    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\\n" :: "n"(24));\n    for (int s = 0; s < A.nseg; ++s) {\n      const int b = A.seg[s][0], seq = __ldg(p.seq_lens + b);\n      hyap_segment<8, true, 1, CHUNK>(p, A.team[0], b, pair, A.seg[s][1] == 0,\n        A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);\n    }\n    cp_wait<0>(); // every producer async copy is complete before the CTA rendezvous\n    // Match ship\'s terminal producer branch: do not merge the 24-register\n    // producer path back into the consumer register-allocation region.\n    asm volatile("bar.arrive 9, 640;" ::: "memory");\n    return; // no producer owns any finalize/reset row\n  } else {\n    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\\n" :: "n"(HYAP_CREGS));\n    auto& S = A.team[tid >> 8];\n    if ((tid & 255) == 0) {\n      S.ticket = atomicAdd(S.counter, CHUNK);\n      S.claim_end = S.ticket + CHUNK;\n    }\n    hyap_sync<2>();\n    int s = 0;\n    while (S.ticket < A.total) {\n      while (s + 1 < A.nseg && S.ticket >= A.tile[s + 1]) ++s;\n      const int b = A.seg[s][0], seq = __ldg(p.seq_lens + b);\n      hyap_segment<8, true, 2, CHUNK>(p, S, b, pair, A.seg[s][1] == 0,\n        A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);\n    }\n    wgmma_wait<0>();\n    // All 512 consumers, including idle teams, wait for all 128 producers.\n    // Keep this and finalize inside the inc\'d branch, as attn_kernel does.\n    asm volatile("bar.sync 9, 640;" ::: "memory");\n    flat_finalize<8, true, 512>(p, &A.sense);\n  }\n}\n\nvoid hyap_launch(Params p, dim3 grid, cudaStream_t stream, bool pdl) {\n  TORCH_CHECK(p.flat && p.coop && p.nc == 1 && p.Hkv == 2 && !p.window && (p.B == 16 || p.B == 32));\n  p.q2 = 0;\n  static bool init = false;\n  static int nsm = 0;\n  if (!init) { // same first-eager-call initialization pattern as ship launch()\n    int dev = 0, occ = 0;\n    TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess);\n    TORCH_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess);\n    TORCH_CHECK(cudaFuncSetAttribute(hyap_kernel<HYAP_CHUNK>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(HyapShared)) == cudaSuccess);\n    TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, hyap_kernel<HYAP_CHUNK>, 640, sizeof(HyapShared)) == cudaSuccess && occ >= 1);\n    init = true;\n  }\n  grid.x = nsm; p.n_splits = nsm;\n  cudaLaunchConfig_t cfg{};\n  cfg.gridDim = grid; cfg.blockDim = dim3(640, 1, 1);\n  cfg.dynamicSmemBytes = sizeof(HyapShared); cfg.stream = stream;\n  cudaLaunchAttribute attr{};\n  if (pdl) {\n    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;\n    attr.val.programmaticStreamSerializationAllowed = 1;\n    cfg.attrs = &attr; cfg.numAttrs = 1;\n  }\n  TORCH_CHECK(cudaLaunchKernelEx(&cfg, hyap_kernel<HYAP_CHUNK>, p) == cudaSuccess);\n}\nstd::vector<int64_t> hyap_resources() {\n  cudaFuncAttributes a{}; int occ = 0;\n  TORCH_CHECK(cudaFuncSetAttribute(hyap_kernel<HYAP_CHUNK>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(HyapShared)) == cudaSuccess);\n  TORCH_CHECK(cudaFuncGetAttributes(&a, hyap_kernel<HYAP_CHUNK>) == cudaSuccess);\n  TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, hyap_kernel<HYAP_CHUNK>, 640, sizeof(HyapShared)) == cudaSuccess);\n  return {a.numRegs, (int64_t)a.localSizeBytes, (int64_t)a.sharedSizeBytes,\n    sizeof(HyapShared), occ, HYAP_CREGS, 24};\n}\n'
+CUDA_KERNEL = '\nstruct alignas(1024) HyapShared {\n  alignas(1024) uint8_t k[4 * STAGE_BYTES], v[4 * STAGE_BYTES];\n  uint64_t full[4], empty[4];\n  int counter, sense, total, nseg;\n  int cum[33], seg[32][3], tile[33];\n  HyapView team[2];\n};\nstatic_assert(sizeof(HyapShared) <= 227 * 1024, "HYAP exceeds H200 smem");\nstatic_assert(__builtin_offsetof(HyapShared, k) == 0, "HYAP k ABI");\nstatic_assert(__builtin_offsetof(HyapShared, v) == 4 * STAGE_BYTES, "HYAP v ABI");\nstatic_assert(__builtin_offsetof(HyapShared, full) == 8 * STAGE_BYTES, "HYAP full ABI");\nstatic_assert(__builtin_offsetof(HyapShared, empty) == 8 * STAGE_BYTES + 32, "HYAP empty ABI");\nstatic_assert(__builtin_offsetof(HyapShared, counter) == 8 * STAGE_BYTES + 64, "HYAP counter ABI");\nstatic_assert(HYAP_CREGS == 112, "HYAP consumer budget");\nstatic_assert(512 * HYAP_CREGS + 128 * 24 <= 96 * 640, "HYAP CTA entry pool");\n\ntemplate<int CHUNK>\n__global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Params p) {\n  extern __shared__ __align__(1024) uint8_t raw[];\n  auto& A = *reinterpret_cast<HyapShared*>(raw);\n  const int tid = threadIdx.x, pair = blockIdx.z;\n  if (tid == 0) {\n    A.counter = 0; A.cum[0] = 0;\n    // The base reads seq_lens before its dependency wait as well.\n    for (int b = 0; b < p.B; ++b) A.cum[b + 1] = A.cum[b] + __ldg(p.seq_lens + b) + 8;\n    const int64_t T = int64_t(A.cum[p.B]) + (p.B - 1) * 600;\n    // c/G == (2*c)/(2*G): exact union of adjacent ship ranges, same SEGK.\n    auto vmap = [&](int v) {\n      int lo = 0, hi = p.B - 1;\n      while (lo < hi) {\n        const int mid = (lo + hi + 1) >> 1;\n        if (A.cum[mid] + mid * 600 <= v) lo = mid; else hi = mid - 1;\n      }\n      return min(v - lo * 600, A.cum[lo + 1]);\n    };\n    const int cs = vmap(int(int64_t(blockIdx.x) * T / gridDim.x));\n    const int ce = vmap(int(int64_t(blockIdx.x + 1) * T / gridDim.x));\n    int n = 0, tiles = 0;\n    A.tile[0] = 0;\n    for (int b = 0; b < p.B; ++b) {\n      const int lo = max(cs, A.cum[b]) - A.cum[b];\n      const int hi = min(ce, A.cum[b + 1]) - A.cum[b];\n      if (lo < hi) {\n        A.seg[n][0] = b; A.seg[n][1] = lo; A.seg[n][2] = hi;\n        tiles += (hi - lo + 63) / 64;\n        A.tile[++n] = tiles;\n      }\n    }\n    A.nseg = n; A.total = tiles;\n    for (int s = 0; s < 4; ++s) {\n      mbar_init_n(&A.full[s], 128);\n      mbar_init_n(&A.empty[s], 1); // exactly one elected arrival per owning team\n    }\n    for (int t = 0; t < 2; ++t) {\n      auto& S = A.team[t];\n      S.ticket = 0; S.claim_end = 0; S.prepared_b = -1; S.segment_s = 0;\n    }\n    mbar_fence_init();\n    cp_async4(smem_u32(&A.sense), p.ws_cnt + 30022);\n    cp_commit(); cp_wait<0>();\n  }\n  __syncthreads();\n  if (tid >= 512) {\n    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\\n" :: "n"(24));\n    for (int s = 0; s < A.nseg; ++s) {\n      const int b = A.seg[s][0], seq = __ldg(p.seq_lens + b);\n      hyap_segment<8, true, 1, CHUNK>(p, A.team[0], b, pair, A.seg[s][1] == 0,\n        A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);\n    }\n    cp_wait<0>(); // every producer async copy is complete before the CTA rendezvous\n    // Match ship\'s terminal producer branch: do not merge the 24-register\n    // producer path back into the consumer register-allocation region.\n    asm volatile("bar.arrive 9, 640;" ::: "memory");\n    return; // no producer owns any finalize/reset row\n  } else {\n    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\\n" :: "n"(HYAP_CREGS));\n    auto& S = A.team[__shfl_sync(0xffffffffu, tid >> 8, 0)];\n    if ((tid & 255) == 0) {\n      S.ticket = atomicAdd(hyap_counter(), CHUNK);\n      S.claim_end = S.ticket + CHUNK;\n    }\n    hyap_sync<2>();\n    while (hyap_read(&S.ticket) < A.total) {\n      // Only the elected thread owns request/claim bookkeeping. Nothing in\n      // this scope is live across the inlined segment\'s per-tile math.\n      if ((tid & 255) == 0) {\n        int s = S.segment_s;\n        while (s + 1 < A.nseg && S.ticket >= A.tile[s + 1]) ++s;\n        S.segment_s = s; S.b = A.seg[s][0];\n        S.start = A.seg[s][1]; S.end = A.seg[s][2];\n        S.seq = __ldg(p.seq_lens + S.b); S.tb = A.tile[s];\n        S.begin = S.ticket - S.tb; S.limit = A.tile[s + 1] - S.tb;\n        S.stop = min(int(S.limit), int(S.claim_end - S.tb));\n      }\n      hyap_sync<2>();\n      hyap_segment<8, true, 2, CHUNK>(p, S, hyap_read(&S.b), pair, hyap_read(&S.start) == 0,\n        hyap_read(&S.start), hyap_read(&S.end), hyap_read(&S.seq), hyap_read(&S.seq) + 8,\n        0, 0, hyap_read(&S.tb), 0, true);\n    }\n    wgmma_wait<0>();\n    // All 512 consumers, including idle teams, wait for all 128 producers.\n    // Keep this and finalize inside the inc\'d branch, as attn_kernel does.\n    asm volatile("bar.sync 9, 640;" ::: "memory");\n    flat_finalize<8, true, 512>(p, &A.sense);\n  }\n}\n\nvoid hyap_launch(Params p, dim3 grid, cudaStream_t stream, bool pdl) {\n  TORCH_CHECK(p.flat && p.coop && p.nc == 1 && p.Hkv == 2 && !p.window && (p.B == 16 || p.B == 32));\n  p.q2 = 0;\n  static bool init = false;\n  static int nsm = 0;\n  if (!init) { // same first-eager-call initialization pattern as ship launch()\n    int dev = 0, occ = 0;\n    TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess);\n    TORCH_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess);\n    TORCH_CHECK(cudaFuncSetAttribute(hyap_kernel<HYAP_CHUNK>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(HyapShared)) == cudaSuccess);\n    TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, hyap_kernel<HYAP_CHUNK>, 640, sizeof(HyapShared)) == cudaSuccess && occ >= 1);\n    init = true;\n  }\n  grid.x = nsm; p.n_splits = nsm;\n  cudaLaunchConfig_t cfg{};\n  cfg.gridDim = grid; cfg.blockDim = dim3(640, 1, 1);\n  cfg.dynamicSmemBytes = sizeof(HyapShared); cfg.stream = stream;\n  cudaLaunchAttribute attr{};\n  if (pdl) {\n    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;\n    attr.val.programmaticStreamSerializationAllowed = 1;\n    cfg.attrs = &attr; cfg.numAttrs = 1;\n  }\n  TORCH_CHECK(cudaLaunchKernelEx(&cfg, hyap_kernel<HYAP_CHUNK>, p) == cudaSuccess);\n}\nstd::vector<int64_t> hyap_resources() {\n  cudaFuncAttributes a{}; int occ = 0;\n  TORCH_CHECK(cudaFuncSetAttribute(hyap_kernel<HYAP_CHUNK>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(HyapShared)) == cudaSuccess);\n  TORCH_CHECK(cudaFuncGetAttributes(&a, hyap_kernel<HYAP_CHUNK>) == cudaSuccess);\n  TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, hyap_kernel<HYAP_CHUNK>, 640, sizeof(HyapShared)) == cudaSuccess);\n  return {a.numRegs, (int64_t)a.localSizeBytes, (int64_t)a.sharedSizeBytes,\n    sizeof(HyapShared), occ, HYAP_CREGS, 24};\n}\n'
 _HYAP_RESOURCE_CPP = '\nstd::vector<int64_t> hyap_resources();\n'
 def _hyap_cuda(ship, chunk, cregs=112):
     """Plain-source vendoring, no module handles; exact source anchors fail shut."""
+    import re
     assert chunk in (2, 4, 8)
-    assert type(cregs) is int and cregs in (112, 120)
+    assert type(cregs) is int and cregs == 112
     def sub(s, old, new):
         assert s.count(old) == 1, (s.count(old), old[:100])
         return s.replace(old, new)
     a = ship.index('template <int L, bool F>\nstruct Smem {')
     b = ship.index('\ntemplate <int L, typename SM>', a)
     view = ship[a:b].replace('template <int L, bool F>\nstruct Smem {',
-        'struct HyapView {\nstatic constexpr int L = 8; static constexpr bool F = true;\nint* counter; int ticket, claim_end, prepared_b;')
-    view = sub(view, 'uint8_t k[Cfg<L, F>::STAGES * STAGE_BYTES];', 'uint8_t* k;')
-    view = sub(view, 'uint8_t v[Cfg<L, F>::STAGES * STAGE_BYTES];', 'uint8_t* v;')
-    view = sub(view, 'uint64_t full[8];', 'uint64_t* full;')
-    view = sub(view, 'uint64_t empty[8];', 'uint64_t* empty;')
+        'struct HyapView {\nstatic constexpr int L = 8; static constexpr bool F = true;\n'
+        'volatile int ticket, claim_end, prepared_b, segment_s;\n'
+        'volatile int b, start, end, seq, tb, begin, limit, stop, more;')
+    for field in ('uint8_t k[Cfg<L, F>::STAGES * STAGE_BYTES];',
+                  'uint8_t v[Cfg<L, F>::STAGES * STAGE_BYTES];',
+                  'uint64_t full[8];', 'uint64_t empty[8];'):
+        view = sub(view, field, '')
     a = ship.index('template <int L, bool FLAT, int ROLE, int MODE = 0>')
     b = ship.index('\ntemplate <int L, bool WS, int NT>\n__device__ __forceinline__ void flat_finalize', a)
     seg = ship[a:b]
@@ -19501,52 +19504,82 @@ def _hyap_cuda(ship, chunk, cregs=112):
     qa = seg.index('int tidL = tid, partL = part;')
     qb = seg.index('constexpr int MT = 1;',qa)
     query = seg[qa:qb]
-    seg = seg[:qa] + '''const bool hyap_reload = S.prepared_b != b;
+    # Finish query setup AND its Q8 conversion in one lexical scope, before
+    # accumulator initialization. No reload predicate or qa8 fragments cross
+    # into the math loop; only q8s/kn/vn/scl/cloc in shared survive a gap.
+    q8a = seg.index('uint32_t qa8[2][4];')
+    q8b = seg.index('float cr[2] = {0.f, 0.f};', q8a)
+    q8 = seg[q8a:q8b]
+    seg = seg[:q8a] + seg[q8b:]
+    seg = seg[:qa] + '''
 constexpr bool QDIR = L == 8 && !WS;
-if (hyap_reload) {
-''' + query + '''}
+if (hyap_read(&S.prepared_b) != b) {
+''' + query + '''
+const int hk = __shfl_sync(0xffffffffu, (warp & 7) >> 2, 0);
+const int wsub = __shfl_sync(0xffffffffu, warp & 3, 0);
+''' + q8 + '''
+if (tid == 0) S.prepared_b = b;
+}
 const float kscale = S.scl[0], vscale = S.scl[1];
 const float sl2 = p.scale_log2 * kscale;
 ''' + seg[qb:]
-    seg = sub(seg, 'uint32_t qa8[2][4];\nif constexpr (!QDIR)',
-        'uint32_t qa8[2][4];\nif (hyap_reload) {\nif constexpr (!QDIR)')
-    seg = sub(seg, 'float cr[2] = {0.f, 0.f};',
-        'if (tid == 0) S.prepared_b = b;\n}\nfloat cr[2] = {0.f, 0.f};')
     # Cache append is done by the tile owner in ws_patch, including a newly
     # acquired contiguous chunk; query setup must never write unowned keys.
     seg = sub(seg, 'if (pos >= start && pos < end) {', 'if (false) { // HYAP: owner writes below at tile consumption')
     patch_call = 'ws_patch_ni<L, NT, false>(&S, i, st_c, start, seq, end, tid)'
-    seg = sub(seg, patch_call, 'hyap_patch(p, S, i, st_c, start, seq, end, tid, pair)')
+    seg = sub(seg, patch_call, 'hyap_patch(p, S, i, st_c, hyap_read(&S.start), hyap_read(&S.seq), hyap_read(&S.end), tid, int(blockIdx.z))')
     seg = sub(seg, 'int st_c = tb % STAGES;\nuint32_t ph_c = (uint32_t)(tb / STAGES) & 1u;',
-        'const int i_begin = S.ticket - tb;\nint st_c = (tb + i_begin) % STAGES;\nuint32_t ph_c = (uint32_t)((tb + i_begin) / STAGES) & 1u;')
-    seg = sub(seg, 'const int nit = ntiles;', 'int nit = min(ntiles, S.claim_end - tb);')
-    seg = sub(seg, 'for (int jj = 0; jj < nit; ++jj)', 'for (int jj = i_begin; jj < nit; ++jj)')
-    seg = sub(seg, 'if (patched || i == 0)', 'if (patched || i == i_begin)')
-    seg = sub(seg, 'if (jj == 0)', 'if (jj == i_begin)')
+        'int st_c = hyap_read(&S.ticket) % STAGES;\nuint32_t ph_c = (uint32_t)(hyap_read(&S.ticket) / STAGES) & 1u;')
+    seg = sub(seg, 'const int nit = ntiles;', '// Loop bounds and continuation state live in the team header.')
+    seg = sub(seg, 'for (int jj = 0; jj < nit; ++jj)', 'for (int jj = hyap_read(&S.begin); ; ++jj)')
+    seg = sub(seg, 'if (patched || i == 0)', 'if (patched || first)')
+    seg = sub(seg, 'if (jj == 0)', 'if (first)')
     seg = sub(seg, 'mbar_arrive(&S.empty[st]);',
         'hyap_sync<ROLE>(); // both WGs finished QK and V transpose\nif (tid == 0) mbar_arrive(&S.empty[st]);')
     # No accumulator reset for a contiguous next claim. At a gap/request end,
     # the original absolute-frame reduction and new-segment reset run verbatim.
     seg = sub(seg, 'vdesc_c ^= vdesc_x;\n}', '''vdesc_c ^= vdesc_x;
-if (jj + 1 == nit) {
+if (jj + 1 == hyap_read(&S.stop)) {
   hyap_sync<ROLE>();
   if (tid == 0) {
-    const int next = tb + jj + 1;
+    const int next = S.tb + jj + 1;
     if (next == S.claim_end) {
-      S.ticket = atomicAdd(S.counter, CHUNK);
+      S.ticket = atomicAdd(hyap_counter(), CHUNK);
       S.claim_end = S.ticket + CHUNK;
     } else S.ticket = next; // same claim straddles the request boundary
+    S.more = S.ticket == next && jj + 1 != S.limit;
+    S.stop = min(int(S.limit), int(S.claim_end - S.tb));
   }
   hyap_sync<ROLE>();
-  if (S.ticket != tb + jj + 1 || jj + 1 == ntiles) break;
-  nit = min(ntiles, S.claim_end - tb);
+  if (!hyap_read(&S.more)) break;
 }
 }''')
+    # Cold mask and final reduction reload metadata instead of retaining
+    # b/bp/start/end/seq through softmax. The arithmetic inside is verbatim.
+    seg = sub(seg, 'const bool common_t = WS && ((uint32_t)i - r_lo <= r_span);', '''
+// Fully interior cached tiles already satisfy ship's common_t fast path.
+// Reload mask metadata only for boundary tiles, where it is actually used.
+if ((uint32_t)i - r_lo > r_span) {
+const int start = hyap_read(&S.start), end = hyap_read(&S.end), seq = hyap_read(&S.seq);
+const int lo_all = start, hi_all = __shfl_sync(0xffffffffu, min(end - 1, seq), 0);
+const bool common_t = WS && ((uint32_t)i - r_lo <= r_span);''')
+    seg = sub(seg, 'constexpr bool PCHK = WS;', '} // metadata dies before softmax / PV\nconstexpr bool PCHK = WS;')
+    seg = sub(seg, 'if (do_red) {\n', '''{
+const int bp = hyap_read(&S.b) * (p.Hkv >> 1) + int(blockIdx.z);
+if (do_red) {
+''')
+    seg = sub(seg, 'const bool mode1 =', '} // recomputed flush address\nconst bool mode1 =')
+    # Replace only field tokens: kn/kvq/etc are separate private team arrays.
+    patch_source = CUDA_PATCH
+    for field in ('k', 'v', 'full', 'empty'):
+        pattern = r'\bS\.' + field + r'\b'
+        seg = re.sub(pattern, 'hyap_' + field + '()', seg)
+        patch_source = re.sub(pattern, 'hyap_' + field + '()', patch_source)
     # Keep dead L1/non-flat branches type-correct without instantiating their
     # Smem-only helpers for the HyapView specialization.
     seg = seg.replace('if (M_CL)', 'if constexpr (false)')
     seg = seg.replace('if (M_CL &&', 'if (false &&')
-    extra = CUDA_SUPPORT + view + CUDA_PATCH + seg + CUDA_KERNEL
+    extra = CUDA_SUPPORT + view + patch_source + seg + CUDA_KERNEL
     anchor = 'template <int L>\nvoid launch(const Params& p0, dim3 grid, cudaStream_t stream, int cs, bool pdl) {'
     result = sub(ship, anchor, extra + '\n' + anchor + '''
 if constexpr (L == 8) {
