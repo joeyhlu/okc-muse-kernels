@@ -30,7 +30,8 @@ OUT = ROOT / "kernels/lab/k3_hyap_ab.py"
 CUDA_SUPPORT = r'''
 // HYAP: 0..255 / 256..511 consumers; 512..639 producer. Named barriers:
 // 1 = finalize (512 consumers), 2 = producer, 3..6 = individual WGs,
-// 7/8 = consumer teams. Barrier 0 is only the full-CTA prologue/epilogue.
+// 7/8 = consumer teams, 9 = producer drain + consumer rendezvous (640).
+// Barrier 0 is only the full-CTA prologue, before register redistribution.
 template<int ROLE> __device__ __forceinline__ void hyap_sync() {
   if constexpr (ROLE == 1) asm volatile("bar.sync 2, 128;" ::: "memory");
   else asm volatile("bar.sync %0, 256;" :: "r"(7 + (int(threadIdx.x) >> 8)) : "memory");
@@ -49,7 +50,8 @@ struct alignas(1024) HyapShared {
   HyapView team[2];
 };
 static_assert(sizeof(HyapShared) <= 227 * 1024, "HYAP exceeds H200 smem");
-static_assert(512 * 104 + 128 * 32 <= 65536, "HYAP role register budget");
+static_assert(HYAP_CREGS == 112 || HYAP_CREGS == 120, "HYAP consumer budget");
+static_assert(512 * HYAP_CREGS + 128 * 24 <= 65536, "HYAP role register budget");
 
 template<int CHUNK>
 __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Params p) {
@@ -99,15 +101,19 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
   }
   __syncthreads();
   if (tid >= 512) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 32;" ::: "memory");
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(24));
     for (int s = 0; s < A.nseg; ++s) {
       const int b = A.seg[s][0], seq = __ldg(p.seq_lens + b);
       hyap_segment<8, true, 1, CHUNK>(p, A.team[0], b, pair, A.seg[s][1] == 0,
         A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);
     }
     cp_wait<0>(); // every producer async copy is complete before the CTA rendezvous
+    // Match ship's terminal producer branch: do not merge the 24-register
+    // producer path back into the consumer register-allocation region.
+    asm volatile("bar.arrive 9, 640;" ::: "memory");
+    return; // no producer owns any finalize/reset row
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 104;" ::: "memory");
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(HYAP_CREGS));
     auto& S = A.team[tid >> 8];
     if ((tid & 255) == 0) {
       S.ticket = atomicAdd(S.counter, CHUNK);
@@ -122,11 +128,11 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
         A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);
     }
     wgmma_wait<0>();
+    // All 512 consumers, including idle teams, wait for all 128 producers.
+    // Keep this and finalize inside the inc'd branch, as attn_kernel does.
+    asm volatile("bar.sync 9, 640;" ::: "memory");
+    flat_finalize<8, true, 512>(p, &A.sense);
   }
-  // No CTA exits early, including an empty virtual range or an idle team.
-  // All reductions from both teams precede the single ticket and reset loops.
-  __syncthreads();
-  if (tid < 512) flat_finalize<8, true, 512>(p, &A.sense);
 }
 
 void hyap_launch(Params p, dim3 grid, cudaStream_t stream, bool pdl) {
@@ -160,14 +166,15 @@ std::vector<int64_t> hyap_resources() {
   TORCH_CHECK(cudaFuncGetAttributes(&a, hyap_kernel<HYAP_CHUNK>) == cudaSuccess);
   TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, hyap_kernel<HYAP_CHUNK>, 640, sizeof(HyapShared)) == cudaSuccess);
   return {a.numRegs, (int64_t)a.localSizeBytes, (int64_t)a.sharedSizeBytes,
-    sizeof(HyapShared), occ, 104, 32};
+    sizeof(HyapShared), occ, HYAP_CREGS, 24};
 }
 '''
 
 
-def _hyap_cuda(ship, chunk):
+def _hyap_cuda(ship, chunk, cregs=112):
     """Plain-source vendoring, no module handles; exact source anchors fail shut."""
     assert chunk in (2, 4, 8)
+    assert type(cregs) is int and cregs in (112, 120)
     def sub(s, old, new):
         assert s.count(old) == 1, (s.count(old), old[:100])
         return s.replace(old, new)
@@ -193,7 +200,9 @@ def _hyap_cuda(ship, chunk):
     seg = seg.replace('csync<WS, NT>();', 'hyap_sync<ROLE>();')
     seg = seg.replace('wgsync(wgi);', 'hyap_wgsync(wgi);')
     # Q, scales and new-KV scratch are private and remain valid for the team's
-    # entire request. A discontinuous claim flushes accumulators, NOT queries.
+    # entire request. Q8 is already cached in S.q8s (shared memory), not in
+    # persistent query registers: L=8, WS=true uses SS QK WGMMA descriptors.
+    # A discontinuous claim flushes accumulators, NOT the shared queries.
     # kvq is reused by VT, so both the BF16 gather and its Q8 conversion must
     # be bypassed together on a repeated request; q8s itself is never reused.
     qa = seg.index('int tidL = tid, partL = part;')
@@ -252,7 +261,7 @@ if constexpr (L == 8) {
     hyap_launch(p0, grid, stream, pdl); return;
   }
 }''')
-    return '#define HYAP_CHUNK %d\n' % chunk + result
+    return '#define HYAP_CHUNK %d\n#define HYAP_CREGS %d\n' % (chunk, cregs) + result
 
 
 CUDA_PATCH = r'''
@@ -289,7 +298,7 @@ _HYAP = {k: {"mod": None, "ws": {}, "build_s": 0.0, "err": None, "resources": No
 def _hyap_src(k):
     if k in (0, "twin"):
         return HYA_CUDA_SRC
-    return _hyap_cuda(HYA_CUDA_SRC, k)
+    return _hyap_cuda(HYA_CUDA_SRC, k, _HYAP_CREGS)
 
 def _hyap_build(k):
     H = _HYAP[k]
@@ -322,8 +331,13 @@ def _hyap_prepare(state, t0):
         if k != "twin":
             H["resources"] = list(mod.hyap_resources())
             reg, local, static, dynamic, occ, cr, pr = H["resources"]
-            if reg > 104 or local or occ < 1 or cr != 104 or pr != 32 or static + dynamic > 227*1024:
+            if reg > 96 or local or occ < 1 or cr != _HYAP_CREGS or pr != 24 or static + dynamic > 227*1024:
                 raise RuntimeError(f"HYAP {k} resource gate: {H['resources']}")
+            # setmaxnreg redistributes the CTA's launch allocation; an SM-wide
+            # <=65536 check alone cannot prove that an inc will complete.
+            pool = ((reg * 32 + 255) // 256) * 256 * 20
+            if 512 * cr + 128 * pr > pool:
+                raise RuntimeError(f"HYAP {k} role budget exceeds entry pool: {H['resources']}")
         if str(dev) not in H["ws"]:
             n = HYA_WS_ROWS
             H["ws"][str(dev)] = (torch.zeros(n*64, dtype=torch.float32, device=dev),
@@ -368,16 +382,17 @@ def literal(source, name):
             return ast.literal_eval(n.value)
     raise KeyError(name)
 
-def lab_text():
+def lab_text(cregs=112):
     import inspect
     return ('\nCUDA_SUPPORT = ' + repr(CUDA_SUPPORT) + '\nCUDA_PATCH = ' + repr(CUDA_PATCH)
         + '\nCUDA_KERNEL = ' + repr(CUDA_KERNEL) + '\n_HYAP_RESOURCE_CPP = ' + repr(RESOURCE_CPP)
-        + '\n' + inspect.getsource(_hyap_cuda) + '\n' + LAB)
+        + '\n' + inspect.getsource(_hyap_cuda) + '\n_HYAP_CREGS = ' + str(cregs) + '\n' + LAB)
 
-def build():
+def build(cregs=112):
+    assert type(cregs) is int and cregs in (112, 120)
     base = BASE.read_bytes().decode('ascii')
     assert '\r' not in base
-    return base, sub(sub(sub(base, PREP_A, PREP_B), CALL_A, CALL_B), END, END + lab_text())
+    return base, sub(sub(sub(base, PREP_A, PREP_B), CALL_A, CALL_B), END, END + lab_text(cregs))
 
 def namespace(source):
     names = {'HYA_CPP_SRC','HYA_CUDA_SRC','_HYA','HYA_ENABLE','HYA_ROUTE','HYA_DEFAULT',
@@ -393,6 +408,7 @@ def namespace(source):
 
 def dry_run(source):
     # Same padz-style bank / real layer functions; only CUDA boundaries mocked.
+    cregs = literal(source, '_HYAP_CREGS')
     class Tensor:
         def __init__(self, shape, device="cpu-mock"):
             self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
@@ -408,7 +424,7 @@ def dry_run(source):
     class Module:
         def __init__(self, name): self.name, self.calls = name, []
         def run(self, *a): self.calls.append(a)
-        def hyap_resources(self): return [96, 0, 0, 163840, 1, 104, 32]
+        def hyap_resources(self): return [96, 0, 1024, 162816, 1, cregs, 24]
 
     allocs, builds = [], []
     def tensor(shape, **kw):
@@ -432,6 +448,15 @@ def dry_run(source):
         ns["_hyap_prepare"](state, time.time())
         assert len(builds) == 1, "default must not compile an experiment"
         ns["HYAP_BUILD"] = True
+        if cregs == 120:
+            # Compile-only fallback: 96 entry regs allocate 61,440, whereas
+            # 512*120+128*24 needs 64,512. Fail locally before a GPU launch.
+            try: ns['_hyap_prepare'](state,time.time())
+            except RuntimeError as ex:
+                assert 'role budget exceeds entry pool' in str(ex), ex
+            else: raise AssertionError('unsafe 120-register arm accepted')
+            return dict(actual_launch_paths=0,real_base_prepare=True,default_no_build=True,
+                        consumer_budget=cregs,entry_pool_rejection_exercised=True)
         ns["_hyap_prepare"](state, time.time())
         nalloc = len(allocs)
         ns["_hyap_prepare"](state, time.time())
@@ -481,14 +506,22 @@ def dry_run(source):
         saved = H["ws"]; H["ws"] = {}; fails(choose,RuntimeError); H["ws"] = saved
         fails(lambda: ns["_hyap_bank"](cfg,dict(flat=1,nc=100000),"cpu-mock",ws),ValueError)
         fails(lambda: ns["_hyap_prepare"]({"hya":False},time.time()),RuntimeError)
-        H["mod"].hyap_resources = lambda: [96,0,0,163840,0,104,32]
-        fails(lambda: ns["_hyap_prepare"](state,time.time()),RuntimeError)
+        valid = [96,0,1024,162816,1,cregs,24]
+        rejected = 0
+        for index,value in ((0,104),(0,80),(1,200),(4,0),(5,104),(6,32),(3,227*1024)):
+            bad = valid.copy(); bad[index] = value
+            H["mod"].hyap_resources = lambda bad=bad: bad
+            fails(lambda: ns["_hyap_prepare"](state,time.time()),RuntimeError)
+            rejected += 1
+        H["mod"].hyap_resources = lambda: valid
+        ns["_hyap_prepare"](state,time.time())
         H["mod"] = None
         ext.load_inline = lambda **kw: (_ for _ in ()).throw(RuntimeError("dry compile failure"))
         fails(lambda: ns["_hyap_build"](2),RuntimeError)
         assert "dry compile failure" in H["err"]
     return dict(actual_launch_paths=cases, distinct_modules=5, independent_workspaces=5,
-                real_base_prepare=True, default_no_build=True, failure_paths=True)
+                real_base_prepare=True, default_no_build=True, failure_paths=True,
+                consumer_budget=cregs, rejected_resource_vectors=rejected)
 
 
 def protocol_check():
@@ -567,8 +600,24 @@ def protocol_check():
                     if row < min(rows,(c+1)*R):
                         key = row,tid&7; assert key not in visited; visited.add(key)
         assert len(visited) == rows*8
+    # The split drain barrier counts every thread once, in every arrival
+    # order. Only producers exit; all grid-ticket and reset owners remain.
+    import itertools
+    drain_orders = 0
+    for order in itertools.permutations(range(5)):
+        arrivals = set()
+        for wg in order:
+            threads = set(range(wg*128,(wg+1)*128))
+            assert not arrivals & threads
+            arrivals |= threads
+            if len(arrivals) < 640: assert arrivals != set(range(640))
+        assert arrivals == set(range(640))
+        kept = arrivals - set(range(512,640))
+        assert kept == set(range(512)) and 0 in kept
+        drain_orders += 1
     return dict(interleavings=cases,tiles=tiles_checked,partitions=partitions,
-                exact_once_ownership=True,finalize_coverage=True,ring_slots=4)
+                exact_once_ownership=True,finalize_coverage=True,ring_slots=4,
+                drain_barrier_arrival_orders=drain_orders,producer_exit_keeps_all_cleanup_owners=True)
 
 
 def pycompile_without_writes(paths):
@@ -580,8 +629,9 @@ def pycompile_without_writes(paths):
 
 
 def gates(base,source):
+    cregs = literal(source, '_HYAP_CREGS')
     assert OUT.read_bytes() == source.encode('ascii'), 'regenerate lab file'
-    assert sub(sub(sub(source,lab_text(),''),PREP_B,PREP_A),CALL_B,CALL_A) == base
+    assert sub(sub(sub(source,lab_text(cregs),''),PREP_B,PREP_A),CALL_B,CALL_A) == base
     assert literal(source,'HYAP') == {} and literal(source,'HYAP_BUILD') is False
     assert literal(source,'HYAP_TWIN') is False and literal(source,'HYAP_CHUNK') == 4
     for name in ('HYA_CPP_SRC','HYA_CUDA_SRC'):
@@ -599,6 +649,12 @@ def gates(base,source):
         assert cu.count('atomicAdd(S.counter, CHUNK)') == 2
         assert 'flat_finalize<8, true, 512>(p, &A.sense)' in cu
         assert 'mbar_init_n(&A.empty[s], 1)' in cu
+        kernel = cu[cu.index('template<int CHUNK>\n__global__'):cu.index('\nvoid hyap_launch')]
+        assert kernel.count('__syncthreads();') == 1
+        assert kernel.count('bar.arrive 9, 640;') == kernel.count('bar.sync 9, 640;') == 1
+        assert 'return; // no producer owns any finalize/reset row\n  } else {' in kernel
+        assert kernel.index('setmaxnreg.inc') < kernel.index('bar.sync 9') < kernel.index('flat_finalize')
+        assert f'#define HYAP_CREGS {cregs}\n' in cu
     pycompile_without_writes([pathlib.Path(__file__),OUT,ROOT/'tools/box/hyap_check.py'])
     assert b'\r' not in (ROOT/'tools/local/hyap_gate.sh').read_bytes()
     checker = runpy.run_path(str(ROOT/'tools/box/hyap_check.py'))['cpu_schema']()
@@ -617,17 +673,26 @@ def gates(base,source):
             ship.splitlines(),cu.splitlines(),autojunk=False).get_opcodes() if tag!='equal']
     return dict(default_cuda_identical=True,default_restore_byte_identical=True,
         py_compile=True,bash_LF=True,dry_run=dry_run(source),protocol=protocol_check(),checker=checker,
+        compiler_gate=compiler_gate_cpu_check(),
         changed_lines=changes,cuda_changed_lines_HYAP_1_by_CHUNK=cuda_changes,
-        role_registers_EST={'consumer':104,'producer':32,'total':57344},
+        role_registers_EST={'consumer':cregs,'producer':24,'total':512*cregs+128*24},
         smem_bytes_EST={'shared_ring':65536,'team_view_each':48128,'whole_CTA':162816},
         cleanup_coverage={
             'ring_init':'Every CTA, thread 0: all 4 full barriers (128 arrivals), all 4 empty barriers (1 arrival), counter and both team headers; all 640 synchronize',
             'new_KV_patch':'Owning team local threads 0..255, e=tid; e<(hi-lo)*8; e+=256, covers every appended K/V 16-byte vector exactly once',
             'stage_release':'Owning team 0..255 rendezvous after QK wait and V transpose; local thread 0 alone arrives empty, after which only private VT is read',
             'partial_flush':'Each team local threads 0..255: 2 rows x 4 red.v4; tig=0 threads also do 2 red.f32, followed by team sync',
-            'producer_drain':'Threads 512..639 cp_wait<0>; consumers 0..511 wgmma_wait<0>; all 640 rendezvous even with no owned tiles',
+            'producer_drain':'Every CTA threads 512..639 cp_wait<0>, bar.arrive 9,640, then exit; consumers 0..511 wgmma_wait<0> then bar.sync 9,640 even with no owned tiles. 128+512=640 arrivals; no work remains for exited producers',
             'grid_counter_reset':'Every CTA consumer thread 0 contributes exactly one acq_rel ticket; the last resets the alternate counter at 30020+((epoch&1)^1) and writes epoch+1 at 30022',
-            'output_and_workspace_reset':'Every CTA consumers 0..511 execute unchanged flat_finalize<8,true,512>, 8 lanes/row, stride 64 rows. sum_copies clears both float4 accumulators per part and part=0 clears ws_l; rows cover [0,B*8*16). Producers exit only after the all-640 rendezvous and own no cleanup rows'},
+            'output_and_workspace_reset':'Every CTA consumers 0..511 execute unchanged flat_finalize<8,true,512>, 8 lanes/row, stride 64 rows. sum_copies clears both float4 accumulators per part and part=0 clears ws_l; rows cover [0,B*8*16). Producers exit after their drain arrival and own no cleanup rows'},
+        round1_accounting_EST=dict(weight_bytes_per_tile=[0,0],KV_bytes_per_tile=[16384,16384],
+            shared_bytes=[162816,162816],flush_global_payload_bytes_per_team=[33280,33280],
+            consumer_per_thread_per_tile={'QK_wgmma':[2,2],'PV_wgmma':[2,2],'pack2_ex2':[32,32]},
+            producer_per_thread_per_tile={'cp_async16':[8,8],'index_ldg':[4,4]},
+            role_setmaxnreg_instructions_per_thread=[1,1],
+            epilogue_barrier_instructions_per_thread=[1,1],
+            epilogue_change='producer BAR.SYNC -> BAR.ARV plus terminal return; consumer BAR.SYNC retained on barrier 9; no hot-loop edit',
+            compiler_instruction_counts='pending SASS; no latency claim'),
         accounting_EST=dict(weight_bytes_per_tile=[0,0],KV_bytes_per_tile=[16384,16384],
             unique_page_index_bytes_per_tile=[256,256],producer_per_thread_per_tile={'cp_async16':[8,8],'index_ldg':[4,4]},
             consumer_per_thread_per_tile={'QK_wgmma':[2,2],'PV_wgmma':[2,2],'pack2_ex2':[32,32],
@@ -663,7 +728,96 @@ def resources(text):
     return result
 
 
-def linux_gate(base,source,report):
+def resource_verdict(res, ops, cregs):
+    """Keep entry allocation distinct from the inc'd per-role SASS limits."""
+    errors = []
+    if any(res[k] for k in ('stack','spill_stores','spill_loads')):
+        errors.append('nonzero stack/spills')
+    if any(re.search(r'\b(?:LDL|STL)(?:\.|\b)',s) for s in ops):
+        errors.append('local-memory SASS')
+    setregs = [s for s in ops if 'SETMAXNREG' in s]
+    for kind,n in (('consumer',cregs),('producer',24)):
+        if not any(re.search(r'\b0x%x\b' % n,s) for s in setregs):
+            errors.append(f'missing {kind} setmaxnreg {n}')
+    regs = [int(n) for s in ops for n in re.findall(r'\bR(\d+)\b',s)]
+    above = [s for s in ops if any(int(n)>=res['registers'] for n in re.findall(r'\bR(\d+)\b',s))]
+    if res['registers'] > 96: errors.append('entry allocation exceeds 640-thread launch budget')
+    entry_pool = ((res['registers']*32+255)//256)*256*20
+    role_budget = 512*cregs+128*24
+    if role_budget > entry_pool: errors.append('role budget exceeds CTA entry pool (setmaxnreg may block)')
+    if regs and max(regs) >= cregs: errors.append('GPR outside requested consumer budget')
+    if not any('ATOMS' in s for s in ops): errors.append('claim not shared memory')
+    return dict(errors=errors,entry_registers_MEASURED=res['registers'],
+        max_GPR_index_MEASURED=max(regs,default=-1),above_entry_GPR_examples=above[:8],
+        setmaxnreg_SASS=setregs,roles=dict(consumer=cregs,producer=24,source_budget=role_budget),
+        entry_pool_registers_EST=entry_pool,
+        static_instructions_MEASURED=len(ops),shared_claim_SASS=[s for s in ops if 'ATOMS' in s])
+
+
+def compiler_gate_cpu_check():
+    # Regression: a spilling CHUNK must be recorded, not abort later chunks.
+    old = """ptxas info : Compiling entry function '_Z11hyap_kernelILi2EEv' for 'sm_90a'
+ptxas info : Function properties for _Z11hyap_kernelILi2EEv
+    200 bytes stack frame, 692 bytes spill stores, 724 bytes spill loads
+ptxas info : Used 96 registers"""
+    old_res = next(iter(resources(old).values()))
+    assert old_res == dict(registers=96,stack=200,spill_stores=692,spill_loads=724)
+    zero = dict(registers=96,stack=0,spill_stores=0,spill_loads=0)
+    for cr in (112,120):
+        ops = ['SETMAXNREG.DEC 0x18;', f'SETMAXNREG.INC {hex(cr)};',
+               'ATOMS.ADD R4, [R8], R12;', f'FADD R{cr-1}, R2, R3;']
+        assert resource_verdict(old_res,ops,cr)['errors']
+        clean = resource_verdict(zero,ops,cr)
+        if cr == 112: assert not clean['errors']
+        else: assert clean['errors'] == ['role budget exceeds CTA entry pool (setmaxnreg may block)']
+        assert resource_verdict(zero,ops+['LDL R2, [R1];'],cr)['errors']
+        assert resource_verdict(zero,ops[2:],cr)['errors']
+    # cuobjdump's anonymous namespace embeds a source filename hash. Compare
+    # by specialization, not that hash (the old gate never reached this step).
+    assert canonical_attn_name('_ZN36_GLOBAL__N__abc11attn_kernelILi8ELb1ELi0EEEvNS_6ParamsE') == \
+        canonical_attn_name('_ZN39_GLOBAL__N__xyz11attn_kernelILi8ELb1ELi0EEEvNS_6ParamsE')
+    for mode,want,sequence in (('first',112,[(k,112) for k in (2,4,8)]),
+            ('fallback',120,[(k,c) for c in (112,120) for k in (2,4,8)]),
+            ('exception',None,[(k,c) for c in (112,120) for k in (2,4,8)])):
+        calls = []
+        def fake(k,c):
+            calls.append((k,c))
+            if mode == 'exception' and k == 2: raise ValueError('compile fixture')
+            return dict(errors=['spill fixture'] if mode == 'fallback' and c == 112 and k == 2 else [])
+        report = dict(builds={},attempts=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = select_register_budget((112,120),fake,report)
+        assert got == want and calls == sequence,(mode,got,calls)
+        assert all(set(a['chunks']) == {'2','4','8'} for a in report['attempts'])
+    return dict(ptxas_spill_fixture=True,entry_vs_role_budget=True,missing_setmax_rejected=True,
+                local_SASS_rejected=True,anonymous_namespace_normalized=True,CTA_pool_checked=True,
+                all_chunks_after_failure=True,first_passing_budget_stops=True)
+
+
+def canonical_attn_name(name):
+    return name[name.index('attn_kernelI'):]
+
+
+def select_register_budget(candidates,compile_one,report):
+    for cregs in candidates:
+        attempt = dict(consumer=cregs,producer=24,chunks={},status='FAIL')
+        report['attempts'].append(attempt)
+        for k in (2,4,8):
+            label = f'r{cregs}_chunk{k}'
+            try:
+                row = compile_one(k,cregs)
+            except Exception as ex:
+                row = report['builds'].setdefault(label,dict(errors=[]))
+                row['errors'].append(repr(ex))
+                print(json.dumps(dict(build=label,status='FAIL',errors=row['errors'])),flush=True)
+            attempt['chunks'][str(k)] = dict(build=label,errors=row['errors'])
+        if all(not v['errors'] for v in attempt['chunks'].values()):
+            attempt['status'] = 'PASS'
+            return cregs
+    return None
+
+
+def linux_gate(base,source,report,candidates=(112,120)):
     import os
     import shutil
     import sysconfig
@@ -686,10 +840,11 @@ def linux_gate(base,source,report):
     nvcc,cobj,cxx = shutil.which('nvcc'),shutil.which('cuobjdump'),shutil.which(os.environ.get('CXX','c++'))
     assert nvcc and cobj and cxx,'nvcc, cuobjdump and C++20 compiler required'
     report['nvcc'] = run([nvcc,'--version'],'version')
-    ns = namespace(source); report['builds'] = {}; assemblies = {}
-    # A host executable reports actual C++ layout without loading a CUDA module.
-    for k in (0,'twin',2,4,8):
-        label = str(k); cuda = ns['_hyap_src'](k)
+    report['builds'] = {}; report['attempts'] = []; assemblies = {}
+    def compile_one(k,cregs):
+        label = str(k) if k in (0,'twin') else f'r{cregs}_chunk{k}'
+        cuda = literal(base,'HYA_CUDA_SRC') if k in (0,'twin') else _hyap_cuda(literal(base,'HYA_CUDA_SRC'),k,cregs)
+        row = report['builds'][label] = dict(chunk=k,consumer_budget=cregs,errors=[])
         cpp = '#include <torch/extension.h>\n'+literal(base,'HYA_CPP_SRC')
         funcs = ['run']
         if k not in (0,'twin'): cpp += RESOURCE_CPP; funcs.append('hyap_resources')
@@ -700,23 +855,19 @@ def linux_gate(base,source,report):
         log = run([nvcc,'-std=c++20','-O3','-gencode=arch=compute_90a,code=sm_90a','--expt-relaxed-constexpr',
             '-Xptxas=-v,-warn-spills','-Xcompiler=-fPIC',abi,*inc,'-c',str(cu),'-o',str(obj)],label+'_nvcc')
         res = resources(log)
+        row['resources'] = res
+        for name,r in res.items():
+            if 'hyap_kernel' in name or 'attn_kernelILi8ELb1ELi0' in name:
+                print(json.dumps(dict(build=label,kernel=name,MEASURED=r)),flush=True)
         ass = sass_functions(run([cobj,'--dump-sass',str(obj)],label+'_sass'))
         usage = run([cobj,'--dump-resource-usage',str(obj)],label+'_resources')
         assemblies[label] = ass
-        report['builds'][label] = dict(resources=res,resource_usage=usage)
-        if k in (0,'twin'): continue
+        row.update(resources=res,resource_usage=usage)
+        if k in (0,'twin'): return row
         target = next(n for n in res if 'hyap_kernel' in n)
         r = res[target]; ops = ass[target]
-        assert r['spill_stores'] == r['spill_loads'] == r['stack'] == 0,(label,r)
-        assert not any(re.search(r'\b(?:LDL|STL)\b',s) for s in ops),label
-        # Runtime role limits must survive the optimizer; values also recorded
-        # by the pod's cudaFuncGetAttributes/occupancy gate.
-        assert any('SETMAXNREG' in s and '0x68' in s for s in ops),(label,'missing consumer 104')
-        assert any('SETMAXNREG' in s and '0x20' in s for s in ops),(label,'missing producer 32')
-        report['builds'][label]['roles'] = dict(consumer=104,producer=32,source_budget=57344)
-        report['builds'][label]['static_instructions_MEASURED'] = len(ops)
-        report['builds'][label]['shared_claim_SASS'] = [s for s in ops if 'ATOMS' in s]
-        assert report['builds'][label]['shared_claim_SASS'], 'claim not shared memory'
+        row.update(resource_verdict(r,ops,cregs))
+        if re.search(r'setmaxnreg[^\n]*ignored',log,re.I): row['errors'].append('ptxas ignored setmaxnreg')
         # Isolate just the POD layout and measure sizeof with the host C++20
         # compiler, including the real alignas rules from the base source.
         a = cuda.index('struct HyapView {'); b = cuda.index('\n__device__ __forceinline__ bool hyap_patch',a)
@@ -724,26 +875,44 @@ def linux_gate(base,source,report):
         view = view.replace('__device__','').replace('__forceinline__','inline')
         shared = CUDA_KERNEL[CUDA_KERNEL.index('struct alignas(1024) HyapShared'):CUDA_KERNEL.index('\ntemplate<int CHUNK>')]
         cfg = 'template<int L,bool F> struct Cfg { static constexpr int STAGES=4; };\n'
-        host = '#include <cstdint>\n#include <cstdio>\nusing __nv_bfloat16=uint16_t;\nconstexpr int TILE=64, ROWB=128, STAGE_BYTES=8192, MAXB=512, MAXSEG=64;\n'+cfg+view+shared+'\nint main(){printf("%zu %zu\\n",sizeof(HyapView),sizeof(HyapShared));}\n'
+        host = f'#define HYAP_CREGS {cregs}\n'+'#include <cstdint>\n#include <cstdio>\nusing __nv_bfloat16=uint16_t;\nconstexpr int TILE=64, ROWB=128, STAGE_BYTES=8192, MAXB=512, MAXSEG=64;\n'+cfg+view+shared+'\nint main(){printf("%zu %zu\\n",sizeof(HyapView),sizeof(HyapShared));}\n'
         hp,exe = work/(label+'_layout.cpp'),work/(label+'_layout')
         hp.write_bytes(host.encode()); run([cxx,'-std=c++20',str(hp),'-o',str(exe)],label+'_layout_compile')
         sizes = list(map(int,run([str(exe)],label+'_layout_run').split()))
         assert sizes == [48128,162816],('layout accounting drift',sizes)
-        report['builds'][label]['dynamic_smem_bytes_MEASURED'] = sizes[1]
+        row['dynamic_smem_bytes_MEASURED'] = sizes[1]
+        return row
+
+    for k in (0,'twin'): compile_one(k,112)
     # Same source must produce exactly the same ship/twin instructions.
-    for name,ops in assemblies['0'].items():
-        if 'attn_kernel' in name: assert ops == assemblies['twin'][name],name
+    def attn_ops(label):
+        return {canonical_attn_name(n):ops for n,ops in assemblies[label].items() if 'attn_kernel' in n}
+    assert attn_ops('0') == attn_ops('twin'), 'ship/twin SASS drift'
     report['default_twin_SASS_identical'] = True
-    report['status'] = 'CPU_COMPILE_SASS_PASS'
+    cregs = select_register_budget(candidates,compile_one,report)
+    report['selected_consumer_registers'] = cregs
+    if cregs is not None:
+        # Materialize exactly the variant that passed, still default-off;
+        # checker hashes and CPU dry run must refer to this source.
+        _,selected = build(cregs)
+        OUT.write_bytes(selected.encode('ascii'))
+        report['cpu'] = gates(base,selected)
+        report['status'] = 'CPU_COMPILE_SASS_PASS'
+        return selected
+    raise AssertionError('all requested register budgets failed; see every CHUNK in attempts/builds')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--cpu-gate',action='store_true')
     ap.add_argument('--linux-gate',action='store_true')
+    ap.add_argument('--consumer-regs',type=int,choices=(112,120),
+                    help='pin a build budget; Linux gate otherwise tries 112 then 120')
     ap.add_argument('--json',type=pathlib.Path)
     args = ap.parse_args()
-    base,source = build()
+    cregs = args.consumer_regs or (literal(OUT.read_text(encoding='ascii'),'_HYAP_CREGS')
+        if (args.cpu_gate or args.linux_gate) and OUT.exists() else 112)
+    base,source = build(cregs)
     if not (args.cpu_gate or args.linux_gate):
         # Exercise all CUDA construction paths before writing the lab artifact.
         ns = namespace(source)
@@ -756,10 +925,13 @@ def main():
         artifact_sha256={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in artifacts})
     try:
         result['cpu'] = gates(base,source); result['status'] = 'CPU_PASS'
-        if args.linux_gate: linux_gate(base,source,result)
+        if args.linux_gate:
+            source = linux_gate(base,source,result,(args.consumer_regs,) if args.consumer_regs else (112,120))
     except Exception as ex:
         result['status'] = 'FAIL'; result['error'] = repr(ex); raise
     finally:
+        result['output_sha256'] = hashlib.sha256(OUT.read_bytes()).hexdigest()
+        result['artifact_sha256'] = {p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in artifacts}
         if args.json: args.json.write_bytes((json.dumps(result,indent=2)+'\n').encode())
         print(json.dumps(result,indent=2))
 
