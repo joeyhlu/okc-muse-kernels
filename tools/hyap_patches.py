@@ -28,17 +28,13 @@ OUT = ROOT / "kernels/lab/k3_hyap_ab.py"
 # CUDA added only to independently built arms. Ship and twin use the literal
 # base source, including its launch, barriers and exact top-8 layer routing.
 CUDA_SUPPORT = r'''
-// HYAP: 0..255 / 256..511 consumers; 512..639 producer. Named barriers:
+// HYAP: 0..255 / 256..511 consumers; 512..639 producer. Logical groups:
 // 1 = finalize (512 consumers), 2 = producer, 3..6 = individual WGs,
 // 7/8 = consumer teams, 9 = producer drain + consumer rendezvous (640).
 // Barrier 0 is only the full-CTA prologue, before register redistribution.
-template<int ROLE> __device__ __forceinline__ void hyap_sync() {
-  if constexpr (ROLE == 1) asm volatile("bar.sync 2, 128;" ::: "memory");
-  else asm volatile("bar.sync %0, 256;" :: "r"(7 + (int(threadIdx.x) >> 8)) : "memory");
-}
-__device__ __forceinline__ void hyap_wgsync(int wg) {
-  asm volatile("bar.sync %0, 128;" :: "r"(3 + 2 * (int(threadIdx.x) >> 8) + wg) : "memory");
-}
+// All later software waits have M1's 2^24 poll cap. Never trap.
+constexpr unsigned HYAP_POLLS = 1u << 24;
+constexpr int HYAP_ERROR = 30023; // unused by ship's counter/epoch/reset ranges
 // Fixed ring addresses, like ship's embedded Smem arrays: no cached generic
 // pointers from HyapView survive the QK/softmax/PV register-pressure peak.
 // HyapShared's offsetof assertions below check every byte of this ABI.
@@ -55,6 +51,79 @@ __device__ __forceinline__ uint64_t* hyap_empty() { return hyap_full() + 4; }
 __device__ __forceinline__ int* hyap_counter() {
   return reinterpret_cast<int*>(hyap_empty() + 4);
 }
+// These 100 bytes fit in the existing padding before the aligned team views.
+__device__ __forceinline__ int* hyap_arrivals() { return hyap_counter() + 4; }
+__device__ __forceinline__ int* hyap_status() { return hyap_arrivals() + 10; }
+__device__ __forceinline__ int* hyap_issued() { return hyap_status() + 10; }
+__device__ __forceinline__ int* hyap_dead() { return hyap_issued() + 4; }
+__device__ __forceinline__ void hyap_fail(const Params& p, int bit) {
+  atomicOr(hyap_dead(), bit);
+  atomicOr(p.ws_cnt + HYAP_ERROR, bit);
+}
+// Warp arrivals, not thread arrivals. A single CAS arbitrates completion vs
+// timeout: status >= 0 counts completed phases; -(phase+1) poisons that phase.
+// A late reader of an earlier completed phase still succeeds after poisoning.
+template<int N> __device__ __forceinline__ int hyap_arrive(int id) {
+  __threadfence_block();
+  __syncwarp();
+  int ticket = 0;
+  if ((threadIdx.x & 31) == 0) ticket = atomicAdd(hyap_arrivals() + id, 1);
+  ticket = __shfl_sync(0xffffffffu, ticket, 0);
+  const int phase = ticket / (N / 32);
+  if ((threadIdx.x & 31) == 0 && ticket % (N / 32) == N / 32 - 1)
+    atomicCAS(hyap_status() + id, phase, phase + 1);
+  return phase;
+}
+template<int N> __device__ __forceinline__ bool hyap_bar(const Params& p, int id) {
+  const int phase = hyap_arrive<N>(id);
+  int value = 0;
+  if ((threadIdx.x & 31) == 0) {
+    for (unsigned poll = 0; poll <= HYAP_POLLS; ++poll) {
+      value = atomicAdd(hyap_status() + id, 0);
+      if (value < 0 || value > phase) break;
+      if (poll == HYAP_POLLS) {
+        atomicCAS(hyap_status() + id, phase, -(phase + 1));
+        value = atomicAdd(hyap_status() + id, 0);
+        if (value < 0) hyap_fail(p, 4);
+      }
+    }
+  }
+  value = __shfl_sync(0xffffffffu, value, 0);
+  __threadfence_block();
+  return value < 0 ? phase < -value - 1 : value > phase;
+}
+template<int ROLE> __device__ __forceinline__ bool hyap_sync(const Params& p) {
+  if constexpr (ROLE == 1) return hyap_bar<128>(p, 2);
+  else return hyap_bar<256>(p, 7 + (int(threadIdx.x) >> 8));
+}
+__device__ __forceinline__ bool hyap_wgsync(const Params& p, int wg) {
+  return hyap_bar<128>(p, 3 + 2 * (int(threadIdx.x) >> 8) + wg);
+}
+// Only the role leader polls the ring; the reusable role barrier publishes a
+// uniform success/failure decision. Failure poisons that barrier's next phase.
+// Successful phases remain successful, even if another group fails later.
+template<int ROLE> __device__ __forceinline__ bool hyap_wait(
+    const Params& p, uint64_t* bar, int parity, int ticket = -1) {
+  const int leader = ROLE == 1 ? 512 : (int(threadIdx.x) & ~255);
+  if (int(threadIdx.x) == leader) {
+    bool ok = false;
+    for (unsigned poll = 0; poll < HYAP_POLLS; ++poll) {
+      if (*reinterpret_cast<volatile int*>(hyap_dead())) break;
+      if (ticket >= 0 && *reinterpret_cast<volatile int*>(hyap_issued() + ticket % 4) != ticket) continue;
+      int ready;
+      asm volatile("{ .reg .pred q; mbarrier.test_wait.parity.shared::cta.b64 q, [%1], %2; selp.b32 %0, 1, 0, q; }"
+        : "=r"(ready) : "r"(smem_u32(bar)), "r"(parity) : "memory");
+      if (ready) { ok = true; break; }
+    }
+    if (!ok) {
+      hyap_fail(p, ROLE == 1 ? 1 : 2);
+      const int id = ROLE == 1 ? 2 : 7 + (int(threadIdx.x) >> 8);
+      const int phase = *reinterpret_cast<volatile int*>(hyap_status() + id);
+      if (phase >= 0) atomicCAS(hyap_status() + id, phase, -(phase + 1));
+    }
+  }
+  return hyap_sync<ROLE>(p);
+}
 __device__ __forceinline__ int hyap_read(const volatile int* ptr) {
   // Volatile shared load prevents ptxas carrying scheduler/flush metadata
   // through the math. Broadcast preserves ship's proven warp uniformity.
@@ -67,6 +136,7 @@ struct alignas(1024) HyapShared {
   alignas(1024) uint8_t k[4 * STAGE_BYTES], v[4 * STAGE_BYTES];
   uint64_t full[4], empty[4];
   int counter, sense, total, nseg;
+  int arrivals[10], status[10], issued[4], dead;
   int cum[33], seg[32][3], tile[33];
   HyapView team[2];
 };
@@ -76,6 +146,7 @@ static_assert(__builtin_offsetof(HyapShared, v) == 4 * STAGE_BYTES, "HYAP v ABI"
 static_assert(__builtin_offsetof(HyapShared, full) == 8 * STAGE_BYTES, "HYAP full ABI");
 static_assert(__builtin_offsetof(HyapShared, empty) == 8 * STAGE_BYTES + 32, "HYAP empty ABI");
 static_assert(__builtin_offsetof(HyapShared, counter) == 8 * STAGE_BYTES + 64, "HYAP counter ABI");
+static_assert(__builtin_offsetof(HyapShared, arrivals) == 8 * STAGE_BYTES + 80, "HYAP sync ABI");
 static_assert(HYAP_CREGS == 112, "HYAP consumer budget");
 static_assert(512 * HYAP_CREGS + 128 * 24 <= 96 * 640, "HYAP CTA entry pool");
 
@@ -86,16 +157,20 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
   const int tid = threadIdx.x, pair = blockIdx.z;
   if (tid == 0) {
     A.counter = 0; A.cum[0] = 0;
+    A.dead = *reinterpret_cast<volatile int*>(p.ws_cnt + HYAP_ERROR);
+    for (int i = 0; i < 10; ++i) A.arrivals[i] = A.status[i] = 0;
+    for (int i = 0; i < 4; ++i) A.issued[i] = -1;
     // The base reads seq_lens before its dependency wait as well.
     for (int b = 0; b < p.B; ++b) A.cum[b + 1] = A.cum[b] + __ldg(p.seq_lens + b) + 8;
     const int64_t T = int64_t(A.cum[p.B]) + (p.B - 1) * 600;
     // c/G == (2*c)/(2*G): exact union of adjacent ship ranges, same SEGK.
     auto vmap = [&](int v) {
       int lo = 0, hi = p.B - 1;
-      while (lo < hi) {
+      for (int steps = 0; lo < hi && steps < 6; ++steps) {
         const int mid = (lo + hi + 1) >> 1;
         if (A.cum[mid] + mid * 600 <= v) lo = mid; else hi = mid - 1;
       }
+      if (lo < hi) hyap_fail(p, 8);
       return min(v - lo * 600, A.cum[lo + 1]);
     };
     const int cs = vmap(int(int64_t(blockIdx.x) * T / gridDim.x));
@@ -119,6 +194,7 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
     for (int t = 0; t < 2; ++t) {
       auto& S = A.team[t];
       S.ticket = 0; S.claim_end = 0; S.prepared_b = -1; S.segment_s = 0;
+      S.turns = 0; S.last = -1; S.active = 0;
     }
     mbar_fence_init();
     cp_async4(smem_u32(&A.sense), p.ws_cnt + 30022);
@@ -129,13 +205,13 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(24));
     for (int s = 0; s < A.nseg; ++s) {
       const int b = A.seg[s][0], seq = __ldg(p.seq_lens + b);
-      hyap_segment<8, true, 1, CHUNK>(p, A.team[0], b, pair, A.seg[s][1] == 0,
-        A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true);
+      if (!hyap_segment<8, true, 1, CHUNK>(p, A.team[0], b, pair, A.seg[s][1] == 0,
+        A.seg[s][1], A.seg[s][2], seq, seq + 8, 0, 0, A.tile[s], 0, true)) break;
     }
     cp_wait<0>(); // every producer async copy is complete before the CTA rendezvous
     // Match ship's terminal producer branch: do not merge the 24-register
     // producer path back into the consumer register-allocation region.
-    asm volatile("bar.arrive 9, 640;" ::: "memory");
+    hyap_arrive<640>(9);
     return; // no producer owns any finalize/reset row
   } else {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(HYAP_CREGS));
@@ -144,29 +220,37 @@ __global__ void __launch_bounds__(640, 1) hyap_kernel(const __grid_constant__ Pa
       S.ticket = atomicAdd(hyap_counter(), CHUNK);
       S.claim_end = S.ticket + CHUNK;
     }
-    hyap_sync<2>();
-    while (hyap_read(&S.ticket) < A.total) {
+    for (;;) { // leader-owned cap and immutable team decision, below
       // Only the elected thread owns request/claim bookkeeping. Nothing in
       // this scope is live across the inlined segment's per-tile math.
       if ((tid & 255) == 0) {
+        S.active = S.ticket < A.total && !A.dead;
+        if (S.active && (++S.turns > A.total + 1 || S.turns > int(HYAP_POLLS) || S.ticket <= S.last)) {
+          hyap_fail(p, 8); S.active = 0;
+        }
+        S.last = S.ticket;
+        if (S.active) {
         int s = S.segment_s;
-        while (s + 1 < A.nseg && S.ticket >= A.tile[s + 1]) ++s;
+        for (int step = 0; step < 32 && s + 1 < A.nseg && S.ticket >= A.tile[s + 1]; ++step) ++s;
         S.segment_s = s; S.b = A.seg[s][0];
         S.start = A.seg[s][1]; S.end = A.seg[s][2];
         S.seq = __ldg(p.seq_lens + S.b); S.tb = A.tile[s];
         S.begin = S.ticket - S.tb; S.limit = A.tile[s + 1] - S.tb;
         S.stop = min(int(S.limit), int(S.claim_end - S.tb));
+        if (S.begin < 0 || S.begin >= S.stop || S.stop > S.limit) { hyap_fail(p, 8); S.active = 0; }
+        }
       }
-      hyap_sync<2>();
-      hyap_segment<8, true, 2, CHUNK>(p, S, hyap_read(&S.b), pair, hyap_read(&S.start) == 0,
+      if (!hyap_sync<2>(p) || !hyap_read(&S.active)) break;
+      if (!hyap_segment<8, true, 2, CHUNK>(p, S, hyap_read(&S.b), pair, hyap_read(&S.start) == 0,
         hyap_read(&S.start), hyap_read(&S.end), hyap_read(&S.seq), hyap_read(&S.seq) + 8,
-        0, 0, hyap_read(&S.tb), 0, true);
+        0, 0, hyap_read(&S.tb), 0, true)) break;
     }
     wgmma_wait<0>();
     // All 512 consumers, including idle teams, wait for all 128 producers.
     // Keep this and finalize inside the inc'd branch, as attn_kernel does.
-    asm volatile("bar.sync 9, 640;" ::: "memory");
-    flat_finalize<8, true, 512>(p, &A.sense);
+    cp_wait<0>();
+    hyap_bar<640>(p, 9);
+    hyap_finalize<8, true, 512>(p, &A.sense);
   }
 }
 
@@ -188,11 +272,10 @@ void hyap_launch(Params p, dim3 grid, cudaStream_t stream, bool pdl) {
   cfg.gridDim = grid; cfg.blockDim = dim3(640, 1, 1);
   cfg.dynamicSmemBytes = sizeof(HyapShared); cfg.stream = stream;
   cudaLaunchAttribute attr{};
-  if (pdl) {
-    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr.val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = &attr; cfg.numAttrs = 1;
-  }
+  // This grid contains an all-CTA finalize. Admission must guarantee residency.
+  attr.id = cudaLaunchAttributeCooperative;
+  attr.val.cooperative = 1;
+  cfg.attrs = &attr; cfg.numAttrs = 1;
   TORCH_CHECK(cudaLaunchKernelEx(&cfg, hyap_kernel<HYAP_CHUNK>, p) == cudaSuccess);
 }
 std::vector<int64_t> hyap_resources() {
@@ -219,7 +302,8 @@ def _hyap_cuda(ship, chunk, cregs=112):
     view = ship[a:b].replace('template <int L, bool F>\nstruct Smem {',
         'struct HyapView {\nstatic constexpr int L = 8; static constexpr bool F = true;\n'
         'volatile int ticket, claim_end, prepared_b, segment_s;\n'
-        'volatile int b, start, end, seq, tb, begin, limit, stop, more;')
+        'volatile int b, start, end, seq, tb, begin, limit, stop, more;\n'
+        'volatile int turns, last, active;')
     for field in ('uint8_t k[Cfg<L, F>::STAGES * STAGE_BYTES];',
                   'uint8_t v[Cfg<L, F>::STAGES * STAGE_BYTES];',
                   'uint64_t full[8];', 'uint64_t empty[8];'):
@@ -273,7 +357,8 @@ const float sl2 = p.scale_log2 * kscale;
     seg = sub(seg, 'int st_c = tb % STAGES;\nuint32_t ph_c = (uint32_t)(tb / STAGES) & 1u;',
         'int st_c = hyap_read(&S.ticket) % STAGES;\nuint32_t ph_c = (uint32_t)(hyap_read(&S.ticket) / STAGES) & 1u;')
     seg = sub(seg, 'const int nit = ntiles;', '// Loop bounds and continuation state live in the team header.')
-    seg = sub(seg, 'for (int jj = 0; jj < nit; ++jj)', 'for (int jj = hyap_read(&S.begin); ; ++jj)')
+    seg = sub(seg, 'for (int jj = 0; jj < nit; ++jj)',
+        'for (int jj = hyap_read(&S.begin); jj < hyap_read(&S.limit) && jj < int(HYAP_POLLS); ++jj)')
     seg = sub(seg, 'if (patched || i == 0)', 'if (patched || first)')
     seg = sub(seg, 'if (jj == 0)', 'if (first)')
     seg = sub(seg, 'mbar_arrive(&S.empty[st]);',
@@ -311,6 +396,32 @@ const int bp = hyap_read(&S.b) * (p.Hkv >> 1) + int(blockIdx.z);
 if (do_red) {
 ''')
     seg = sub(seg, 'const bool mode1 =', '} // recomputed flush address\nconst bool mode1 =')
+    # The earlier symbolic ring model stored full ticket identities. Real
+    # mbarriers store one parity bit: a future claim can alias an OLD phase.
+    # Publish the issued generation before any consumer may test its phase.
+    seg = sub(seg, 'cp_async_mbar_arrive(&S.full[st]);',
+        'cp_async_mbar_arrive(&S.full[st]);\nif (q == 0) { __threadfence_block(); '
+        '*reinterpret_cast<volatile int*>(hyap_issued() + st) = tb + x; }')
+    seg = sub(seg, 'if (tb + x >= STAGES) mbar_wait_full(&S.empty[st], (((tb + x) / STAGES) - 1) & 1);',
+        'if (tb + x >= STAGES && !hyap_wait<1>(p, &S.empty[st], (((tb + x) / STAGES) - 1) & 1)) return false;')
+    seg = sub(seg, 'mbar_wait_full(&S.full[st_c], ph_c);',
+        'if (!hyap_wait<2>(p, &S.full[st_c], ph_c, hyap_read(&S.tb) + jj)) return false;')
+    # Even inactive template branches have no inherited unbounded ring helper.
+    seg = seg.replace('mbar_wait_full(&S.pbar[slot], ((pgb + x) / PS) & 1);',
+        'hyap_wait<ROLE>(p, &S.pbar[slot], ((pgb + x) / PS) & 1);')
+    seg = seg.replace('mbar_wait_full(&S.full[st], ((tb + i) / STAGES) & 1);',
+        'hyap_wait<ROLE>(p, &S.full[st], ((tb + i) / STAGES) & 1);')
+    # A failed group leaves only at a phase agreed by every participating warp.
+    # Main keeps ALL consumer threads for the drain and reset/finalize loops.
+    seg = seg.replace('hyap_sync<ROLE>();', 'if (!hyap_sync<ROLE>(p)) return false;')
+    seg = seg.replace('hyap_wgsync(wgi);', 'if (!hyap_wgsync(p, wgi)) return false;')
+    seg = seg.replace('asm volatile("bar.sync 2, %0;\\n" ::"n"(NP) : "memory");',
+        'if (!hyap_sync<ROLE>(p)) return false;')
+    seg = seg.replace('pdl_wait();', '// cooperative launch: stream dependency already satisfied')
+    # Publish the cache marker only after every team warp has consumed the old
+    # marker and finished Q8; the existing inner barriers protect branch entry.
+    seg = sub(seg, 'if (tid == 0) S.prepared_b = b;',
+        'if (!hyap_sync<ROLE>(p)) return false;\nif (tid == 0) S.prepared_b = b;')
     # Replace only field tokens: kn/kvq/etc are separate private team arrays.
     patch_source = CUDA_PATCH
     for field in ('k', 'v', 'full', 'empty'):
@@ -321,7 +432,14 @@ if (do_red) {
     # Smem-only helpers for the HyapView specialization.
     seg = seg.replace('if (M_CL)', 'if constexpr (false)')
     seg = seg.replace('if (M_CL &&', 'if (false &&')
-    extra = CUDA_SUPPORT + view + patch_source + seg + CUDA_KERNEL
+    fa = ship.index('template <int L, bool WS, int NT>\n__device__ __forceinline__ void flat_finalize')
+    fb = ship.index('template <int L, bool FLAT, int MODE = 0>\n__global__', fa)
+    finalize = ship[fa:fb].replace('void flat_finalize(', 'void hyap_finalize(')
+    finalize = finalize.replace('pdl_wait();', '// cooperative launch has no PDL edge')
+    finalize = finalize.replace('csync<WS, NT>();', 'hyap_bar<NT>(p, 1);')
+    finalize = finalize.replace('SPIN_CHECK;',
+        'if (++_spin_n > HYAP_POLLS) { hyap_fail(p, 16); break; }')
+    extra = CUDA_SUPPORT + view + patch_source + seg + finalize + CUDA_KERNEL
     anchor = 'template <int L>\nvoid launch(const Params& p0, dim3 grid, cudaStream_t stream, int cs, bool pdl) {'
     result = sub(ship, anchor, extra + '\n' + anchor + '''
 if constexpr (L == 8) {
@@ -431,6 +549,14 @@ def _hyap_bank(cfg, plan, dev, ws):
     if H["mod"] is None or own is None or own[1].numel() < cfg["batch"]*(cfg["num_kv_heads"]//2)*plan["nc"]*8*16:
         raise RuntimeError("HYAP bank unavailable: set HYAP_BUILD=True before prepare")
     return H["mod"], own
+
+def _hyap_error(arm, dev):
+    # Read AFTER a call/replay, never inside capture. Sticky until workspace
+    # destruction: the launch and flat_finalize deliberately never clear it.
+    if arm in (0, "twin"):
+        return 0
+    ws = _HYAP[arm]["ws"][str(dev)]
+    return int(ws[2][30023].item())
 # HYAP END
 '''
 
@@ -488,6 +614,9 @@ def dry_run(source):
         def __truediv__(self, _): return self
         def __rtruediv__(self, _): return self
         def __rpow__(self, _): return self
+        def __getitem__(self, i):
+            assert i == 30023 and self.numel() > i
+            return types.SimpleNamespace(item=lambda: getattr(self, 'error', 0))
 
     class Module:
         def __init__(self, name): self.name, self.calls = name, []
@@ -496,7 +625,8 @@ def dry_run(source):
 
     allocs, builds = [], []
     def tensor(shape, **kw):
-        t = Tensor(shape, kw.get("device", "cpu-mock")); allocs.append(t); return t
+        dev = kw.get("device", "cpu-mock")
+        t = Tensor(shape, "cuda:0" if dev == "cuda" else dev); allocs.append(t); return t
     def loader(**kw):
         builds.append(kw)
         return Module(kw["name"])
@@ -524,6 +654,13 @@ def dry_run(source):
         banks = [ns["_HYA"]] + list(ns["_HYAP"].values())
         assert len({id(b["mod"]) for b in banks}) == 5
         assert len({id(t) for b in banks for t in b["ws"]["cpu-mock"]}) == 15
+        for arm in (0, 'twin', 2, 4, 8):
+            assert ns['_hyap_error'](arm, 'cpu-mock') == 0
+            if isinstance(arm, int) and arm:
+                flag = ns['_HYAP'][arm]['ws']['cpu-mock'][2]
+                flag.error = 31
+                assert ns['_hyap_error'](arm, 'cpu-mock') == 31
+                flag.error = 0
         cases = 0
         for B in (1, 8, 16, 32, 33):
             for L in (1, 8):
@@ -579,9 +716,27 @@ def dry_run(source):
         ext.load_inline = lambda **kw: (_ for _ in ()).throw(RuntimeError("dry compile failure"))
         fails(lambda: ns["_hyap_build"](2),RuntimeError)
         assert "dry compile failure" in H["err"]
+        # Execute every standalone smoke prepare/selection path too; no layer
+        # import, fabricated state accessor, actual JIT, or CUDA initialization.
+        smoke = runpy.run_path(str(ROOT/'tools/box/hyap_smoke.py'))
+        smoke_paths = 0
+        for chunk in (2,4,8):
+            only = namespace(source)
+            pair = [Module('ship'), Module('hyap')]
+            smoke_state = smoke['prepare_banks'](only, torch, pair, chunk, 'cuda')
+            assert smoke_state['router'].device == 'cuda:0'
+            assert list(only['_HYAP']) == [chunk]
+            assert only['_HYA']['ws'].keys() == only['_HYAP'][chunk]['ws'].keys() == {'cuda:0'}
+            for B in (16,32):
+                for arm in (0,1):
+                    smoke['select'](only,B,chunk,arm)
+                    cfg = dict(batch=B,q_len=8,window=0,num_kv_heads=2)
+                    selected, _ = only['_hyap_bank'](cfg,dict(flat=1,nc=1),'cuda:0',only['_HYA']['ws']['cuda:0'])
+                    assert selected is pair[arm]
+                    smoke_paths += 1
     return dict(actual_launch_paths=cases, distinct_modules=5, independent_workspaces=5,
-                real_base_prepare=True, default_no_build=True, failure_paths=True,
-                consumer_budget=cregs, rejected_resource_vectors=rejected)
+                real_base_prepare=True, default_no_build=True, failure_paths=True, sticky_error_read=True,
+                consumer_budget=cregs, rejected_resource_vectors=rejected, smoke_prepare_and_select_paths=smoke_paths)
 
 
 def protocol_check():
@@ -759,11 +914,64 @@ def control_scratch_check():
                 exact_once=True,contiguous_flushes=True,request_crossings_and_empty=True)
 
 
+def bounded_protocol_check():
+    """Model the actual parity predicate and CAS arbitration, including faults."""
+    import itertools
+    # mbarrier.test_wait.parity is phase != requested, NOT ticket == produced.
+    aliases = []
+    for chunk in (2, 4, 8):
+        ticket = chunk
+        produced = -1
+        phase = 0
+        if phase != (ticket // 4) % 2:
+            aliases.append((chunk, 'before_first_issue'))
+        produced = 0
+        phase = 1
+        if ticket % 4 == 0 and phase != (ticket // 4) % 2:
+            aliases.append((chunk, 'after_tile_zero'))
+        assert not (produced == ticket and phase != (ticket // 4) % 2)
+    assert (4, 'before_first_issue') in aliases and (8, 'after_tile_zero') in aliases
+    generations = 0
+    for ticket in range(128):
+        parity = (ticket // 4) & 1
+        for issued in range(-4 + ticket % 4, ticket + 1, 4):
+            for completed in (False, True):
+                phase = ((issued // 4) + int(completed)) & 1
+                ready = issued == ticket and phase != parity
+                assert ready == (issued == ticket and completed)
+                generations += 1
+    # Timeout vs final arrival have exactly one winning CAS. Every delayed
+    # waiter gets the same answer, even after the NEXT phase is poisoned.
+    races = 0
+    for phase in range(4):
+        for order in itertools.permutations(('complete', 'timeout')):
+            value = phase
+            for event in order:
+                if value == phase: value = phase + 1 if event == 'complete' else -(phase + 1)
+            def result(v, p): return p < -v - 1 if v < 0 else v > p
+            assert result(value, phase) == (order[0] == 'complete')
+            if value > 0:
+                value = -(phase + 2)  # following phase failed
+                assert result(value, phase) and not result(value, phase + 1)
+            races += 1
+    # The outer loop faults on a returned segment that didn't advance, on a
+    # backwards claim, and on an empty/out-of-range per-request interval.
+    for before, after in ((0,0), (7,3), (16,16)):
+        assert after <= before
+    for begin, stop, limit in ((0,0,1), (-1,1,2), (1,3,2)):
+        assert begin < 0 or begin >= stop or stop > limit
+    return dict(parity_aliases_reproduced=aliases, generation_phase_checks=generations,
+                phase_completion_timeout_races=races,
+                missing_arriver_poisons_phase=True, late_arrivals_cannot_resurrect=True,
+                prior_completed_phase_stays_success=True, no_progress_rejected=True,
+                software_poll_cap=1 << 24, hardware_drains='cp.async/WGMMA issued operations only')
+
+
 def math_path_check(ship, candidate):
     """Compare complete math regions, not just instruction totals or pack2."""
     a = candidate.index('bool hyap_segment')
     b = candidate.index('struct alignas(1024) HyapShared', a)
-    seg = candidate[a:b].replace('hyap_wgsync(wgi);', 'wgsync(wgi);')
+    seg = candidate[a:b].replace('if (!hyap_wgsync(p, wgi)) return false;', 'wgsync(wgi);')
     for field in ('k','v','full','empty'):
         seg = seg.replace('hyap_'+field+'()', 'S.'+field)
     regions = {
@@ -813,19 +1021,23 @@ def gates(base,source):
         assert 'int nit =' not in segment and 'jj + 1 == hyap_read(&S.stop)' in segment
         assert segment.index('uint32_t qa8') < segment.index('float o[MT][8][4]')
         assert 'const int bp = hyap_read(&S.b)' in segment
-        assert 'flat_finalize<8, true, 512>(p, &A.sense)' in cu
+        assert 'hyap_finalize<8, true, 512>(p, &A.sense)' in cu
         assert 'mbar_init_n(&A.empty[s], 1)' in cu
         kernel = cu[cu.index('template<int CHUNK>\n__global__'):cu.index('\nvoid hyap_launch')]
         assert kernel.count('__syncthreads();') == 1
-        assert kernel.count('bar.arrive 9, 640;') == kernel.count('bar.sync 9, 640;') == 1
+        assert kernel.count('hyap_arrive<640>(9);') == kernel.count('hyap_bar<640>(p, 9);') == 1
         assert 'return; // no producer owns any finalize/reset row\n  } else {' in kernel
-        assert kernel.index('setmaxnreg.inc') < kernel.index('bar.sync 9') < kernel.index('flat_finalize')
+        assert kernel.index('setmaxnreg.inc') < kernel.index('hyap_bar<640>') < kernel.index('hyap_finalize')
+        assert 'mbar_wait_full(' not in segment
+        assert 'jj < hyap_read(&S.limit)' in segment and 'S.ticket <= S.last' in kernel
+        assert 'cudaLaunchAttributeCooperative' in cu[cu.index('void hyap_launch'):cu.index('std::vector<int64_t> hyap_resources')]
         assert f'#define HYAP_CREGS {cregs}\n' in cu
         consumer = kernel[kernel.index('setmaxnreg.inc'):]
         assert 'int s = 0;' not in consumer and 'S.segment_s = s;' in consumer
-    pycompile_without_writes([pathlib.Path(__file__),OUT,ROOT/'tools/box/hyap_check.py'])
+    pycompile_without_writes([pathlib.Path(__file__),OUT,ROOT/'tools/box/hyap_check.py',ROOT/'tools/box/hyap_smoke.py'])
     assert b'\r' not in (ROOT/'tools/local/hyap_gate.sh').read_bytes()
     checker = runpy.run_path(str(ROOT/'tools/box/hyap_check.py'))['cpu_schema']()
+    smoke = runpy.run_path(str(ROOT/'tools/box/hyap_smoke.py'))['cpu_check']()
     changes = [{'kind':tag,'base_lines':[i+1,j] if i<j else [],'insert_after':i if i==j else None,
                 'lab_lines':[u+1,v]} for tag,i,j,u,v in difflib.SequenceMatcher(None,
                 base.splitlines(),source.splitlines(),autojunk=False).get_opcodes() if tag!='equal']
@@ -840,8 +1052,8 @@ def gates(base,source):
             'variant_CUDA_lines':[u+1,v]} for tag,i,j,u,v in difflib.SequenceMatcher(None,
             ship.splitlines(),cu.splitlines(),autojunk=False).get_opcodes() if tag!='equal']
     return dict(default_cuda_identical=True,default_restore_byte_identical=True,
-        py_compile=True,bash_LF=True,dry_run=dry_run(source),protocol=protocol_check(),checker=checker,
-        compiler_gate=compiler_gate_cpu_check(),control_scratch=control_scratch_check(),
+        py_compile=True,bash_LF=True,dry_run=dry_run(source),protocol=protocol_check(),checker=checker,smoke=smoke,
+        compiler_gate=compiler_gate_cpu_check(),control_scratch=control_scratch_check(),bounded_protocol=bounded_protocol_check(),
         ship_math_fragment_sha256_by_chunk=math_hashes,
         changed_lines=changes,cuda_changed_lines_HYAP_1_by_CHUNK=cuda_changes,
         role_registers_EST={'consumer':cregs,'producer':24,'total':512*cregs+128*24},
@@ -850,12 +1062,49 @@ def gates(base,source):
             'ring_init':'Every CTA, thread 0: all 4 full barriers (128 arrivals), all 4 empty barriers (1 arrival), counter and both team headers; all 640 synchronize',
             'new_KV_patch':'Owning team local threads 0..255, e=tid; e<(hi-lo)*8; e+=256, covers every appended K/V 16-byte vector exactly once',
             'stage_release':'Owning team 0..255 rendezvous after QK wait and V transpose; local thread 0 alone arrives empty, after which only private VT is read',
-            'scheduler_header':'Every nonempty owning team, local thread 0 writes all 9 segment fields, local threads 0..255 rendezvous before reads. At each stop, all 256 rendezvous before/after thread 0 updates ticket/end/more/stop. No team exits before its partial flush',
-            'partial_flush':'Each team local threads 0..255: 2 rows x 4 red.v4; tig=0 threads also do 2 red.f32, followed by team sync',
-            'producer_drain':'Every CTA threads 512..639 cp_wait<0>, bar.arrive 9,640, then exit; consumers 0..511 wgmma_wait<0> then bar.sync 9,640 even with no owned tiles. 128+512=640 arrivals; no work remains for exited producers',
+            'scheduler_header':'Every team local thread 0 writes active/turns/last and 9 segment fields; all local threads 0..255 rendezvous before decisions. All 256 rendezvous before/after claim updates. Active/ticket decisions cannot change before the next group rendezvous',
+            'partial_flush':'Healthy team local threads 0..255: 2 rows x 4 red.v4; tig=0 threads also do 2 red.f32, followed by team sync. Failed segments may omit partials, but keep ALL consumer threads for finalize; sticky error makes the incomplete result invalid',
+            'producer_drain':'Every CTA threads 512..639 cp_wait<0>, 4 warp arrivals at software group9 then exit. Consumers 0..511 drain wgmma/cp then 16 warp arrivals/waits at group9 even after segment failure or with no tiles. 4+16=20; exited producers own no cleanup rows',
             'grid_counter_reset':'Every CTA consumer thread 0 contributes exactly one acq_rel ticket; the last resets the alternate counter at 30020+((epoch&1)^1) and writes epoch+1 at 30022',
-            'output_and_workspace_reset':'Every CTA consumers 0..511 execute unchanged flat_finalize<8,true,512>, 8 lanes/row, stride 64 rows. sum_copies clears both float4 accumulators per part and part=0 clears ws_l; rows cover [0,B*8*16). Producers exit after their drain arrival and own no cleanup rows'},
-        round2_accounting_EST=dict(weight_bytes_per_tile=[0,0],KV_bytes_per_tile=[16384,16384],
+            'output_and_workspace_reset':'Every CTA consumers 0..511 execute hyap_finalize<8,true,512>, unchanged output/reset body: c in [0,131], R=ceil(B*128/132), r in [cR,min(B*128,(c+1)R)), 8 lanes/row, stride64. sum_copies clears both float4 accumulators per part; part0 clears ws_l. Software group1 has 16 warps. No consumer early-return skips its rows',
+            'sticky_error':'Workspace counter index30023 is NEVER reset by any kernel or helper. Python reads after eager calls/replays. A timed-out global finalize is invalid and workspace reuse is forbidden by the checker'},
+        round3_accounting_EST=dict(weight_bytes_per_tile=[0,0],KV_bytes_per_tile=[16384,16384],
+            page_index_bytes_per_tile=[256,256],dynamic_smem_bytes=[162816,162816],
+            protocol_shared_payload_bytes_added=100,team_header_bytes_added=12,
+            producer_tile={'cp_async16_per_thread':[8,8],'index_ldg_per_thread':[4,4],
+                'issued_generation_store_thread512_bytes':[0,4],
+                'empty_wait':'before: per-thread unbounded try_wait; after: leader at most 2^24 dead-load/test_wait polls, one bounded role barrier per reused slot'},
+            consumer_tile={'QK_wgmma_per_thread':[2,2],'PV_wgmma_per_thread':[2,2],
+                'pack2_ex2_per_thread':[32,32],
+                'loop_limit_LDS_SHFL_pairs_per_thread':[0,1],
+                'loop_limit_shared_load_bytes_per_thread':[0,4],
+                'full_wait':'before: per-thread unbounded try_wait; after: leader at most 2^24 dead-load/issued-load/test_wait polls, plus one role barrier',
+                'sync_sites':'existing team-release and 2 WG sync sites change from bar.sync to bounded software barriers; first/patch/claim/request sync sites also change'},
+            every_replaced_barrier_per_thread={'bar_sync':[1,0],'threadfence_block':[0,2],
+                'syncwarp':[0,1],'SHFL':[0,2],
+                'warp_leader_shared_atomicAdd_arrival':[0,1],
+                'warp_leader_shared_atomicAdd_poll':[0,'1..2^24+1'],
+                'last_arriving_warp_leader_CAS':[0,1]},
+            barrier_shared_bytes='4B arrival RMW + 4B status per warp poll; 4B CAS by last warp. Shared scratch, not weight traffic',
+            scheduler_per_request='leader adds turns increment, last/active stores (12B), progress/interval comparisons; segment walk at most32; outer at most total+1',
+            claim_and_flush='unchanged 1 shared claim atomic/chunk; 33280B FP32 reduction payload/team flush',
+            fault_path='two 4B sticky atomicOr (shared+workspace) per elected fault reporter; no new weight reads',
+            sticky_initial_read='4B workspace read per CTA per call; preexisting sticky failure is copied into CTA dead',
+            instructions='EST source operations only; exact compiled instruction counts and 0 spill/stack require Linux gate; no time-saving claim'),
+        loop_wait_audit={
+            'route':'B16/B32, L8, full, Hkv2, nc1, flat/coop -> hyap_kernel<2|4|8> -> hyap_segment<8,true,ROLE1|2,CHUNK,MODE3>',
+            'vmap':'6 bisections (B<=32); unfinished search sets bit8',
+            'metadata':'B<=32 scans; <=32 segments; 4 rings; 2 teams; fixed initialization loops',
+            'producer':'<=nseg<=32; per segment ceil((end-start)/64) iterations; every recycled empty wait has 2^24 cap and propagates false',
+            'consumer':'leader turns <=total+1 and <=2^24, strictly increasing ticket; segment walk <=32; jj bounded by request limit and2^24, no-progress return sets bit8',
+            'ring':'leader tests issued ticket before parity; <=2^24 polls then bit1/2 and poisons group phase',
+            'groups':'2/3..6/7..8/9/1 all software CAS phases, <=2^24 polls; completion and timeout cannot disagree',
+            'finalize':'same M1 counter cap, now workspace bit16; finite 8-lane output/reset loop',
+            'patch':'<=8 appended rows *8 vectors, stride256; all math tfor/unrolled loops statically finite',
+            'uninstantiated':'TMAPG L1, !WS, !FLAT and non-PK2 (PK2=WS=true) paths do not execute; retained ship global polls are M1 bounded',
+            'hardware':'only CTA prologue __syncthreads (all640, before role split), warp collectives, issued cp.async/WGMMA drains and setmaxnreg remain hardware waits. Pool gate ensures 60416 registers fit launch allocation; no divergent WGMMA issue on failed group phases',
+            'admission':'cooperative launch, no PDL attr; occupancy checked. This prevents residency starvation but is not evidence of the original CHUNK2 root cause'},
+        historical_round2_accounting_EST=dict(weight_bytes_per_tile=[0,0],KV_bytes_per_tile=[16384,16384],
             shared_bytes=[162816,162816],flush_global_payload_bytes_per_team=[33280,33280],
             consumer_per_thread_per_tile={'QK_wgmma':[2,2],'PV_wgmma':[2,2],'pack2_ex2':[32,32]},
             producer_per_thread_per_tile={'cp_async16':[8,8],'index_ldg':[4,4]},
@@ -1049,7 +1298,7 @@ def linux_gate(base,source,report,candidates=(112,),prior=None):
     from torch.utils.cpp_extension import include_paths
     work = pathlib.Path(tempfile.mkdtemp(prefix='hyap-gate-'))
     report['build_dir'] = str(work)
-    for i,p in enumerate((pathlib.Path(__file__),OUT,ROOT/'tools/box/hyap_check.py')):
+    for i,p in enumerate((pathlib.Path(__file__),OUT,ROOT/'tools/box/hyap_check.py',ROOT/'tools/box/hyap_smoke.py')):
         py_compile.compile(str(p),cfile=str(work/f'py{i}.pyc'),doraise=True)
     inc = ['-I'+p for p in include_paths(device_type='cuda')]+['-I'+sysconfig.get_path('include')]
     abi = f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}'
@@ -1168,7 +1417,7 @@ def main():
         OUT.write_bytes(source.encode('ascii'))
         print(f'generated {OUT.relative_to(ROOT)}; HYAP=0; {len(source)} bytes')
         return
-    artifacts = (BASE,OUT,pathlib.Path(__file__),ROOT/'tools/box/hyap_check.py',ROOT/'tools/local/hyap_gate.sh')
+    artifacts = (BASE,OUT,pathlib.Path(__file__),ROOT/'tools/box/hyap_check.py',ROOT/'tools/box/hyap_smoke.py',ROOT/'tools/local/hyap_gate.sh')
     result = dict(status='FAIL',gpu_launched=False,output_sha256=hashlib.sha256(source.encode()).hexdigest(),
         artifact_sha256={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in artifacts})
     try:
