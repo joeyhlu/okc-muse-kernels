@@ -1,0 +1,4 @@
+muse_decode_layer box_out/dsg/k3_s6o4_g16.py
+muse_decode_layer box_out/dsg/k3_s6o4_g32.py
+muse_decode_layer box_out/dsg/k3_s6o4_g64.py
+muse_decode_layer box_out/dsg/k3_s6o4_g128.py
