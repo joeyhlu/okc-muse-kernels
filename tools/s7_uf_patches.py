@@ -51,11 +51,11 @@ return reinterpret_cast<unsigned char*>(xbuf) + OKC_NS * UNIT_BYTES;
 __device__ __forceinline__ void uf_prefetch(const Params& p, Smem& S, __nv_bfloat16* xbuf) {
 if (TIDX == 0 && blockIdx.x < 128) {
 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], 65536;\n"
-             :: "r"(smem_u32(S.bars + 11)) : "memory");
-asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], 65536, [%2];\n"
+asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+             :: "r"(smem_u32(S.bars + 11)), "r"(65536) : "memory");
+asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
              :: "r"(smem_u32(uf_weights(xbuf))), "l"(p.uf_w + (size_t)blockIdx.x * 65536),
-                "r"(smem_u32(S.bars + 11)) : "memory");
+                "r"(65536), "r"(smem_u32(S.bars + 11)) : "memory");
 }
 }
 __device__ __forceinline__ void uf_finish(const Params& p, Smem& S, __nv_bfloat16* xbuf) {
@@ -339,6 +339,14 @@ def geometry_gate():
         assert output.isdisjoint(suffix) and len(output | suffix) == m * 8192
         assert max(m * 4104 * 2 + (16 if m == 1 else 32) * 2 * 32 * 4, 0) <= 3 * 36864
         assert 3 * 36864 + 65536 <= 178176
+        # Every LDS128 vector is aligned and reads only valid BF16 x, never padding.
+        for tk in range(m):
+            for u in range(64):
+                for t in range(4):
+                    for half in range(2):
+                        address = tk * 4104 + u * 64 + t * 16 + half * 8
+                        assert (address * 2) % 16 == 0
+                        assert tk * 4104 <= address and address + 8 <= tk * 4104 + 4096
     # GD's 64 K units, q parity and grouping are preserved for every output.
     for m, wk, ku, splits in ((1, 16, 4, 1), (8, 8, 2, 4)):
         gd = [[[(s * wk + k) * ku + u for u in range(ku)] for k in range(wk)] for s in range(splits)]
@@ -425,17 +433,17 @@ def dry_run(base, generated):
            "HIDDEN": 8192, "D_EXPERT": 4096, "UNPOOL_SLICE": 1024, "N_EXPERTS": 256,
            "K2A_E_LOC": 32, "K2A_TOP_K": 8, "_HYB": {"nsm": 132},
            "_hyb_scratch": lambda d: ([Tensor((4096,)) for _ in range(3)], [(Tensor((10,)), 8, "i32", 123)]),
-           "_gd_live": lambda state, proj, m: state["gd"]["route"].get((proj, m)),
            "_k2a_rel_err": lambda a, b: (0., 0.),
            "_gd_unpool": lambda state, x, m: Tensor((m, 8192)),
            "_hyblo_run": lambda k, x, ids, tw: Tensor(x.shape),
            "_hyblo_inputs": lambda m, seed, dev, dist: {"hidden_states": Tensor((m, 4096)),
                                                       "topk_ids": Tensor((m, 8)), "topk_weights": Tensor((m, 8))}}
     for name in ("_UF_EDITS", "UF_ON", "UF_BUILD", "_UF_MODS", "_TINYS_CUDA", "_HYB_MOE_CPP", "_HYBLO_KEYS",
-                 "_HYBLO_FLAGS", "_HYBLO", "HYBLO_ENABLE", "HYBLO_K", "HYBLO_T", "HYBLO_PDL", "GD_ROUTE"):
+                 "_HYBLO_FLAGS", "_HYBLO", "HYBLO_ENABLE", "HYBLO_K", "HYBLO_T", "HYBLO_PDL", "GD_ROUTE",
+                 "GD_ENABLE", "SLICED_UNPOOL_MAX_TOKENS", "GD_SMS"):
         env[name] = literal(generated, name)
     funcs = [n for n in ast.parse(generated).body if isinstance(n, ast.FunctionDef) and
-             (n.name.startswith("_uf_") or n.name == "_hyblo_key")]
+             (n.name.startswith("_uf_") or n.name in ("_hyblo_key", "_gd_live", "_gd_bucket", "_gd_key"))]
     exec(compile(ast.Module(body=funcs, type_ignores=[]), "uf-real-python", "exec"), env)
     # Evaluate actual state dict/return expressions, without importing the layer.
     state_assign = next(n for n in ast.walk(ast.parse(base)) if isinstance(n, ast.Assign) and
@@ -448,7 +456,22 @@ def dry_run(base, generated):
     ret = next(n.value for n in prep.body if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict))
     marker = object()
     k33 = eval(compile(ast.Expression(ret), "base-k2a33-layout", "eval"), {"st": marker, "ok": {1: True, 8: True}})
-    state = {"dense": dense, "k2a33": k33, "gd": {"route": {("unpooler", m): object() for m in (1, 8)}}}
+    # GD route descriptors also come from the actual prepare-side dict expression.
+    gdprep = node(base, "_gd_prepare")
+    rexpr = next(n.value for n in ast.walk(gdprep) if isinstance(n, ast.Assign) and
+                 any(isinstance(t, ast.Name) and t.id == "r" for t in n.targets) and isinstance(n.value, ast.Dict))
+    routes = {}
+    exact_keys = {}
+    for m in (1, 8):
+        rt = env["GD_ROUTE"]["unpooler", m]
+        key = env["_gd_key"](1024, 4096, rt)
+        exact_keys[m] = list(key) + [0, 0]
+        r = eval(compile(ast.Expression(rexpr), "base-gd-route-layout", "eval"),
+                 {"mod": object(), "ids": {key: 0}, "key": key,
+                  "pk": {"w": object(), "esc": object(), "tb": 0, "nbx": 64},
+                  "n": 1024, "k": 4096, "rt": rt, "proj": "unpooler", "UNPOOL_SLICE": 1024, "desc": "CPU"})
+        routes["unpooler", m] = r
+    state = {"dense": dense, "k2a33": k33, "gd": {"route": routes}}
     env["_HYBLO"].update(ok={"tiny": True, "tiny2": True}, w=[object() for _ in range(14)])
     # Execute the actual inserted prepare hook, including default-off no-build.
     env["state"] = state
@@ -485,6 +508,20 @@ def dry_run(base, generated):
     try: env["_uf_prepare"](broken)
     except KeyError as ex: assert ex.args == ("st",)
     else: raise AssertionError("missing real state key was ignored")
+    # Fail-closed paths use the same executable prepare, not a copied selector.
+    def must_fail(action, kinds):
+        try: action()
+        except kinds: return
+        raise AssertionError("invalid prepare state accepted")
+    must_fail(lambda: env["_uf_prepare"](dict(state, k2a33=None)), RuntimeError)
+    bad_k33 = dict(k33, st=None)
+    must_fail(lambda: env["_uf_prepare"](dict(state, k2a33=bad_k33)), RuntimeError)
+    must_fail(lambda: env["_uf_prepare"](dict(state, gd={"route": {}})), RuntimeError)
+    saved_rt = env["GD_ROUTE"]["unpooler", 1]
+    env["GD_ROUTE"]["unpooler", 1] = (1, 1, 4, 8, 2, 4, 1)
+    must_fail(lambda: env["_uf_prepare"](state), RuntimeError)
+    env["GD_ROUTE"]["unpooler", 1] = saved_rt
+    must_fail(lambda: env["_uf_pack"](Tensor((1023, 4096))), ValueError)
     # Real pack code on all 4,194,304 distinct coordinate IDs (not mocked ops).
     ids = np.arange(1024 * 4096, dtype=np.uint32).reshape(1024, 4096)
     packed = env["_uf_pack"](Tensor(ids.shape, ids)).data.reshape(128, 64, 4, 32, 4)
@@ -493,9 +530,15 @@ def dry_run(base, generated):
             for j in range(4):
                 expected = (np.arange(128)[:, None] * 8 + ln // 4) * 4096 + np.arange(64)[None, :] * 64 + 16 * (ln % 4) + 4 * q + j
                 assert np.array_equal(packed[:, :, q, ln, j], expected)
-    return {"prepare_state_layout": "PASS: actual base expressions", "pack_coordinates_checked": ids.size,
+    rawbits = ids.astype(np.uint16)  # exhaustively includes all BF16 payloads/escape exponents
+    bitpack = env["_uf_pack"](Tensor(rawbits.shape, rawbits)).data
+    restored = bitpack.reshape(128, 64, 4, 8, 4, 4).transpose(0, 3, 1, 4, 2, 5).reshape(1024, 4096)
+    assert np.array_equal(restored, rawbits)
+    return {"prepare_state_layout": "PASS: actual base expressions and real _gd_live", "pack_coordinates_checked": ids.size,
+            "BF16_bit_patterns_roundtripped": 65536,
             "prepare_paths": "default/build/cache/select/invalid/missing-key/selftest/graph-control-flow PASS",
-            "build_count": len(builds), "calls": len(calls), "numerical_GPU_test": "NOT RUN: symbolic CPU only"}
+            "build_count": len(builds), "calls": len(calls), "exact_GD_template_keys": exact_keys,
+            "numerical_GPU_test": "NOT RUN: symbolic CPU only"}
 
 
 def cpu_gate(base, generated):
@@ -510,7 +553,7 @@ def cpu_gate(base, generated):
     changes = [{"base": [i+1,j], "candidate": [k+1,l], "kind": op} for op,i,j,k,l in sm.get_opcodes() if op != "equal"]
     return {"identity": identity_gate(base, generated), "geometry": geometry_gate(), "dry_run": dry_run(base, generated),
             "bytes": len(generated.encode()), "sha256": hashlib.sha256(generated.encode()).hexdigest(),
-            "per_bit_changed_lines": {"1_T1_and_2_T8_shared": changes},
+            "per_bit_changed_lines": {"UF_ON=(1,)": changes, "UF_ON=(8,)": changes},
             "accounting_EST": {
                 "expert_weight_stage_before_after": [36864, 36864],
                 "expert_consumer_instructions_before_after": "unchanged source: 9 LDS128,32 dq4,128 HMUL2,32 MMA,12 adds,1 STS128,1 CTA barrier per unit",
@@ -519,6 +562,9 @@ def cpu_gate(base, generated):
                 "unpooler_stage_half_tile_before_after": [768, 1024],
                 "UF_consumer_per_K64_unit": "per thread 4 LDS64 weight + 2 LDS128 x + 4 MMA; GD full16-row:3 LDG128+2 LDG128 x+decode+escape+4 MMA",
                 "UF_consumer_total_per_thread": "both T:32 LDS64 weight+16 LDS128 x+32 MMA; T1 4 partial stores, T8 8 partial stores",
+                "GD_consumer_total_per_thread_T1": "12 LDG128 weight+8 LDG128 x+144 decode PTX operations+variable escapes+16 MMA+4 FADD+4 STS32",
+                "GD_consumer_total_per_thread_T8": "6 LDG128 weight+4 LDG128 x+72 decode PTX operations+variable escapes+8 MMA+4 FADD+4 STS32",
+                "MMA_warp_instructions_grid_before_after": [16384, 32768],
                 "combine_per_thread": "4*T float4 outputs; per live route:1 LDG128 y,1 LDG32 ss,1 LDG32 w,1 rsqrt,2 MUL,4 FMA; 2 BF16x2 CVT+1 STS64 per float4",
                 "combine_L2_y_bytes": "before 16384*sum(local_routes); after 128 times that (repeated L2-resident reads)",
                 "UF_shared_partial_bytes_T1_T8": [4096, 8192],

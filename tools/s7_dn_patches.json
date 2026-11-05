@@ -1,0 +1,4057 @@
+{
+  "status": "COMPILE_FAIL",
+  "GPU_executed": false,
+  "base_sha256": "07eb81e0a91a5161e23e0f794abe1f536788ff4200326c209c484802092c6e10",
+  "cpu": "PASS",
+  "variants": [
+    {
+      "variant": 1,
+      "status": "COMPILE_PASS",
+      "bytes": 965903,
+      "sha256": "ca8d5d56b5d95b86b66df9a3d80528282230cbed8451ceb2648386b28eef5a5c",
+      "instance_count": 13,
+      "dry_run": {
+        "status": "PASS",
+        "selected": [
+          {
+            "bit": 1,
+            "role": "qkv",
+            "T": 16,
+            "key": [
+              0,
+              2,
+              1,
+              4,
+              8,
+              2,
+              4,
+              5,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "bit": 2,
+            "role": "cat",
+            "T": 16,
+            "key": [
+              0,
+              2,
+              1,
+              8,
+              18,
+              3,
+              1,
+              2,
+              0,
+              0,
+              2
+            ]
+          },
+          {
+            "bit": 4,
+            "role": "cat",
+            "T": 32,
+            "key": [
+              0,
+              4,
+              1,
+              8,
+              18,
+              2,
+              1,
+              2,
+              0,
+              0,
+              2
+            ]
+          }
+        ],
+        "prepared_routes": 15,
+        "packs": 8,
+        "lookups": 320,
+        "numerical_tests": "NOT RUN (explicit CPU mocks)",
+        "state_layout_sources": [
+          "_r1_prepare:11628",
+          "_v8_tail_prepare:1542"
+        ]
+      },
+      "targets": [
+        {
+          "bit": 1,
+          "role": "qkv",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            2,
+            4,
+            5,
+            0,
+            0,
+            0
+          ],
+          "ring": {
+            "KU": 8,
+            "ST": 2,
+            "weight_vector_loads_per_thread": 24,
+            "prologue_vector_loads": 6,
+            "refill_vector_loads": 18
+          },
+          "protocol": {
+            "CTAs": [
+              144,
+              4,
+              1
+            ],
+            "threads": [
+              0,
+              127
+            ],
+            "red_indices": [
+              0,
+              255
+            ],
+            "owner": "split=0 combines 3*256 FP32 partials then stores 256 values per bx",
+            "exiting": "split=1..3 each sends all 256 partials before return",
+            "persistent_resets": 0
+          }
+        },
+        {
+          "bit": 2,
+          "role": "cat",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "ring": {
+            "KU": 18,
+            "ST": 3,
+            "weight_vector_loads_per_thread": 54,
+            "prologue_vector_loads": 9,
+            "refill_vector_loads": 45
+          },
+          "protocol": {
+            "CTAs": 256,
+            "threads": [
+              0,
+              255
+            ],
+            "pooler_indices": [
+              0,
+              255
+            ],
+            "router_indices": [
+              0,
+              127
+            ],
+            "early_exits": 0,
+            "persistent_resets": 0,
+            "coverage": "all stores exactly once; reductions unchanged"
+          }
+        },
+        {
+          "bit": 4,
+          "role": "cat",
+          "T": 32,
+          "key": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            2,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "ring": {
+            "KU": 18,
+            "ST": 2,
+            "weight_vector_loads_per_thread": 54,
+            "prologue_vector_loads": 6,
+            "refill_vector_loads": 48
+          },
+          "protocol": {
+            "CTAs": 256,
+            "threads": [
+              0,
+              255
+            ],
+            "pooler_indices": [
+              0,
+              511
+            ],
+            "router_indices": [
+              0,
+              255
+            ],
+            "early_exits": 0,
+            "persistent_resets": 0,
+            "coverage": "all stores exactly once; reductions unchanged"
+          }
+        }
+      ],
+      "changed_lines": [
+        {
+          "kind": "replace",
+          "base_lines": [
+            2,
+            2
+          ],
+          "output_lines": [
+            2,
+            2
+          ],
+          "text": [
+            "# nonce dn-v1 (GD register lookahead; qkv16 + cat16 + cat32)"
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            22885,
+            22884
+          ],
+          "output_lines": [
+            22885,
+            22895
+          ],
+          "text": [
+            "",
+            "# S7-DN begin: existing GD register ring, opt-in only.",
+            "S7_DN_VARIANT=1",
+            "if S7_DN_VARIANT:",
+            " if S7_DN_VARIANT not in (1,2):",
+            "  raise ValueError(\"S7_DN_VARIANT must be 0, 1, or 2\")",
+            " _s7_dn_st=S7_DN_VARIANT+1",
+            " GD_ROUTE[(\"qkv\",16)]=(2,1,4,8,_s7_dn_st,4,0) # bit 1",
+            " GD_CAT_ROUTE[16]=(2,1,8,18,_s7_dn_st+1,1,0) # bit 2",
+            " GD_CAT_ROUTE[32]=(4,1,8,18,_s7_dn_st,1,0) # bit 4",
+            "# S7-DN end"
+          ]
+        }
+      ],
+      "CUDA_sources_identical": true,
+      "prepare_selftests_unchanged": true,
+      "accounting": [
+        {
+          "bit": 1,
+          "role": "qkv",
+          "T": 16,
+          "weight_bytes_per_CTA_unit_before_after": [
+            6144,
+            6144
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            64,
+            64
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            51,
+            51
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 4,
+            "decode_ops": 36,
+            "mma": 8
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            24,
+            24
+          ],
+          "register_ring_words_per_thread_before_after": [
+            12,
+            24
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        },
+        {
+          "bit": 2,
+          "role": "cat",
+          "T": 16,
+          "weight_bytes_per_CTA_unit_before_after": [
+            12288,
+            12288
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            64,
+            64
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            51,
+            51
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 4,
+            "decode_ops": 36,
+            "mma": 8
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            54,
+            54
+          ],
+          "register_ring_words_per_thread_before_after": [
+            24,
+            36
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        },
+        {
+          "bit": 4,
+          "role": "cat",
+          "T": 32,
+          "weight_bytes_per_CTA_unit_before_after": [
+            12288,
+            12288
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            128,
+            128
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            63,
+            63
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 8,
+            "decode_ops": 36,
+            "mma": 16
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            54,
+            54
+          ],
+          "register_ring_words_per_thread_before_after": [
+            12,
+            24
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        }
+      ],
+      "performance_ledger": [
+        {
+          "bit": 1,
+          "shape": "d16s",
+          "role": "qkv",
+          "MEASURED_current_us": 9.7,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:32",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 9.2,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 8.065186,
+          "EST_floor_arithmetic": "1.9 + 28606464/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/8 = 95.00 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3538944,
+          "EST_capacity_stream_equivalent_us": 0.762703,
+          "EST_capacity_arithmetic": "576 CTAs * 4 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "qkv is the first timed kernel, and its output gates attention; there is no preceding PDL work to hide a real duration reduction",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            2,
+            4,
+            5,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "bit": 1,
+          "shape": "d16f",
+          "role": "qkv",
+          "MEASURED_current_us": 9.6,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:44",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 9.1,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 8.065186,
+          "EST_floor_arithmetic": "1.9 + 28606464/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/8 = 95.00 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3538944,
+          "EST_capacity_stream_equivalent_us": 0.762703,
+          "EST_capacity_arithmetic": "576 CTAs * 4 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "qkv is the first timed kernel, and its output gates attention; there is no preceding PDL work to hide a real duration reduction",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            2,
+            4,
+            5,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "bit": 2,
+          "shape": "d16s",
+          "role": "cat",
+          "MEASURED_current_us": 17.1,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:30",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 16.6,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3145728,
+          "EST_capacity_stream_equivalent_us": 0.677959,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 2,
+          "shape": "d16f",
+          "role": "cat",
+          "MEASURED_current_us": 16.6,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:42",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 16.1,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3145728,
+          "EST_capacity_stream_equivalent_us": 0.677959,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 4,
+          "shape": "d32s",
+          "role": "cat",
+          "MEASURED_current_us": 19.0,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:52",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 18.5,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3145728,
+          "EST_capacity_stream_equivalent_us": 0.677959,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            2,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 4,
+          "shape": "d32f",
+          "role": "cat",
+          "MEASURED_current_us": 19.5,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:65",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 19.0,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 3145728,
+          "EST_capacity_stream_equivalent_us": 0.677959,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 1 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            2,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        }
+      ],
+      "compile": {
+        "command": [
+          "nvcc",
+          "-cubin",
+          "-std=c++20",
+          "-arch=sm_90a",
+          "-O3",
+          "-Xptxas=-v",
+          "/tmp/s7_dn_gate_12h1sz33/v1.cu",
+          "-o",
+          "/tmp/s7_dn_gate_12h1sz33/v1.cubin"
+        ],
+        "ptxas": {
+          "_ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi2ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 128
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi3ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 126
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 57
+          },
+          "_ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 24,
+            "spill_stores": 24,
+            "spill_loads": 360,
+            "registers": 128
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 108
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 80
+          },
+          "_ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 48,
+            "spill_stores": 72,
+            "spill_loads": 212,
+            "registers": 96
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi2ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 96
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 94
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 102
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 58
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 40
+          },
+          "_ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 32
+          }
+        },
+        "resources": "\nResource usage:\n Common:\n  GLOBAL:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi2ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:128 STACK:0 SHARED:33792 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi3ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:126 STACK:0 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:57 STACK:0 SHARED:6672 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:128 STACK:24 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:108 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:80 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:48 SHARED:15376 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi2ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:0 SHARED:8208 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:94 STACK:0 SHARED:4624 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:102 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:58 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:576 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:580 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+      },
+      "sass_targets": [
+        {
+          "bit": 1,
+          "key": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            2,
+            4,
+            5,
+            0,
+            0,
+            0
+          ],
+          "resources": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 96
+          },
+          "static_instruction_count": 1448,
+          "opcodes": {
+            "LDC": 4,
+            "ULDC": 13,
+            "ULDC.64": 7,
+            "ISETP.NE.AND": 145,
+            "S2R": 7,
+            "S2UR": 6,
+            "PREEXIT": 1,
+            "SHF.R.S32.HI": 16,
+            "IMAD": 31,
+            "IMAD.SHL.U32": 23,
+            "IMAD.WIDE": 12,
+            "LOP3.LUT": 292,
+            "IADD3": 3,
+            "UMOV": 2,
+            "LEA": 9,
+            "IMAD.X": 1,
+            "LEA.HI.X": 5,
+            "LDG.E.NA.128.CONSTANT": 24,
+            "LDG.E.CONSTANT": 1,
+            "VOTEU.ALL": 2,
+            "@!UP0": 7,
+            "LEA.HI": 16,
+            "ISETP.EQ.U32.AND": 2,
+            "IMAD.MOV.U32": 27,
+            "IMAD.IADD": 25,
+            "SYNCS.ARRIVE.TRANS64": 1,
+            "NOP": 13,
+            "BRA": 48,
+            "UCGABAR_ARV": 1,
+            "UIADD3": 2,
+            "IMAD.WIDE.U32": 3,
+            "SHF.R.W.U32": 32,
+            "ACQBULK": 1,
+            "USHF.L.U32": 1,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 5,
+            "VIADD": 94,
+            "SEL": 130,
+            "LDG.E.128.CONSTANT": 32,
+            "SHFL.IDX": 9,
+            "PRMT": 130,
+            "SHF.R.U32.HI": 35,
+            "BSSY": 12,
+            "ISETP.GT.U32.AND": 2,
+            "SHF.L.U32": 10,
+            "BSYNC": 12,
+            "HMMA.16816.F32.BF16": 64,
+            "@!UPT": 10,
+            "ISETP.GT.AND": 10,
+            "MOV": 1,
+            "STS": 8,
+            "BAR.SYNC.DEFER_BLOCKING": 2,
+            "UCGABAR_WAIT": 1,
+            "CCTL.IVALL": 3,
+            "EXIT": 6,
+            "VIMNMX": 1,
+            "ISETP.GE.U32.AND": 1,
+            "LDS": 34,
+            "FADD": 34,
+            "STAS": 5,
+            "SYNCS.PHASECHK.TRANS64.TRYWAIT": 2,
+            "PLOP3.LUT": 3,
+            "ULEA": 1,
+            "FSEL": 2,
+            "F2FP.BF16.F32.PACK_AB": 2,
+            "STG.E.U16": 2
+          },
+          "baseline_static_instruction_count": 1448,
+          "baseline_opcodes": {
+            "LDC": 4,
+            "ULDC": 13,
+            "ULDC.64": 7,
+            "ISETP.NE.AND": 145,
+            "S2R": 7,
+            "S2UR": 6,
+            "PREEXIT": 1,
+            "SHF.R.S32.HI": 15,
+            "IMAD": 30,
+            "IMAD.WIDE": 12,
+            "LOP3.LUT": 291,
+            "IADD3": 3,
+            "LEA": 9,
+            "IMAD.X": 1,
+            "LEA.HI.X": 5,
+            "LDG.E.NA.128.CONSTANT": 24,
+            "UMOV": 2,
+            "LDG.E.CONSTANT": 1,
+            "VOTEU.ALL": 2,
+            "@!UP0": 7,
+            "ISETP.EQ.U32.AND": 2,
+            "LEA.HI": 16,
+            "IMAD.MOV.U32": 28,
+            "IMAD.SHL.U32": 23,
+            "IMAD.IADD": 24,
+            "SYNCS.ARRIVE.TRANS64": 1,
+            "NOP": 14,
+            "BRA": 48,
+            "UCGABAR_ARV": 1,
+            "UIADD3": 2,
+            "ACQBULK": 1,
+            "USHF.L.U32": 1,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 5,
+            "VIADD": 94,
+            "SEL": 130,
+            "LDG.E.128.CONSTANT": 32,
+            "SHFL.IDX": 9,
+            "SHF.R.W.U32": 32,
+            "PRMT": 130,
+            "SHF.R.U32.HI": 35,
+            "BSSY": 12,
+            "ISETP.GT.U32.AND": 2,
+            "SHF.L.U32": 10,
+            "BSYNC": 12,
+            "HMMA.16816.F32.BF16": 64,
+            "@!UPT": 13,
+            "ISETP.GT.AND": 10,
+            "MOV": 1,
+            "STS": 8,
+            "BAR.SYNC.DEFER_BLOCKING": 2,
+            "UCGABAR_WAIT": 1,
+            "CCTL.IVALL": 3,
+            "EXIT": 6,
+            "VIMNMX": 1,
+            "ISETP.GE.U32.AND": 1,
+            "LDS": 34,
+            "FADD": 34,
+            "STAS": 5,
+            "SYNCS.PHASECHK.TRANS64.TRYWAIT": 2,
+            "PLOP3.LUT": 3,
+            "ULEA": 1,
+            "IMAD.WIDE.U32": 2,
+            "FSEL": 2,
+            "F2FP.BF16.F32.PACK_AB": 2,
+            "STG.E.U16": 2
+          },
+          "pre_wait_x_candidates": []
+        },
+        {
+          "bit": 2,
+          "key": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "resources": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 126
+          },
+          "static_instruction_count": 2824,
+          "opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 6,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "SHF.R.S32.HI": 25,
+            "IMAD": 40,
+            "LEA.HI": 9,
+            "LOP3.LUT": 600,
+            "IMAD.WIDE": 57,
+            "IMAD.SHL.U32": 16,
+            "IADD3": 6,
+            "IMAD.IADD": 16,
+            "LEA": 18,
+            "IMAD.X": 1,
+            "LEA.HI.X": 12,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "LDG.E.CONSTANT": 1,
+            "VIADD": 172,
+            "UIADD3": 2,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 10,
+            "SEL": 290,
+            "LDG.E.128.CONSTANT": 72,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 44,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 144,
+            "@!UPT": 37,
+            "ISETP.GT.AND": 19,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 16,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 11
+          },
+          "baseline_static_instruction_count": 2824,
+          "baseline_opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 6,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "SHF.R.S32.HI": 25,
+            "IMAD": 40,
+            "IMAD.WIDE": 57,
+            "LOP3.LUT": 600,
+            "IADD3": 6,
+            "LEA": 18,
+            "IMAD.X": 1,
+            "LEA.HI.X": 12,
+            "LEA.HI": 9,
+            "IMAD.SHL.U32": 16,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.IADD": 16,
+            "UIADD3": 2,
+            "ISETP.GE.AND": 10,
+            "VIADD": 172,
+            "USHF.R.S32.HI": 2,
+            "SEL": 290,
+            "LDG.E.128.CONSTANT": 72,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 44,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 144,
+            "@!UPT": 38,
+            "ISETP.GT.AND": 19,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 16,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 10
+          },
+          "pre_wait_x_candidates": []
+        },
+        {
+          "bit": 4,
+          "key": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            2,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "resources": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 128
+          },
+          "static_instruction_count": 3080,
+          "opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 13,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "IMAD": 42,
+            "SHF.R.S32.HI": 28,
+            "LEA.HI": 9,
+            "IMAD.WIDE": 93,
+            "LOP3.LUT": 603,
+            "IMAD.IADD": 16,
+            "IADD3": 6,
+            "IMAD.X": 1,
+            "LEA": 18,
+            "LEA.HI.X": 12,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.SHL.U32": 19,
+            "UIADD3": 2,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "VIADD": 174,
+            "ISETP.GE.AND": 12,
+            "SEL": 292,
+            "USHF.R.S32.HI": 2,
+            "LDG.E.128.CONSTANT": 144,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 44,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 288,
+            "ISETP.GT.AND": 19,
+            "@!UPT": 2,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 32,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 10
+          },
+          "baseline_static_instruction_count": 3080,
+          "baseline_opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 14,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "IMAD": 42,
+            "SHF.R.S32.HI": 28,
+            "LEA.HI": 9,
+            "IMAD.WIDE": 93,
+            "LOP3.LUT": 603,
+            "IMAD.IADD": 16,
+            "IADD3": 6,
+            "IMAD.X": 1,
+            "LEA": 18,
+            "LEA.HI.X": 12,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.SHL.U32": 19,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "UIADD3": 2,
+            "VIADD": 174,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 12,
+            "SEL": 292,
+            "LDG.E.128.CONSTANT": 144,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 45,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 288,
+            "ISETP.GT.AND": 19,
+            "@!UPT": 2,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 32,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 8
+          },
+          "pre_wait_x_candidates": []
+        }
+      ],
+      "unchanged_SASS_instances": 12
+    },
+    {
+      "variant": 2,
+      "status": "COMPILE_FAIL",
+      "bytes": 965903,
+      "sha256": "b73a8f3d387aa0a438856aedad0b694d991f8a5f122fbc8ec60ea9f5de1f750a",
+      "instance_count": 13,
+      "dry_run": {
+        "status": "PASS",
+        "selected": [
+          {
+            "bit": 1,
+            "role": "qkv",
+            "T": 16,
+            "key": [
+              0,
+              2,
+              1,
+              4,
+              8,
+              3,
+              4,
+              5,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "bit": 2,
+            "role": "cat",
+            "T": 16,
+            "key": [
+              0,
+              2,
+              1,
+              8,
+              18,
+              4,
+              1,
+              2,
+              0,
+              0,
+              2
+            ]
+          },
+          {
+            "bit": 4,
+            "role": "cat",
+            "T": 32,
+            "key": [
+              0,
+              4,
+              1,
+              8,
+              18,
+              3,
+              1,
+              2,
+              0,
+              0,
+              2
+            ]
+          }
+        ],
+        "prepared_routes": 15,
+        "packs": 8,
+        "lookups": 320,
+        "numerical_tests": "NOT RUN (explicit CPU mocks)",
+        "state_layout_sources": [
+          "_r1_prepare:11628",
+          "_v8_tail_prepare:1542"
+        ]
+      },
+      "targets": [
+        {
+          "bit": 1,
+          "role": "qkv",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            3,
+            4,
+            5,
+            0,
+            0,
+            0
+          ],
+          "ring": {
+            "KU": 8,
+            "ST": 3,
+            "weight_vector_loads_per_thread": 24,
+            "prologue_vector_loads": 9,
+            "refill_vector_loads": 15
+          },
+          "protocol": {
+            "CTAs": [
+              144,
+              4,
+              1
+            ],
+            "threads": [
+              0,
+              127
+            ],
+            "red_indices": [
+              0,
+              255
+            ],
+            "owner": "split=0 combines 3*256 FP32 partials then stores 256 values per bx",
+            "exiting": "split=1..3 each sends all 256 partials before return",
+            "persistent_resets": 0
+          }
+        },
+        {
+          "bit": 2,
+          "role": "cat",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            4,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "ring": {
+            "KU": 18,
+            "ST": 4,
+            "weight_vector_loads_per_thread": 54,
+            "prologue_vector_loads": 12,
+            "refill_vector_loads": 42
+          },
+          "protocol": {
+            "CTAs": 256,
+            "threads": [
+              0,
+              255
+            ],
+            "pooler_indices": [
+              0,
+              255
+            ],
+            "router_indices": [
+              0,
+              127
+            ],
+            "early_exits": 0,
+            "persistent_resets": 0,
+            "coverage": "all stores exactly once; reductions unchanged"
+          }
+        },
+        {
+          "bit": 4,
+          "role": "cat",
+          "T": 32,
+          "key": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "ring": {
+            "KU": 18,
+            "ST": 3,
+            "weight_vector_loads_per_thread": 54,
+            "prologue_vector_loads": 9,
+            "refill_vector_loads": 45
+          },
+          "protocol": {
+            "CTAs": 256,
+            "threads": [
+              0,
+              255
+            ],
+            "pooler_indices": [
+              0,
+              511
+            ],
+            "router_indices": [
+              0,
+              255
+            ],
+            "early_exits": 0,
+            "persistent_resets": 0,
+            "coverage": "all stores exactly once; reductions unchanged"
+          }
+        }
+      ],
+      "changed_lines": [
+        {
+          "kind": "replace",
+          "base_lines": [
+            2,
+            2
+          ],
+          "output_lines": [
+            2,
+            2
+          ],
+          "text": [
+            "# nonce dn-v2 (GD register lookahead; qkv16 + cat16 + cat32)"
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            22885,
+            22884
+          ],
+          "output_lines": [
+            22885,
+            22895
+          ],
+          "text": [
+            "",
+            "# S7-DN begin: existing GD register ring, opt-in only.",
+            "S7_DN_VARIANT=2",
+            "if S7_DN_VARIANT:",
+            " if S7_DN_VARIANT not in (1,2):",
+            "  raise ValueError(\"S7_DN_VARIANT must be 0, 1, or 2\")",
+            " _s7_dn_st=S7_DN_VARIANT+1",
+            " GD_ROUTE[(\"qkv\",16)]=(2,1,4,8,_s7_dn_st,4,0) # bit 1",
+            " GD_CAT_ROUTE[16]=(2,1,8,18,_s7_dn_st+1,1,0) # bit 2",
+            " GD_CAT_ROUTE[32]=(4,1,8,18,_s7_dn_st,1,0) # bit 4",
+            "# S7-DN end"
+          ]
+        }
+      ],
+      "CUDA_sources_identical": true,
+      "prepare_selftests_unchanged": true,
+      "accounting": [
+        {
+          "bit": 1,
+          "role": "qkv",
+          "T": 16,
+          "weight_bytes_per_CTA_unit_before_after": [
+            6144,
+            6144
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            64,
+            64
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            51,
+            51
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 4,
+            "decode_ops": 36,
+            "mma": 8
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            24,
+            24
+          ],
+          "register_ring_words_per_thread_before_after": [
+            12,
+            36
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        },
+        {
+          "bit": 2,
+          "role": "cat",
+          "T": 16,
+          "weight_bytes_per_CTA_unit_before_after": [
+            12288,
+            12288
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            64,
+            64
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            51,
+            51
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 4,
+            "decode_ops": 36,
+            "mma": 8
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            54,
+            54
+          ],
+          "register_ring_words_per_thread_before_after": [
+            24,
+            48
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        },
+        {
+          "bit": 4,
+          "role": "cat",
+          "T": 32,
+          "weight_bytes_per_CTA_unit_before_after": [
+            12288,
+            12288
+          ],
+          "weight_bytes_per_thread_unit_before_after": [
+            48,
+            48
+          ],
+          "x_bytes_requested_per_thread_unit_before_after": [
+            128,
+            128
+          ],
+          "named_core_source_ops_per_thread_unit_before_after": [
+            63,
+            63
+          ],
+          "source_ops_breakdown": {
+            "weight_vector_loads": 3,
+            "x_vector_loads": 8,
+            "decode_ops": 36,
+            "mma": 16
+          },
+          "weight_vector_loads_per_thread_total_before_after": [
+            54,
+            54
+          ],
+          "register_ring_words_per_thread_before_after": [
+            12,
+            36
+          ],
+          "extra_weight_stream_bytes": 0,
+          "extra_scratch_bytes": 0,
+          "caveat": "Source counts exclude unchanged escape/address/control ops; SASS counts require Linux gate"
+        }
+      ],
+      "performance_ledger": [
+        {
+          "bit": 1,
+          "shape": "d16s",
+          "role": "qkv",
+          "MEASURED_current_us": 9.7,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:32",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 9.2,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 8.065186,
+          "EST_floor_arithmetic": "1.9 + 28606464/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/8 = 95.00 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 7077888,
+          "EST_capacity_stream_equivalent_us": 1.525407,
+          "EST_capacity_arithmetic": "576 CTAs * 4 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "qkv is the first timed kernel, and its output gates attention; there is no preceding PDL work to hide a real duration reduction",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            3,
+            4,
+            5,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "bit": 1,
+          "shape": "d16f",
+          "role": "qkv",
+          "MEASURED_current_us": 9.6,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:44",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 9.1,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 8.065186,
+          "EST_floor_arithmetic": "1.9 + 28606464/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/8 = 95.00 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 7077888,
+          "EST_capacity_stream_equivalent_us": 1.525407,
+          "EST_capacity_arithmetic": "576 CTAs * 4 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "qkv is the first timed kernel, and its output gates attention; there is no preceding PDL work to hide a real duration reduction",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            3,
+            4,
+            5,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "bit": 2,
+          "shape": "d16s",
+          "role": "cat",
+          "MEASURED_current_us": 17.1,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:30",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 16.6,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 6291456,
+          "EST_capacity_stream_equivalent_us": 1.355917,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            4,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 2,
+          "shape": "d16f",
+          "role": "cat",
+          "MEASURED_current_us": 16.6,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:42",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 16.1,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 6291456,
+          "EST_capacity_stream_equivalent_us": 1.355917,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            4,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 4,
+          "shape": "d32s",
+          "role": "cat",
+          "MEASURED_current_us": 19.0,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:52",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 18.5,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 6291456,
+          "EST_capacity_stream_equivalent_us": 1.355917,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 4,
+          "shape": "d32f",
+          "role": "cat",
+          "MEASURED_current_us": 19.5,
+          "measurement_source": "notes/study/evo/s7/kernel_baseline.md:65",
+          "EST_success_threshold_saving_us": 0.5,
+          "EST_expected_us_CONDITIONAL_on_success": 19.0,
+          "estimate_status": "test target only; speedup unknown and zero/regression plausible",
+          "kill_reasons": [
+            "ST adds 12 live words/thread/stage; register pressure can spill or lower occupancy",
+            "Other warps or the HBM stream may already hide the latency; PDL durations also include waits"
+          ],
+          "EST_stream_floor_us": 14.159752,
+          "EST_floor_arithmetic": "1.9 + 56885248/4,640,000; residual is NOT all exposed stall",
+          "EST_required_stall_cycles": "0.5 * 1520 = 760 cycles/CTA, or 760/18 = 42.22 cycles/unit",
+          "EST_extra_inflight_weight_capacity_B": 6291456,
+          "EST_capacity_stream_equivalent_us": 1.355917,
+          "EST_capacity_arithmetic": "256 CTAs * 8 warps * 1536 B * 2 stages / 4,640,000 B/us; NOT saved time",
+          "critical_path": "Only a post-wait reduction counts: pooler and router partial completion gates tail/MoE. A shorter overlapped prologue alone is not a layer gain",
+          "closest_DO_NOT_REPEAT": "GD-A/combo91 (shared ring, different transport); R-gdxh-0; R-rat-1 (different routes)",
+          "exact_new_instance": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        }
+      ],
+      "compile": {
+        "command": [
+          "nvcc",
+          "-cubin",
+          "-std=c++20",
+          "-arch=sm_90a",
+          "-O3",
+          "-Xptxas=-v",
+          "/tmp/s7_dn_gate_12h1sz33/v2.cu",
+          "-o",
+          "/tmp/s7_dn_gate_12h1sz33/v2.cubin"
+        ],
+        "ptxas": {
+          "_ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi3ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+            "stack": 32,
+            "spill_stores": 32,
+            "spill_loads": 288,
+            "registers": 128
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi4ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 128
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 57
+          },
+          "_ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 24,
+            "spill_stores": 24,
+            "spill_loads": 360,
+            "registers": 128
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 108
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 80
+          },
+          "_ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 48,
+            "spill_stores": 72,
+            "spill_loads": 212,
+            "registers": 96
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi3ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 64,
+            "spill_stores": 64,
+            "spill_loads": 64,
+            "registers": 96
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 94
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 102
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 58
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 98
+          },
+          "_ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 40
+          },
+          "_ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 32
+          }
+        },
+        "resources": "\nResource usage:\n Common:\n  GLOBAL:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi3ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:128 STACK:32 SHARED:33792 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi4ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:128 STACK:0 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:57 STACK:0 SHARED:6672 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:128 STACK:24 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:108 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:80 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:48 SHARED:15376 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi3ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:64 SHARED:8208 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:94 STACK:0 SHARED:4624 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:102 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:58 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:576 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:580 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+      },
+      "sass_targets": [
+        {
+          "bit": 1,
+          "key": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            3,
+            4,
+            5,
+            0,
+            0,
+            0
+          ],
+          "resources": {
+            "stack": 64,
+            "spill_stores": 64,
+            "spill_loads": 64,
+            "registers": 96
+          },
+          "static_instruction_count": 1472,
+          "opcodes": {
+            "LDC": 4,
+            "ULDC": 13,
+            "VIADD": 95,
+            "ISETP.NE.AND": 145,
+            "ULDC.64": 7,
+            "S2R": 7,
+            "S2UR": 6,
+            "PREEXIT": 1,
+            "SHF.R.S32.HI": 16,
+            "IMAD": 31,
+            "IMAD.SHL.U32": 23,
+            "IMAD.WIDE": 12,
+            "LOP3.LUT": 291,
+            "LEA": 9,
+            "IADD3": 3,
+            "LEA.HI.X": 5,
+            "IMAD.X": 1,
+            "LDG.E.NA.128.CONSTANT": 24,
+            "LDG.E.CONSTANT": 1,
+            "VOTEU.ALL": 2,
+            "UMOV": 2,
+            "@!UP0": 7,
+            "LEA.HI": 16,
+            "IMAD.MOV.U32": 27,
+            "ISETP.EQ.U32.AND": 2,
+            "IMAD.IADD": 25,
+            "SYNCS.ARRIVE.TRANS64": 1,
+            "NOP": 10,
+            "BRA": 48,
+            "UCGABAR_ARV": 1,
+            "UIADD3": 2,
+            "SHF.R.W.U32": 32,
+            "IMAD.WIDE.U32": 3,
+            "ACQBULK": 1,
+            "USHF.L.U32": 1,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 5,
+            "SEL": 130,
+            "LDG.E.128.CONSTANT": 32,
+            "SHFL.IDX": 9,
+            "PRMT": 130,
+            "SHF.R.U32.HI": 35,
+            "BSSY": 12,
+            "ISETP.GT.U32.AND": 2,
+            "SHF.L.U32": 10,
+            "BSYNC": 12,
+            "HMMA.16816.F32.BF16": 64,
+            "@!UPT": 13,
+            "STL.64": 8,
+            "ISETP.GT.AND": 10,
+            "LDL.LU": 16,
+            "MOV": 1,
+            "STS": 8,
+            "BAR.SYNC.DEFER_BLOCKING": 2,
+            "UCGABAR_WAIT": 1,
+            "CCTL.IVALL": 3,
+            "EXIT": 6,
+            "VIMNMX": 1,
+            "ISETP.GE.U32.AND": 1,
+            "LDS": 34,
+            "FADD": 34,
+            "STAS": 5,
+            "SYNCS.PHASECHK.TRANS64.TRYWAIT": 2,
+            "PLOP3.LUT": 3,
+            "ULEA": 1,
+            "FSEL": 2,
+            "F2FP.BF16.F32.PACK_AB": 2,
+            "STG.E.U16": 2
+          },
+          "baseline_static_instruction_count": 1448,
+          "baseline_opcodes": {
+            "LDC": 4,
+            "ULDC": 13,
+            "ULDC.64": 7,
+            "ISETP.NE.AND": 145,
+            "S2R": 7,
+            "S2UR": 6,
+            "PREEXIT": 1,
+            "SHF.R.S32.HI": 15,
+            "IMAD": 30,
+            "IMAD.WIDE": 12,
+            "LOP3.LUT": 291,
+            "IADD3": 3,
+            "LEA": 9,
+            "IMAD.X": 1,
+            "LEA.HI.X": 5,
+            "LDG.E.NA.128.CONSTANT": 24,
+            "UMOV": 2,
+            "LDG.E.CONSTANT": 1,
+            "VOTEU.ALL": 2,
+            "@!UP0": 7,
+            "ISETP.EQ.U32.AND": 2,
+            "LEA.HI": 16,
+            "IMAD.MOV.U32": 28,
+            "IMAD.SHL.U32": 23,
+            "IMAD.IADD": 24,
+            "SYNCS.ARRIVE.TRANS64": 1,
+            "NOP": 14,
+            "BRA": 48,
+            "UCGABAR_ARV": 1,
+            "UIADD3": 2,
+            "ACQBULK": 1,
+            "USHF.L.U32": 1,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 5,
+            "VIADD": 94,
+            "SEL": 130,
+            "LDG.E.128.CONSTANT": 32,
+            "SHFL.IDX": 9,
+            "SHF.R.W.U32": 32,
+            "PRMT": 130,
+            "SHF.R.U32.HI": 35,
+            "BSSY": 12,
+            "ISETP.GT.U32.AND": 2,
+            "SHF.L.U32": 10,
+            "BSYNC": 12,
+            "HMMA.16816.F32.BF16": 64,
+            "@!UPT": 13,
+            "ISETP.GT.AND": 10,
+            "MOV": 1,
+            "STS": 8,
+            "BAR.SYNC.DEFER_BLOCKING": 2,
+            "UCGABAR_WAIT": 1,
+            "CCTL.IVALL": 3,
+            "EXIT": 6,
+            "VIMNMX": 1,
+            "ISETP.GE.U32.AND": 1,
+            "LDS": 34,
+            "FADD": 34,
+            "STAS": 5,
+            "SYNCS.PHASECHK.TRANS64.TRYWAIT": 2,
+            "PLOP3.LUT": 3,
+            "ULEA": 1,
+            "IMAD.WIDE.U32": 2,
+            "FSEL": 2,
+            "F2FP.BF16.F32.PACK_AB": 2,
+            "STG.E.U16": 2
+          },
+          "pre_wait_x_candidates": []
+        },
+        {
+          "bit": 2,
+          "key": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            4,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "resources": {
+            "stack": 0,
+            "spill_stores": 0,
+            "spill_loads": 0,
+            "registers": 128
+          },
+          "static_instruction_count": 2808,
+          "opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 6,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "SHF.R.S32.HI": 25,
+            "IMAD": 40,
+            "LEA.HI": 9,
+            "LOP3.LUT": 600,
+            "IMAD.WIDE": 57,
+            "IMAD.IADD": 16,
+            "IADD3": 6,
+            "IMAD.X": 1,
+            "LEA": 18,
+            "LEA.HI.X": 12,
+            "LDG.E.CONSTANT": 1,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "IMAD.SHL.U32": 16,
+            "UIADD3": 2,
+            "USHF.R.S32.HI": 2,
+            "VIADD": 172,
+            "ISETP.GE.AND": 10,
+            "SEL": 290,
+            "LDG.E.128.CONSTANT": 72,
+            "IMAD.MOV.U32": 44,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 144,
+            "@!UPT": 21,
+            "ISETP.GT.AND": 19,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 16,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 11
+          },
+          "baseline_static_instruction_count": 2824,
+          "baseline_opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 6,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "SHF.R.S32.HI": 25,
+            "IMAD": 40,
+            "IMAD.WIDE": 57,
+            "LOP3.LUT": 600,
+            "IADD3": 6,
+            "LEA": 18,
+            "IMAD.X": 1,
+            "LEA.HI.X": 12,
+            "LEA.HI": 9,
+            "IMAD.SHL.U32": 16,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.IADD": 16,
+            "UIADD3": 2,
+            "ISETP.GE.AND": 10,
+            "VIADD": 172,
+            "USHF.R.S32.HI": 2,
+            "SEL": 290,
+            "LDG.E.128.CONSTANT": 72,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 44,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 144,
+            "@!UPT": 38,
+            "ISETP.GT.AND": 19,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 16,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 10
+          },
+          "pre_wait_x_candidates": []
+        },
+        {
+          "bit": 4,
+          "key": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            3,
+            1,
+            2,
+            0,
+            0,
+            2
+          ],
+          "resources": {
+            "stack": 32,
+            "spill_stores": 32,
+            "spill_loads": 288,
+            "registers": 128
+          },
+          "static_instruction_count": 3224,
+          "opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "VIADD": 175,
+            "ISETP.NE.AND": 323,
+            "ULDC.64": 14,
+            "S2R": 38,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "IMAD": 42,
+            "SHF.R.S32.HI": 28,
+            "LEA.HI": 9,
+            "IMAD.WIDE": 93,
+            "LOP3.LUT": 624,
+            "IMAD.IADD": 16,
+            "IADD3": 6,
+            "IMAD.X": 1,
+            "LEA": 18,
+            "LEA.HI.X": 12,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.SHL.U32": 23,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "UIADD3": 2,
+            "ISETP.GE.AND": 12,
+            "USHF.R.S32.HI": 2,
+            "SEL": 292,
+            "STL": 4,
+            "LDG.E.128.CONSTANT": 144,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 45,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 288,
+            "LDL": 64,
+            "ISETP.GT.AND": 19,
+            "@!UPT": 13,
+            "STL.64": 2,
+            "LDL.LU": 8,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 32,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 13
+          },
+          "baseline_static_instruction_count": 3080,
+          "baseline_opcodes": {
+            "LDC": 5,
+            "ULDC": 25,
+            "ULDC.64": 14,
+            "ISETP.NE.AND": 323,
+            "S2R": 14,
+            "S2UR": 3,
+            "PREEXIT": 1,
+            "ACQBULK": 1,
+            "IMAD": 42,
+            "SHF.R.S32.HI": 28,
+            "LEA.HI": 9,
+            "IMAD.WIDE": 93,
+            "LOP3.LUT": 603,
+            "IMAD.IADD": 16,
+            "IADD3": 6,
+            "IMAD.X": 1,
+            "LEA": 18,
+            "LEA.HI.X": 12,
+            "LDG.E.CONSTANT": 1,
+            "IMAD.SHL.U32": 19,
+            "LDG.E.NA.128.CONSTANT": 54,
+            "UIADD3": 2,
+            "VIADD": 174,
+            "USHF.R.S32.HI": 2,
+            "ISETP.GE.AND": 12,
+            "SEL": 292,
+            "LDG.E.128.CONSTANT": 144,
+            "SHFL.IDX": 19,
+            "SHF.R.W.U32": 72,
+            "PRMT": 288,
+            "IMAD.MOV.U32": 45,
+            "BRA": 85,
+            "SHF.R.U32.HI": 64,
+            "BSSY": 27,
+            "ISETP.GT.U32.AND": 1,
+            "SHF.L.U32": 18,
+            "BSYNC": 27,
+            "HMMA.16816.F32.BF16": 288,
+            "ISETP.GT.AND": 19,
+            "@!UPT": 2,
+            "UMOV": 2,
+            "ULEA": 2,
+            "STS": 32,
+            "BAR.SYNC.DEFER_BLOCKING": 1,
+            "VIMNMX": 2,
+            "LDS": 72,
+            "FADD": 72,
+            "F2FP.BF16.F32.PACK_AB": 3,
+            "IMAD.WIDE.U32": 8,
+            "STG.E.U16": 3,
+            "EXIT": 3,
+            "STG.E": 3,
+            "NOP": 8
+          },
+          "pre_wait_x_candidates": []
+        }
+      ],
+      "unchanged_SASS_instances": 12
+    }
+  ],
+  "inert": {
+    "variant": 0,
+    "status": "CPU_PASS",
+    "bytes": 965903,
+    "sha256": "68a320f15af3f5c90deab473d790e19ae8c07df5de5d937d82ef21c53ffe915b",
+    "instance_count": 13,
+    "dry_run": {
+      "status": "PASS",
+      "selected": [
+        {
+          "bit": 1,
+          "role": "qkv",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            4,
+            8,
+            1,
+            4,
+            5,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "bit": 2,
+          "role": "cat",
+          "T": 16,
+          "key": [
+            0,
+            2,
+            1,
+            8,
+            18,
+            2,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        },
+        {
+          "bit": 4,
+          "role": "cat",
+          "T": 32,
+          "key": [
+            0,
+            4,
+            1,
+            8,
+            18,
+            1,
+            1,
+            2,
+            0,
+            0,
+            2
+          ]
+        }
+      ],
+      "prepared_routes": 15,
+      "packs": 8,
+      "lookups": 320,
+      "numerical_tests": "NOT RUN (explicit CPU mocks)",
+      "state_layout_sources": [
+        "_r1_prepare:11628",
+        "_v8_tail_prepare:1542"
+      ]
+    },
+    "targets": [
+      {
+        "bit": 1,
+        "role": "qkv",
+        "T": 16,
+        "key": [
+          0,
+          2,
+          1,
+          4,
+          8,
+          1,
+          4,
+          5,
+          0,
+          0,
+          0
+        ],
+        "ring": {
+          "KU": 8,
+          "ST": 1,
+          "weight_vector_loads_per_thread": 24,
+          "prologue_vector_loads": 3,
+          "refill_vector_loads": 21
+        },
+        "protocol": {
+          "CTAs": [
+            144,
+            4,
+            1
+          ],
+          "threads": [
+            0,
+            127
+          ],
+          "red_indices": [
+            0,
+            255
+          ],
+          "owner": "split=0 combines 3*256 FP32 partials then stores 256 values per bx",
+          "exiting": "split=1..3 each sends all 256 partials before return",
+          "persistent_resets": 0
+        }
+      },
+      {
+        "bit": 2,
+        "role": "cat",
+        "T": 16,
+        "key": [
+          0,
+          2,
+          1,
+          8,
+          18,
+          2,
+          1,
+          2,
+          0,
+          0,
+          2
+        ],
+        "ring": {
+          "KU": 18,
+          "ST": 2,
+          "weight_vector_loads_per_thread": 54,
+          "prologue_vector_loads": 6,
+          "refill_vector_loads": 48
+        },
+        "protocol": {
+          "CTAs": 256,
+          "threads": [
+            0,
+            255
+          ],
+          "pooler_indices": [
+            0,
+            255
+          ],
+          "router_indices": [
+            0,
+            127
+          ],
+          "early_exits": 0,
+          "persistent_resets": 0,
+          "coverage": "all stores exactly once; reductions unchanged"
+        }
+      },
+      {
+        "bit": 4,
+        "role": "cat",
+        "T": 32,
+        "key": [
+          0,
+          4,
+          1,
+          8,
+          18,
+          1,
+          1,
+          2,
+          0,
+          0,
+          2
+        ],
+        "ring": {
+          "KU": 18,
+          "ST": 1,
+          "weight_vector_loads_per_thread": 54,
+          "prologue_vector_loads": 3,
+          "refill_vector_loads": 51
+        },
+        "protocol": {
+          "CTAs": 256,
+          "threads": [
+            0,
+            255
+          ],
+          "pooler_indices": [
+            0,
+            511
+          ],
+          "router_indices": [
+            0,
+            255
+          ],
+          "early_exits": 0,
+          "persistent_resets": 0,
+          "coverage": "all stores exactly once; reductions unchanged"
+        }
+      }
+    ],
+    "changed_lines": [
+      {
+        "kind": "replace",
+        "base_lines": [
+          2,
+          2
+        ],
+        "output_lines": [
+          2,
+          2
+        ],
+        "text": [
+          "# nonce dn-v0 (GD register lookahead; qkv16 + cat16 + cat32)"
+        ]
+      },
+      {
+        "kind": "insert",
+        "base_lines": [
+          22885,
+          22884
+        ],
+        "output_lines": [
+          22885,
+          22895
+        ],
+        "text": [
+          "",
+          "# S7-DN begin: existing GD register ring, opt-in only.",
+          "S7_DN_VARIANT=0",
+          "if S7_DN_VARIANT:",
+          " if S7_DN_VARIANT not in (1,2):",
+          "  raise ValueError(\"S7_DN_VARIANT must be 0, 1, or 2\")",
+          " _s7_dn_st=S7_DN_VARIANT+1",
+          " GD_ROUTE[(\"qkv\",16)]=(2,1,4,8,_s7_dn_st,4,0) # bit 1",
+          " GD_CAT_ROUTE[16]=(2,1,8,18,_s7_dn_st+1,1,0) # bit 2",
+          " GD_CAT_ROUTE[32]=(4,1,8,18,_s7_dn_st,1,0) # bit 4",
+          "# S7-DN end"
+        ]
+      }
+    ],
+    "CUDA_sources_identical": true,
+    "prepare_selftests_unchanged": true
+  },
+  "dense_map": [
+    {
+      "shape": "d1s",
+      "T": 1,
+      "role": "pooler",
+      "instance": "gd_kernel<0,1,1,8,16,2,1,2,7,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        16,
+        2,
+        1,
+        7
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 7, 0, 0>(gd::...",
+      "measured_us": 14.0,
+      "p10": 13.5,
+      "p90": 14.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:6",
+      "weight_bytes_EST": 50593792,
+      "byte_formula_EST": "4096*8192*1.5 + (4096//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.6138,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1s",
+      "T": 1,
+      "role": "qkv",
+      "instance": "gd_kernel<0,1,1,4,8,2,4,5,1,0,0>",
+      "route": [
+        1,
+        1,
+        4,
+        8,
+        2,
+        4,
+        1
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 4, 8, 2, 4, 5, 1, 0, 0>(gd::A...",
+      "measured_us": 9.4,
+      "p10": 9.0,
+      "p90": 9.8,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:7",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.0432,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1s",
+      "T": 1,
+      "role": "router",
+      "instance": "vf_router32_kernel<1>",
+      "route": "VF_ROUTER[1]='lean', kind=0 / V8_ROUTER_PLACE[1]='side'",
+      "label": "void vf_router32_kernel<1>(float const*, float const*, fl...",
+      "measured_us": 5.8,
+      "p10": 5.6,
+      "p90": 6.0,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:8",
+      "weight_bytes_EST": 8388608,
+      "byte_formula_EST": "256*8192*4",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.4463,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15280 (VF_ROUTER)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:925 (_v8_logits)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15273 (vf_router32_launch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1s",
+      "T": 1,
+      "role": "o",
+      "instance": "gd_kernel<0,1,1,8,2,2,1,4,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 1, 4, 6, 0, 0>(gd::A...",
+      "measured_us": 5.4,
+      "p10": 5.3,
+      "p90": 5.6,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:10",
+      "weight_bytes_EST": 13107200,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.4273,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1s",
+      "T": 1,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,1,1,16,4,2,1,1,6,0,0>",
+      "route": [
+        1,
+        1,
+        16,
+        4,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 16, 4, 2, 1, 1, 6, 0, 0>(gd::...",
+      "measured_us": 4.1,
+      "p10": 3.9,
+      "p90": 4.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:11",
+      "weight_bytes_EST": 6422528,
+      "byte_formula_EST": "1024*4096*1.5 + (1024//16*16*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.5665,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1f",
+      "T": 1,
+      "role": "pooler",
+      "instance": "gd_kernel<0,1,1,8,16,2,1,2,7,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        16,
+        2,
+        1,
+        7
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 7, 0, 0>(gd::...",
+      "measured_us": 13.7,
+      "p10": 13.4,
+      "p90": 14.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:18",
+      "weight_bytes_EST": 50593792,
+      "byte_formula_EST": "4096*8192*1.5 + (4096//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.693,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1f",
+      "T": 1,
+      "role": "qkv",
+      "instance": "gd_kernel<0,1,1,4,8,2,4,5,1,0,0>",
+      "route": [
+        1,
+        1,
+        4,
+        8,
+        2,
+        4,
+        1
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 4, 8, 2, 4, 5, 1, 0, 0>(gd::A...",
+      "measured_us": 9.2,
+      "p10": 8.8,
+      "p90": 9.5,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:20",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.1094,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1f",
+      "T": 1,
+      "role": "router",
+      "instance": "vf_router32_kernel<1>",
+      "route": "VF_ROUTER[1]='lean', kind=0 / V8_ROUTER_PLACE[1]='side'",
+      "label": "void vf_router32_kernel<1>(float const*, float const*, fl...",
+      "measured_us": 5.7,
+      "p10": 5.6,
+      "p90": 5.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:21",
+      "weight_bytes_EST": 8388608,
+      "byte_formula_EST": "256*8192*4",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.4717,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15280 (VF_ROUTER)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:925 (_v8_logits)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15273 (vf_router32_launch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1f",
+      "T": 1,
+      "role": "o",
+      "instance": "gd_kernel<0,1,1,8,2,2,1,4,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 1, 4, 6, 0, 0>(gd::A...",
+      "measured_us": 5.3,
+      "p10": 5.2,
+      "p90": 5.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:22",
+      "weight_bytes_EST": 13107200,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.4731,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d1f",
+      "T": 1,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,1,1,16,4,2,1,1,6,0,0>",
+      "route": [
+        1,
+        1,
+        16,
+        4,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 16, 4, 2, 1, 1, 6, 0, 0>(gd::...",
+      "measured_us": 4.0,
+      "p10": 3.9,
+      "p90": 4.2,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:23",
+      "weight_bytes_EST": 6422528,
+      "byte_formula_EST": "1024*4096*1.5 + (1024//16*16*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.6056,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16s",
+      "T": 16,
+      "role": "pooler+router",
+      "instance": "gd_kernel<0,2,1,8,18,2,1,2,0,0,2>",
+      "route": [
+        2,
+        1,
+        8,
+        18,
+        2,
+        1,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 2, 1, 8, 18, 2, 1, 2, 0, 0, 2>(gd::...",
+      "measured_us": 17.1,
+      "p10": 16.8,
+      "p90": 17.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:30",
+      "weight_bytes_EST": 56885248,
+      "byte_formula_EST": "(4096+2*256)*8192*1.5 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.3266,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16523 (GD_CAT_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16727 (_gd_cat)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22591 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16s",
+      "T": 16,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,2,2,4,16,2,1,2,6,0,0>",
+      "route": [
+        2,
+        2,
+        4,
+        16,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 2, 2, 4, 16, 2, 1, 2, 6, 0, 0>(gd::...",
+      "measured_us": 15.2,
+      "p10": 14.8,
+      "p90": 15.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:31",
+      "weight_bytes_EST": 50593792,
+      "byte_formula_EST": "8192*4096*1.5 + (8192//16*4*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.3285,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16s",
+      "T": 16,
+      "role": "qkv",
+      "instance": "gd_kernel<0,2,1,4,8,1,4,5,0,0,0>",
+      "route": [
+        2,
+        1,
+        4,
+        8,
+        1,
+        4,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 2, 1, 4, 8, 1, 4, 5, 0, 0, 0>(gd::A...",
+      "measured_us": 9.7,
+      "p10": 9.5,
+      "p90": 10.0,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:32",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.9491,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16s",
+      "T": 16,
+      "role": "o",
+      "instance": "gd_kernel<0,2,2,4,4,2,1,2,6,0,0>",
+      "route": [
+        2,
+        2,
+        4,
+        4,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 2, 2, 4, 4, 2, 1, 2, 6, 0, 0>(gd::A...",
+      "measured_us": 5.8,
+      "p10": 5.7,
+      "p90": 5.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:34",
+      "weight_bytes_EST": 12845056,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*4*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.2147,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16f",
+      "T": 16,
+      "role": "pooler+router",
+      "instance": "gd_kernel<0,2,1,8,18,2,1,2,0,0,2>",
+      "route": [
+        2,
+        1,
+        8,
+        18,
+        2,
+        1,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 2, 1, 8, 18, 2, 1, 2, 0, 0, 2>(gd::...",
+      "measured_us": 16.6,
+      "p10": 16.4,
+      "p90": 17.3,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:42",
+      "weight_bytes_EST": 56885248,
+      "byte_formula_EST": "(4096+2*256)*8192*1.5 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.4268,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16523 (GD_CAT_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16727 (_gd_cat)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22591 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16f",
+      "T": 16,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,2,2,4,16,2,1,2,6,0,0>",
+      "route": [
+        2,
+        2,
+        4,
+        16,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 2, 2, 4, 16, 2, 1, 2, 6, 0, 0>(gd::...",
+      "measured_us": 15.2,
+      "p10": 14.7,
+      "p90": 15.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:43",
+      "weight_bytes_EST": 50593792,
+      "byte_formula_EST": "8192*4096*1.5 + (8192//16*4*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.3285,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16f",
+      "T": 16,
+      "role": "qkv",
+      "instance": "gd_kernel<0,2,1,4,8,1,4,5,0,0,0>",
+      "route": [
+        2,
+        1,
+        4,
+        8,
+        1,
+        4,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 2, 1, 4, 8, 1, 4, 5, 0, 0, 0>(gd::A...",
+      "measured_us": 9.6,
+      "p10": 9.5,
+      "p90": 9.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:44",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.9798,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d16f",
+      "T": 16,
+      "role": "o",
+      "instance": "gd_kernel<0,2,2,4,4,2,1,2,6,0,0>",
+      "route": [
+        2,
+        2,
+        4,
+        4,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 2, 2, 4, 4, 2, 1, 2, 6, 0, 0>(gd::A...",
+      "measured_us": 7.9,
+      "p10": 5.9,
+      "p90": 8.6,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:45",
+      "weight_bytes_EST": 12845056,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*4*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.626,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d32s",
+      "T": 32,
+      "role": "pooler+router",
+      "instance": "gd_kernel<0,4,1,8,18,1,1,2,0,0,2>",
+      "route": [
+        4,
+        1,
+        8,
+        18,
+        1,
+        1,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 4, 1, 8, 18, 1, 1, 2, 0, 0, 2>(gd::...",
+      "measured_us": 19.0,
+      "p10": 18.8,
+      "p90": 19.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:52",
+      "weight_bytes_EST": 56885248,
+      "byte_formula_EST": "(4096+2*256)*8192*1.5 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.994,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16523 (GD_CAT_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16727 (_gd_cat)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22591 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d32s",
+      "T": 32,
+      "role": "unpooler",
+      "instance": "sk2_kernel<2,32,4,2,2,2,3,true,false,1,1,__nv_bfloat16,false,false>",
+      "route": "unpooler32_r144",
+      "label": "void sk2_kernel<2, 32, 4, 2, 2, 2, 3, true, false, 1, 1, ...",
+      "measured_us": 18.3,
+      "p10": 17.9,
+      "p90": 18.8,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:53",
+      "weight_bytes_EST": 50331648,
+      "byte_formula_EST": "8192*4096*1.5; escape table adds (8192//64)*pmax*8",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.7504,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21100 (sk2_dispatch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21114 (_SK2_CFGS)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21209 (_sk2)"
+      ]
+    },
+    {
+      "shape": "d32s",
+      "T": 32,
+      "role": "qkv",
+      "instance": "sk2_kernel<2,32,3,1,4,2,4,true,false,1,1,__nv_bfloat16,false,false>",
+      "route": "qkv32_r208",
+      "label": "void sk2_kernel<2, 32, 3, 1, 4, 2, 4, true, false, 1, 1, ...",
+      "measured_us": 11.3,
+      "p10": 11.1,
+      "p90": 11.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:54",
+      "weight_bytes_EST": 28311552,
+      "byte_formula_EST": "2304*8192*1.5; escape table adds (2304//24)*pmax*8",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.5054,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21099 (sk2_dispatch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21114 (_SK2_CFGS)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21209 (_sk2)"
+      ]
+    },
+    {
+      "shape": "d32s",
+      "T": 32,
+      "role": "o",
+      "instance": "dg1::dg1_kernel<32,1,1>",
+      "route": [
+        32,
+        1,
+        1,
+        1
+      ],
+      "label": "void dg1::dg1_kernel<32, 1, 1>(CUtensorMap_st, dg1::Params)",
+      "measured_us": 8.8,
+      "p10": 8.7,
+      "p90": 8.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:56",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 (raw BF16; dg1_pack is permutation only)",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.9065,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:13745 (DG1_GEOMETRY)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14727 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22576 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d32f",
+      "T": 32,
+      "role": "pooler+router",
+      "instance": "gd_kernel<0,4,1,8,18,1,1,2,0,0,2>",
+      "route": [
+        4,
+        1,
+        8,
+        18,
+        1,
+        1,
+        0
+      ],
+      "label": "void gd::gd_kernel<0, 4, 1, 8, 18, 1, 1, 2, 0, 0, 2>(gd::...",
+      "measured_us": 19.5,
+      "p10": 19.2,
+      "p90": 20.3,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:65",
+      "weight_bytes_EST": 56885248,
+      "byte_formula_EST": "(4096+2*256)*8192*1.5 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.9172,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16523 (GD_CAT_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16727 (_gd_cat)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22591 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "d32f",
+      "T": 32,
+      "role": "unpooler",
+      "instance": "sk2_kernel<2,32,4,2,2,2,3,true,false,1,1,__nv_bfloat16,false,false>",
+      "route": "unpooler32_r144",
+      "label": "void sk2_kernel<2, 32, 4, 2, 2, 2, 3, true, false, 1, 1, ...",
+      "measured_us": 18.4,
+      "p10": 17.7,
+      "p90": 19.1,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:66",
+      "weight_bytes_EST": 50331648,
+      "byte_formula_EST": "8192*4096*1.5; escape table adds (8192//64)*pmax*8",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.7354,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21100 (sk2_dispatch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21114 (_SK2_CFGS)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21209 (_sk2)"
+      ]
+    },
+    {
+      "shape": "d32f",
+      "T": 32,
+      "role": "qkv",
+      "instance": "sk2_kernel<2,32,3,1,4,2,4,true,false,1,1,__nv_bfloat16,false,false>",
+      "route": "qkv32_r208",
+      "label": "void sk2_kernel<2, 32, 3, 1, 4, 2, 4, true, false, 1, 1, ...",
+      "measured_us": 11.0,
+      "p10": 10.8,
+      "p90": 11.5,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:69",
+      "weight_bytes_EST": 28311552,
+      "byte_formula_EST": "2304*8192*1.5; escape table adds (2304//24)*pmax*8",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.5738,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21099 (sk2_dispatch)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21114 (_SK2_CFGS)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21209 (_sk2)"
+      ]
+    },
+    {
+      "shape": "d32f",
+      "T": 32,
+      "role": "o",
+      "instance": "dg1::dg1_kernel<32,1,1>",
+      "route": [
+        32,
+        1,
+        1,
+        1
+      ],
+      "label": "void dg1::dg1_kernel<32, 1, 1>(CUtensorMap_st, dg1::Params)",
+      "measured_us": 10.0,
+      "p10": 9.6,
+      "p90": 10.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:70",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 (raw BF16; dg1_pack is permutation only)",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.6777,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:13745 (DG1_GEOMETRY)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14727 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22576 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1s",
+      "T": 8,
+      "role": "pooler+FP32 router",
+      "instance": "gd_kernel<0,1,1,8,16,2,1,2,1,2,0>",
+      "route": "gdr_run_raw VF=2 (GD pooler/8 descriptor)",
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2, 0>(gd::...",
+      "measured_us": 17.4,
+      "p10": 17.2,
+      "p90": 18.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:76",
+      "weight_bytes_EST": 58982400,
+      "byte_formula_EST": "4096*8192*1.5 + 256*8192*4 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.3898,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16133 (gdr_run_raw)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16187 (_vfr_fused)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16169 (VF_GDR)"
+      ]
+    },
+    {
+      "shape": "v1s",
+      "T": 8,
+      "role": "qkv",
+      "instance": "gd_kernel<0,1,1,4,8,2,4,5,1,0,0>",
+      "route": [
+        1,
+        1,
+        4,
+        8,
+        2,
+        4,
+        1
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 4, 8, 2, 4, 5, 1, 0, 0>(gd::A...",
+      "measured_us": 9.1,
+      "p10": 9.0,
+      "p90": 9.2,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:77",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.1436,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1s",
+      "T": 8,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,1,1,8,2,2,4,2,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        4,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 4, 2, 6, 0, 0>(gd::A...",
+      "measured_us": 5.5,
+      "p10": 5.2,
+      "p90": 5.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:79",
+      "weight_bytes_EST": 6553600,
+      "byte_formula_EST": "1024*4096*1.5 + (1024//16*8*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.1916,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1s",
+      "T": 8,
+      "role": "o",
+      "instance": "gd_kernel<0,1,1,8,2,2,1,4,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 1, 4, 6, 0, 0>(gd::A...",
+      "measured_us": 5.3,
+      "p10": 5.2,
+      "p90": 5.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:80",
+      "weight_bytes_EST": 13107200,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.4731,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1f",
+      "T": 8,
+      "role": "pooler+FP32 router",
+      "instance": "gd_kernel<0,1,1,8,16,2,1,2,1,2,0>",
+      "route": "gdr_run_raw VF=2 (GD pooler/8 descriptor)",
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 16, 2, 1, 2, 1, 2, 0>(gd::...",
+      "measured_us": 17.9,
+      "p10": 17.7,
+      "p90": 18.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:87",
+      "weight_bytes_EST": 58982400,
+      "byte_formula_EST": "4096*8192*1.5 + 256*8192*4 + (256*8)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.2951,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16133 (gdr_run_raw)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16187 (_vfr_fused)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16169 (VF_GDR)"
+      ]
+    },
+    {
+      "shape": "v1f",
+      "T": 8,
+      "role": "qkv",
+      "instance": "gd_kernel<0,1,1,4,8,2,4,5,1,0,0>",
+      "route": [
+        1,
+        1,
+        4,
+        8,
+        2,
+        4,
+        1
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 4, 8, 2, 4, 5, 1, 0, 0>(gd::A...",
+      "measured_us": 9.2,
+      "p10": 9.1,
+      "p90": 9.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:89",
+      "weight_bytes_EST": 28606464,
+      "byte_formula_EST": "2304*8192*1.5 + (2304//16*4*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.1094,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1f",
+      "T": 8,
+      "role": "o",
+      "instance": "gd_kernel<0,1,1,8,2,2,1,4,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        1,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 1, 4, 6, 0, 0>(gd::A...",
+      "measured_us": 5.6,
+      "p10": 5.5,
+      "p90": 5.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:90",
+      "weight_bytes_EST": 13107200,
+      "byte_formula_EST": "8192*1024*1.5 + (8192//16*8*1)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.3406,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v1f",
+      "T": 8,
+      "role": "unpooler",
+      "instance": "gd_kernel<0,1,1,8,2,2,4,2,6,0,0>",
+      "route": [
+        1,
+        1,
+        8,
+        2,
+        2,
+        4,
+        6
+      ],
+      "label": "void gd::gd_kernel<0, 1, 1, 8, 2, 2, 4, 2, 6, 0, 0>(gd::A...",
+      "measured_us": 5.5,
+      "p10": 5.2,
+      "p90": 5.8,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:91",
+      "weight_bytes_EST": 6553600,
+      "byte_formula_EST": "1024*4096*1.5 + (1024//16*8*4)*128",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.1916,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:15475 (GD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:16475 (_gd_live)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v16s",
+      "T": 128,
+      "role": "qkv+unpooler (two calls, aggregate time)",
+      "instance": "rq_kernel<128,5,1,0,0,0,42999939,1>",
+      "route": "RQ_SEL; d2s5hzwP; KS=7/2",
+      "label": "void rq_kernel<128, 5, 1, 0, 0, 0, 42999939, 1>(rq_P, rq_...",
+      "measured_us": 30.8,
+      "p10": 30.5,
+      "p90": 31.8,
+      "calls": 2,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:98",
+      "weight_bytes_EST": 78643200,
+      "byte_formula_EST": "(2304*8192+8192*4096)*1.5; escape arrays add 4*(KS*(N/128)*8*CAP+32) per role",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.5534,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21273 (RQ_SEL)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21276 (_rq_ks)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21353 (_rq_prepare)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22533 (kernel_fn)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22638 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v16s",
+      "T": 128,
+      "role": "pooler+router",
+      "instance": "vd::vd_kernel<2,128,5,3,1,1>",
+      "route": [
+        2,
+        128,
+        5,
+        3,
+        1,
+        1
+      ],
+      "label": "void vd::vd_kernel<2, 128, 5, 3, 1, 1>(CUtensorMap_st, CU...",
+      "measured_us": 25.8,
+      "p10": 25.4,
+      "p90": 26.1,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:99",
+      "weight_bytes_EST": 75497472,
+      "byte_formula_EST": "(4096+2*256)*8192*2 (raw BF16, includes hi+lo router)",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.9263,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14158 (VD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14705 (_vd)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14732 (_dg1)"
+      ]
+    },
+    {
+      "shape": "v16s",
+      "T": 128,
+      "role": "o",
+      "instance": "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT",
+      "route": [
+        66,
+        18,
+        35,
+        1,
+        0,
+        0,
+        3,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT",
+      "measured_us": 8.7,
+      "p10": 8.6,
+      "p90": 8.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:101",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.9284,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v16f",
+      "T": 128,
+      "role": "qkv+unpooler (two calls, aggregate time)",
+      "instance": "rq_kernel<128,5,1,0,0,0,42999939,1>",
+      "route": "RQ_SEL; d2s5hzwP; KS=7/2",
+      "label": "void rq_kernel<128, 5, 1, 0, 0, 0, 42999939, 1>(rq_P, rq_...",
+      "measured_us": 30.8,
+      "p10": 30.3,
+      "p90": 31.6,
+      "calls": 2,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:108",
+      "weight_bytes_EST": 78643200,
+      "byte_formula_EST": "(2304*8192+8192*4096)*1.5; escape arrays add 4*(KS*(N/128)*8*CAP+32) per role",
+      "unknown_escape_bytes": true,
+      "effective_TB_s_EST": 2.5534,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21273 (RQ_SEL)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21276 (_rq_ks)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:21353 (_rq_prepare)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22533 (kernel_fn)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22638 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v16f",
+      "T": 128,
+      "role": "pooler+router",
+      "instance": "vd::vd_kernel<2,128,5,3,1,1>",
+      "route": [
+        2,
+        128,
+        5,
+        3,
+        1,
+        1
+      ],
+      "label": "void vd::vd_kernel<2, 128, 5, 3, 1, 1>(CUtensorMap_st, CU...",
+      "measured_us": 24.8,
+      "p10": 24.5,
+      "p90": 25.4,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:109",
+      "weight_bytes_EST": 75497472,
+      "byte_formula_EST": "(4096+2*256)*8192*2 (raw BF16, includes hi+lo router)",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.0443,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14158 (VD_ROUTE)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14705 (_vd)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14732 (_dg1)"
+      ]
+    },
+    {
+      "shape": "v16f",
+      "T": 128,
+      "role": "o",
+      "instance": "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT",
+      "route": [
+        66,
+        18,
+        35,
+        1,
+        0,
+        0,
+        3,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT",
+      "measured_us": 7.6,
+      "p10": 7.4,
+      "p90": 7.8,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:110",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.2075,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32s",
+      "T": 256,
+      "role": "unpooler",
+      "instance": "nvjet_sm90_tss_72x128_64x8_1x2_h_bz_TNN",
+      "route": [
+        66,
+        20,
+        35,
+        1,
+        0,
+        0,
+        7,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tss_72x128_64x8_1x2_h_bz_TNN",
+      "measured_us": 32.6,
+      "p10": 31.7,
+      "p90": 33.2,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:116",
+      "weight_bytes_EST": 67108864,
+      "byte_formula_EST": "8192*4096*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.0586,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32s",
+      "T": 256,
+      "role": "qkv",
+      "instance": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_coopA_NNT",
+      "route": [
+        66,
+        124,
+        35,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      "label": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_coopA_NNT",
+      "measured_us": 24.6,
+      "p10": 24.2,
+      "p90": 25.1,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:117",
+      "weight_bytes_EST": 37748736,
+      "byte_formula_EST": "2304*8192*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.5345,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32s",
+      "T": 256,
+      "role": "pooler+router",
+      "instance": "nvjet_sm90_tst_72x64_64x12_1x1_v_bz_TNN",
+      "route": [
+        66,
+        125,
+        35,
+        1,
+        0,
+        0,
+        2,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tst_72x64_64x12_1x1_v_bz_TNN",
+      "measured_us": 20.3,
+      "p10": 20.0,
+      "p90": 20.8,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:118",
+      "weight_bytes_EST": 75497472,
+      "byte_formula_EST": "4608*8192*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.7191,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32s",
+      "T": 256,
+      "role": "o",
+      "instance": "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+      "route": "torch.mm default (no o256 pin)",
+      "label": "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+      "measured_us": 9.3,
+      "p10": 9.2,
+      "p90": 9.9,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:121",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.804,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32f",
+      "T": 256,
+      "role": "unpooler",
+      "instance": "nvjet_sm90_tss_72x128_64x8_1x2_h_bz_TNN",
+      "route": [
+        66,
+        20,
+        35,
+        1,
+        0,
+        0,
+        7,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tss_72x128_64x8_1x2_h_bz_TNN",
+      "measured_us": 32.4,
+      "p10": 31.5,
+      "p90": 33.6,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:127",
+      "weight_bytes_EST": 67108864,
+      "byte_formula_EST": "8192*4096*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 2.0713,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32f",
+      "T": 256,
+      "role": "qkv",
+      "instance": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_coopA_NNT",
+      "route": [
+        66,
+        124,
+        35,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      "label": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_coopA_NNT",
+      "measured_us": 24.7,
+      "p10": 24.1,
+      "p90": 25.6,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:128",
+      "weight_bytes_EST": 37748736,
+      "byte_formula_EST": "2304*8192*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.5283,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32f",
+      "T": 256,
+      "role": "pooler+router",
+      "instance": "nvjet_sm90_tst_72x64_64x12_1x1_v_bz_TNN",
+      "route": [
+        66,
+        125,
+        35,
+        1,
+        0,
+        0,
+        2,
+        0,
+        5
+      ],
+      "label": "nvjet_sm90_tst_72x64_64x12_1x1_v_bz_TNN",
+      "measured_us": 20.4,
+      "p10": 20.0,
+      "p90": 21.1,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:129",
+      "weight_bytes_EST": 75497472,
+      "byte_formula_EST": "4608*8192*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 3.7009,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    },
+    {
+      "shape": "v32f",
+      "T": 256,
+      "role": "o",
+      "instance": "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+      "route": "torch.mm default (no o256 pin)",
+      "label": "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+      "measured_us": 9.4,
+      "p10": 9.2,
+      "p90": 9.7,
+      "calls": 1,
+      "measurement_source": "notes/study/evo/s7/kernel_baseline.md:131",
+      "weight_bytes_EST": 16777216,
+      "byte_formula_EST": "8192*1024*2 raw BF16; nominal unique payload, tile reloads/cache excluded",
+      "unknown_escape_bytes": false,
+      "effective_TB_s_EST": 1.7848,
+      "bandwidth_note": "payload / profile duration, NOT measured HBM throughput; includes PDL wait/overlap",
+      "source_references": [
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22669 (LT_PIN)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:14729 (_dg1)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22865 (_lt)",
+        "kernels/muse_decode_layer/k3_tinys7_c1.py:22525 (kernel_fn)"
+      ]
+    }
+  ],
+  "work_directory": "/tmp/s7_dn_gate_12h1sz33",
+  "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Tue_Sep_01_08:45:21_PDT_2026\nCuda compilation tools, release 13.4, V13.4.92\nBuild cuda_13.4.r13.4/compiler.38855100_0\n",
+  "base_compile": {
+    "command": [
+      "nvcc",
+      "-cubin",
+      "-std=c++20",
+      "-arch=sm_90a",
+      "-O3",
+      "-Xptxas=-v",
+      "/tmp/s7_dn_gate_12h1sz33/base.cu",
+      "-o",
+      "/tmp/s7_dn_gate_12h1sz33/base.cubin"
+    ],
+    "ptxas": {
+      "_ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi1ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 128
+      },
+      "_ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi2ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 114
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 57
+      },
+      "_ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 24,
+        "spill_stores": 24,
+        "spill_loads": 360,
+        "registers": 128
+      },
+      "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 108
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 80
+      },
+      "_ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 48,
+        "spill_stores": 72,
+        "spill_loads": 212,
+        "registers": 96
+      },
+      "_ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 96
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 94
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 98
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 98
+      },
+      "_ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 102
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 58
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 98
+      },
+      "_ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 98
+      },
+      "_ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 40
+      },
+      "_ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij": {
+        "stack": 0,
+        "spill_stores": 0,
+        "spill_loads": 0,
+        "registers": 32
+      }
+    },
+    "resources": "\nResource usage:\n Common:\n  GLOBAL:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi8ELi18ELi1ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:128 STACK:0 SHARED:33792 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi8ELi18ELi2ELi1ELi2ELi0ELi0ELi2EEEvNS_4ArgsE:\n  REG:114 STACK:0 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi4ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:57 STACK:0 SHARED:6672 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi2ELi4ELi16ELi1ELi1ELi2ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:128 STACK:24 SHARED:17408 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi16ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:108 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi16ELi4ELi2ELi1ELi1ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:80 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi4ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:48 SHARED:15376 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi1ELi4ELi8ELi1ELi4ELi5ELi0ELi0ELi0EEEvNS_4ArgsE:\n  REG:96 STACK:0 SHARED:8208 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi4ELi8ELi2ELi4ELi5ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:94 STACK:0 SHARED:4624 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi7ELi0ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi2ELi2ELi4ELi4ELi2ELi1ELi2ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:102 STACK:0 SHARED:9216 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi2ELi2ELi1ELi4ELi6ELi0ELi0EEEvNS_4ArgsE:\n  REG:58 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi1ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd9gd_kernelILi0ELi1ELi1ELi8ELi16ELi2ELi1ELi2ELi1ELi2ELi0EEEvNS_4ArgsE:\n  REG:98 STACK:0 SHARED:5120 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd17unpack_cat_kernelEPK5uint4PKjPjiiiijj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:576 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _ZN2gd13unpack_kernelEPK5uint4PKjPjiiiiiij:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:580 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+  },
+  "failures": [
+    "v2 bit1: nonzero spills {'stack': 64, 'spill_stores': 64, 'spill_loads': 64, 'registers': 96}",
+    "v2 bit4: nonzero spills {'stack': 32, 'spill_stores': 32, 'spill_loads': 288, 'registers': 128}"
+  ]
+}

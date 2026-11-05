@@ -1,0 +1,446 @@
+{
+  "status": "CPU PASS; CUDA/SASS/GPU NOT RUN",
+  "cuda_compile": "NOT RUN: Windows sandbox cannot reach WSL/NVCC",
+  "sass": "NOT RUN",
+  "gpu_correctness": "NOT RUN",
+  "python_compile": "PASS",
+  "unaffected_python_ast": "PASS",
+  "unchanged_math_and_protocol": "PASS",
+  "coverage": {
+    "status": "PASS",
+    "geometries": [
+      {
+        "ns": 4,
+        "kv_bytes_per_cta": 131072,
+        "cp_async_per_thread": 32,
+        "smem_bytes": 141888,
+        "threads": 256
+      },
+      {
+        "ns": 8,
+        "kv_bytes_per_cta": 65536,
+        "cp_async_per_thread": 16,
+        "smem_bytes": 76352,
+        "threads": 256
+      },
+      {
+        "ns": 16,
+        "kv_bytes_per_cta": 32768,
+        "cp_async_per_thread": 8,
+        "smem_bytes": 43584,
+        "threads": 256
+      }
+    ],
+    "protocol_changed": false
+  },
+  "dry_run": {
+    "status": "PASS",
+    "arms": [
+      {
+        "bits": 0,
+        "routes": [
+          [
+            16,
+            16,
+            1
+          ],
+          [
+            16,
+            8,
+            0
+          ],
+          [
+            32,
+            8,
+            0
+          ],
+          [
+            17,
+            8,
+            0
+          ],
+          [
+            31,
+            8,
+            0
+          ],
+          [
+            33,
+            8,
+            0
+          ],
+          [
+            64,
+            8,
+            0
+          ]
+        ],
+        "metadata_only": true,
+        "new_bank": "none"
+      },
+      {
+        "bits": 1,
+        "routes": [
+          [
+            16,
+            16,
+            1
+          ],
+          [
+            16,
+            8,
+            0
+          ],
+          [
+            32,
+            8,
+            0
+          ],
+          [
+            17,
+            8,
+            0
+          ],
+          [
+            31,
+            8,
+            0
+          ],
+          [
+            33,
+            8,
+            0
+          ],
+          [
+            64,
+            8,
+            0
+          ]
+        ],
+        "metadata_only": true,
+        "new_bank": "none"
+      },
+      {
+        "bits": 2,
+        "routes": [
+          [
+            16,
+            16,
+            1
+          ],
+          [
+            16,
+            8,
+            0
+          ],
+          [
+            32,
+            8,
+            0
+          ],
+          [
+            17,
+            8,
+            0
+          ],
+          [
+            31,
+            8,
+            0
+          ],
+          [
+            33,
+            8,
+            0
+          ],
+          [
+            64,
+            8,
+            0
+          ]
+        ],
+        "metadata_only": true,
+        "new_bank": "none"
+      },
+      {
+        "bits": 3,
+        "routes": [
+          [
+            16,
+            16,
+            1
+          ],
+          [
+            16,
+            8,
+            0
+          ],
+          [
+            32,
+            8,
+            0
+          ],
+          [
+            17,
+            8,
+            0
+          ],
+          [
+            31,
+            8,
+            0
+          ],
+          [
+            33,
+            8,
+            0
+          ],
+          [
+            64,
+            8,
+            0
+          ]
+        ],
+        "metadata_only": true,
+        "new_bank": "none"
+      }
+    ],
+    "distinct_build_tags": [
+      "ks1_b31ca333c0",
+      "ks1_7a75fae9fa",
+      "ks1_64ad890f63",
+      "ks1_83ce0da82e"
+    ],
+    "limitation": "real prepare/call Python with fake tensors/compiler; numeric GPU self-tests stubbed"
+  },
+  "changed_lines": [
+    {
+      "kind": "replace",
+      "base_lines": [
+        2,
+        2
+      ],
+      "candidate_lines": [
+        2,
+        2
+      ]
+    },
+    {
+      "kind": "insert",
+      "base_lines": [
+        12704,
+        12703
+      ],
+      "candidate_lines": [
+        12704,
+        12706
+      ]
+    },
+    {
+      "kind": "insert",
+      "base_lines": [
+        12833,
+        12832
+      ],
+      "candidate_lines": [
+        12836,
+        12836
+      ]
+    },
+    {
+      "kind": "insert",
+      "base_lines": [
+        12880,
+        12879
+      ],
+      "candidate_lines": [
+        12884,
+        12953
+      ]
+    },
+    {
+      "kind": "insert",
+      "base_lines": [
+        13256,
+        13255
+      ],
+      "candidate_lines": [
+        13330,
+        13334
+      ]
+    },
+    {
+      "kind": "replace",
+      "base_lines": [
+        13264,
+        13264
+      ],
+      "candidate_lines": [
+        13343,
+        13343
+      ]
+    }
+  ],
+  "per_bit_lines": {
+    "bit1": {
+      "predicate": 12887,
+      "early_metadata": [
+        12904,
+        12910
+      ],
+      "original_metadata_guard": [
+        12931,
+        12937
+      ]
+    },
+    "bit2": {
+      "predicate": 12886,
+      "early_wait_and_q_loads": [
+        12894,
+        12900
+      ],
+      "original_wait_guard": 12944,
+      "original_q_load_guard": [
+        12947,
+        12952
+      ],
+      "metadata": "shares bit1 early/original metadata blocks"
+    },
+    "common": {
+      "exact_diff_hunks": [
+        {
+          "kind": "replace",
+          "base_lines": [
+            2,
+            2
+          ],
+          "candidate_lines": [
+            2,
+            2
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            12704,
+            12703
+          ],
+          "candidate_lines": [
+            12704,
+            12706
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            12833,
+            12832
+          ],
+          "candidate_lines": [
+            12836,
+            12836
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            12880,
+            12879
+          ],
+          "candidate_lines": [
+            12884,
+            12953
+          ]
+        },
+        {
+          "kind": "insert",
+          "base_lines": [
+            13256,
+            13255
+          ],
+          "candidate_lines": [
+            13330,
+            13334
+          ]
+        },
+        {
+          "kind": "replace",
+          "base_lines": [
+            13264,
+            13264
+          ],
+          "candidate_lines": [
+            13343,
+            13343
+          ]
+        }
+      ],
+      "build_source": 13343
+    }
+  },
+  "byte_accounting": {
+    "weight_stream_growth_bytes": 0,
+    "kv_cta_before_after": {
+      "d16s": [
+        32768,
+        32768
+      ],
+      "d32s": [
+        65536,
+        65536
+      ]
+    },
+    "q_gate_load_bytes_per_cta_before_after": [
+      4096,
+      4096
+    ],
+    "tail_new_kv_load_bytes_before_after": [
+      512,
+      512
+    ],
+    "mg1_partial_payload_bytes_per_cta_before_after": [
+      4160,
+      4160
+    ],
+    "mg0_partial_payload_bytes_per_cta_before_after": [
+      4224,
+      4224
+    ],
+    "removed_launches": 0,
+    "removed_waits": 0
+  },
+  "chunk32_source_ops_before_after": {
+    "mma16816": [
+      32,
+      32
+    ],
+    "fp8_pair_conversions": [
+      64,
+      64
+    ],
+    "K_LDS128": [
+      4,
+      4
+    ],
+    "V_LDS64": [
+      8,
+      8
+    ],
+    "byte_perm": [
+      16,
+      16
+    ],
+    "ex2": [
+      9,
+      9
+    ]
+  },
+  "candidate_bytes": 968650,
+  "candidate_sha256": "64c49e807b3f1e7b6c59b6869c425faf6785b8f3e2ce1fb3227c64526ff4e982",
+  "base_bytes": 965632,
+  "base_sha256": "07eb81e0a91a5161e23e0f794abe1f536788ff4200326c209c484802092c6e10",
+  "selector": 0,
+  "timing_status": "NOT RUN; no defensible >=1.5 us summed saving",
+  "compile_report_parsers": "PASS (synthetic positive/negative CPU cases)",
+  "generator_arms": "PASS (0, 1, 2, 3 generated in memory only)"
+}

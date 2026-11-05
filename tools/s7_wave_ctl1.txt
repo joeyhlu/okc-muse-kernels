@@ -1,0 +1,2 @@
+muse_decode_layer box_out/stress3/k3_tinys7_r50.py
+muse_decode_layer box_out/stress3/k3_tinys7_r51.py
