@@ -2,7 +2,7 @@
 usage: python -I tools/s7_prof.py <profile.txt> [...]   (never print a whole profile: they are long)"""
 import re, sys
 LAB = ['d1s', 'd1f', 'd16s', 'd16f', 'd32s', 'd32f', 'v1s', 'v1f', 'v16s', 'v16f', 'v32s', 'v32f']
-KEY = ('branch_b', 'extended_o', 'combine_e', 'input_u', 'moe_fused', 'ks1', 'gd_kernel', 'sbb', 'tail_kernel', 'vf_router', 'attn_kernel')
+KEY = ('front_pipe', 'front_check', 'branch_b', 'extended_o', 'combine_e', 'input_u', 'moe_fused', 'ks1', 'gd_kernel', 'sbb', 'tail_kernel', 'vf_router', 'attn_kernel')
 def parse(path):
     t = open(path, encoding='utf-8', errors='replace').read()
     shapes = []
