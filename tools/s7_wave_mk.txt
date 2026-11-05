@@ -1,0 +1,4 @@
+muse_decode_layer box_out/s7/k3_mk_v1a.py
+muse_decode_layer box_out/s7/k3_mk_v1b.py
+muse_decode_layer box_out/s7/k3_mk_v2a.py
+muse_decode_layer box_out/s7/k3_mk_v2b.py
