@@ -1,0 +1,424 @@
+{
+  "status": "CPU_PASS_CUDA_NOT_RUN",
+  "GPU_executed": false,
+  "base_sha256": "07eb81e0a91a5161e23e0f794abe1f536788ff4200326c209c484802092c6e10",
+  "variant": {
+    "status": "PASS",
+    "bytes": 981432,
+    "headroom": 18568,
+    "sha256": "c816a1e9690180ee908a4dce3790f78e4467e1eadb127c4829962cc0043a3018",
+    "changed_lines": [
+      {
+        "bit": 1,
+        "base": [
+          2,
+          2
+        ],
+        "variant": [
+          2,
+          2
+        ],
+        "kind": "replace"
+      },
+      {
+        "bit": 1,
+        "base": [
+          11751,
+          11750
+        ],
+        "variant": [
+          11751,
+          11751
+        ],
+        "kind": "insert"
+      },
+      {
+        "bit": 1,
+        "base": [
+          21434,
+          21433
+        ],
+        "variant": [
+          21435,
+          21437
+        ],
+        "kind": "insert"
+      },
+      {
+        "bit": 1,
+        "base": [
+          21440,
+          21439
+        ],
+        "variant": [
+          21444,
+          21782
+        ],
+        "kind": "insert"
+      }
+    ],
+    "unchanged_python_functions": 295,
+    "selector_default": 0
+  },
+  "dry_run": {
+    "status": "PASS",
+    "selection_cases": 40,
+    "validation_cases": 4,
+    "repeated_launches": 8,
+    "router_cases": 3,
+    "negative_prepare_cases": [
+      "occupancy",
+      "local memory",
+      "escape overflow",
+      "pack exception",
+      "stream did not shrink",
+      "launch error",
+      "build error",
+      "deadline",
+      "missing cat",
+      "bad layout"
+    ],
+    "weight_bytes": 57507984,
+    "state_layout_sources": {
+      "_r1_prepare": 11613,
+      "_v8_tail_prepare": 1529
+    },
+    "numerical_status": "NOT RUN: strict tensor/CUDA/numeric mocks; real added Python functions executed"
+  },
+  "build_dry_run": {
+    "status": "PASS",
+    "exports": [
+      "rqc_run"
+    ],
+    "source_sha256": "61b7537ce5d2670c2d94a5a495feb0904daeecb925be6c2a60fe38ded1c21448",
+    "compiler_invocations": 0,
+    "compiler_call": "explicit CPU double",
+    "warm_cache": "PASS",
+    "cached_failure": "PASS",
+    "compile_failure": "PASS",
+    "stock_RQ_isolation": "PASS",
+    "source_guard": "PASS"
+  },
+  "protocol": {
+    "status": "PASS",
+    "CTAs": 108,
+    "clusters": 36,
+    "threads": 384,
+    "math_threads": [
+      0,
+      255
+    ],
+    "producer_threads": [
+      256,
+      383
+    ],
+    "receive_bytes_per_rank": {
+      "0": 40960,
+      "1": 40960,
+      "2": 49152
+    },
+    "DSMEM_bytes": 4718592,
+    "output_values": 589824,
+    "k_intervals": [
+      [
+        0,
+        42
+      ],
+      [
+        42,
+        85
+      ],
+      [
+        85,
+        128
+      ]
+    ],
+    "shared_bytes": 194560,
+    "global_counters": 0,
+    "reset_loops": 0,
+    "coverage": "all cluster participants initialize/acquire; all math threads push, wait, combine, transpose and store"
+  },
+  "numpy_pack": {
+    "status": "PASS",
+    "weights": 73728,
+    "components": 3,
+    "escaped_values": 3,
+    "note": "independent NumPy bit model; Linux gate also executes real torch packers"
+  },
+  "paged_cursor": {
+    "status": "PASS",
+    "cases": 2176,
+    "warp_lanes": 32,
+    "stages": 43,
+    "lengths": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "max_second_page_reads": 1,
+    "pending": "exact C++ helper execution and real torch CPU pack in Linux gate"
+  },
+  "accounting": {
+    "label": "EST, conditional source-level arithmetic, NOT a measurement",
+    "baseline_us": {
+      "v16s": 25.8,
+      "v16f": 24.8,
+      "label": "MEASURED",
+      "source": "kernel_baseline.md:99/109"
+    },
+    "weight_bytes_per_stage": {
+      "before": 16384,
+      "after": 12288,
+      "grows": false
+    },
+    "x_bytes_per_stage": {
+      "before": 16384,
+      "after": 16384
+    },
+    "smem_bytes_per_stage": {
+      "before": 81920,
+      "after": 73728
+    },
+    "weight_bytes_total": {
+      "before": 75497472,
+      "after": 57507984,
+      "after_includes_escape_and_table": true
+    },
+    "paged_cursor": {
+      "capacity_entries_per_lane": 8,
+      "resident_entries": 4,
+      "allocation_bytes": 884736,
+      "allocation_growth_vs_failed_D128": 442368,
+      "initial_useful_read_bytes": 442368,
+      "initial_32B_sector_footprint": 884736,
+      "second_page_reads_per_lane": "0 if fewer than 4 escapes, otherwise 1 (16 B)",
+      "weight_stream_stage_growth": false,
+      "source_instruction_delta_vs_failed_D128": "no extra decode/MMA per stage; one increment, compare and conditional branch per consumed escape; one uint4 load + shift only on escape 4",
+      "compiler_counts": "UNMEASURED; exact ptxas/SASS gate pending",
+      "maximum_extra_source_issue_budget_us": "2 WGs * 8 escapes * 3 issue slots / 1520 = 0.0316 (modeled; not additive with overlap)",
+      "conservative_extra_capacity_stream_us": 0.09533793103448276,
+      "mutable_counters": 0,
+      "reset_loops": 0
+    },
+    "payload_thread_instructions_per_stage": {
+      "before": "0 LDS weight decode + 0 unpack ALU + 4 SS WGMMA",
+      "after": "3 LDS.128 + 36 unpack ALU + cursor control/rare patches + 4 RS WGMMA",
+      "modeled_added_issue_charge": 40,
+      "exact_dynamic_SASS": "pending Linux gate; escape/wait-dependent",
+      "common": "one full-barrier wait + WGMMA fence/commit/wait per stage; address/control instructions compiler-dependent",
+      "release_before": "2 empty-barrier arrivals per CTA/stage (WG leaders)",
+      "release_after": "8 W-empty + 8 x-empty arrivals per CTA/stage (warp leaders), plus 2 syncwarp sites per math thread"
+    },
+    "epilogue": {
+      "DSMEM_bytes_before_after": 4718592,
+      "FP32_output_bytes_before_after": 2359296,
+      "per_math_thread_send_vectors": [
+        11,
+        11,
+        10
+      ],
+      "per_math_thread_receive_vectors": [
+        10,
+        10,
+        12
+      ],
+      "per_math_thread_FP32_adds": [
+        40,
+        40,
+        48
+      ],
+      "per_math_thread_staging_stores": [
+        20,
+        20,
+        24
+      ],
+      "global_vector_stores_per_thread": [
+        5,
+        5,
+        6
+      ],
+      "new_global_scratch_bytes": 0,
+      "note": "all figures per rank 0/1/2; same source-level epilogue payload as VD"
+    },
+    "estimate_us": {
+      "gross_stream": 3.877044827586207,
+      "smem_port_ceiling": [
+        1.8105263157894738,
+        2.0116959064327484
+      ],
+      "PDL_charge": 0.84,
+      "ceiling_after_PDL_before_decode": [
+        0.9705263157894738,
+        1.1716959064327486
+      ],
+      "net": "UNMEASURED",
+      "conditional_ceiling_after_page_capacity": [
+        0.8751883847549911,
+        1.0763579753982657
+      ],
+      "expected_score_gain": "NOT ESTABLISHED; conditional ceiling * 0.059 %-pts/us at both T128 shapes",
+      "all_extra_decode_issue": 2.263157894736842,
+      "escape_allowance": 0.3368421052631579,
+      "maximum_exposed_extra_cost_for_0_5us": [
+        0.37518838475499106,
+        0.5763579753982657
+      ],
+      "arithmetic": "stream=(75497472-57507984)/4.64e6; port=43*(81920-73728)/(128*1520*eff), eff=1 or 0.9; conditional ceiling=port-0.84-442368/4.64e6",
+      "assumptions": "128 B/SM/clock modeled port; 90-100% port efficiency; one issue/cycle/SMSP issue budget; added issue must mostly overlap WGMMA",
+      "source": "notes/study/t128_plan.md:43-49; measured clock/PDL constants in task"
+    },
+    "kill_reasons": [
+      "decode dependencies or PDL exposure can consume the conditional residual",
+      "register/cluster admission loss or compiler spills"
+    ],
+    "closest_DNR": [
+      "R-dnx-1 (avoided decoded-weight STS ring)",
+      "RQP128 (kept fused hi/lo router; no side-stream rejoin)"
+    ],
+    "critical_path": "cat's FP32 result feeds tail/routing/MoE; reduced weight stream is inside that dependency; existing PDL overlap charged"
+  },
+  "routes": {
+    "v16": {
+      "shapes": [
+        "v16s",
+        "v16f"
+      ],
+      "qkv": {
+        "instance": "rq_kernel<128,5,1,0,0,0,42999939,1>",
+        "KS": 7,
+        "source": "kernels/muse_decode_layer/k3_tinys7_c1.py:21273",
+        "measured": "30.8 us aggregate qkv+unpooler; no individual split inferred"
+      },
+      "unpooler": {
+        "instance": "rq_kernel<128,5,1,0,0,0,42999939,1>",
+        "KS": 2,
+        "source": "kernels/muse_decode_layer/k3_tinys7_c1.py:21276"
+      },
+      "cat": {
+        "instance": "vd::vd_kernel<2,128,5,3,1,1>",
+        "source": "kernels/muse_decode_layer/k3_tinys7_c1.py:14581",
+        "measured_us": [
+          25.8,
+          24.8
+        ],
+        "measured_source": "notes/study/evo/s7/kernel_baseline.md:99,109"
+      },
+      "o": {
+        "instance": "nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT",
+        "pin": [
+          66,
+          18,
+          35,
+          1,
+          0,
+          0,
+          3,
+          0,
+          5
+        ],
+        "layout": [
+          1,
+          8
+        ],
+        "source": "kernels/muse_decode_layer/k3_tinys7_c1.py:22669",
+        "measured_us": [
+          8.7,
+          7.6
+        ]
+      },
+      "new_cat": {
+        "instance": "rq_kernel<128,5,1,0,0,0,177217667,1>",
+        "KS": 3,
+        "source": "box_out/s7/k3_hyb128_v1.py:21707",
+        "route": "box_out/s7/k3_hyb128_v1.py:21546",
+        "selector": "S7_HYB128=1",
+        "measured_us": null
+      }
+    },
+    "v32": {
+      "shapes": [
+        "v32s",
+        "v32f"
+      ],
+      "changed": false,
+      "cat": {
+        "pin": [
+          66,
+          125,
+          35,
+          1,
+          0,
+          0,
+          2,
+          0,
+          5
+        ],
+        "instance": "nvjet_sm90_tss_72x128_64x8_1x2_h_bz_TNN",
+        "measured_us": [
+          32.6,
+          32.4
+        ]
+      },
+      "unpooler": {
+        "pin": [
+          66,
+          20,
+          35,
+          1,
+          0,
+          0,
+          7,
+          0,
+          5
+        ],
+        "layout": [
+          1,
+          2
+        ],
+        "instance": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_coopA_NNT",
+        "measured_us": [
+          24.6,
+          24.7
+        ]
+      },
+      "qkv": {
+        "pin": [
+          66,
+          124,
+          35,
+          1,
+          0,
+          0,
+          0,
+          0,
+          2
+        ],
+        "instance": "nvjet_sm90_tst_72x64_64x12_1x1_v_bz_TNN",
+        "measured_us": [
+          20.3,
+          20.4
+        ]
+      },
+      "o": {
+        "route": "_v12_gemm -> _gemm -> _bf16_gemm_dispatch_impl (no LT_PIN o256)",
+        "source": "kernels/muse_decode_layer/k3_tinys7_c1.py:11549",
+        "instance": "nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT",
+        "measured_us": [
+          9.3,
+          9.4
+        ]
+      },
+      "pins_source": "kernels/muse_decode_layer/k3_tinys7_c1.py:22669",
+      "measured_source": "notes/study/evo/s7/kernel_baseline.md:116-131"
+    }
+  },
+  "compile_status": "NOT RUN: WSL/NVCC unavailable in implementer sandbox",
+  "GPU_self_test": "NOT RUN",
+  "prepare_duration": "NOT MEASURED; deadline checks at 265 s; H200 validation required"
+}

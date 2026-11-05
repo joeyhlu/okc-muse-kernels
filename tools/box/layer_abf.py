@@ -54,10 +54,17 @@ def main():
     mods, states = {}, {}
     for i, f in enumerate(dict.fromkeys(a["file"] for a in arms)):
         t0 = time.time()
-        mods[f] = J.load_kernel(Path(f), f"okc_submission_{i}", prob)
-        states[f] = mods[f].prepare(J.clone_data(weights))
-        torch.cuda.synchronize()
-        print(f"[abf] prepared {f} in {time.time() - t0:.1f}s", flush=True)
+        try:
+            mods[f] = J.load_kernel(Path(f), f"okc_submission_{i}", prob)
+            states[f] = mods[f].prepare(J.clone_data(weights))
+            torch.cuda.synchronize()
+            print(f"[abf] prepared {f} in {time.time() - t0:.1f}s", flush=True)
+        except Exception as ex:   # one broken candidate must not void the whole session (arm 0 must prepare)
+            if i == 0:
+                raise
+            print(f"[abf] PREPARE FAILED {f}: {ex!r:.300} -> arm dropped", flush=True)
+            mods.pop(f, None); states.pop(f, None)
+    arms = [a for a in arms if a["file"] in states]
     timer = J.GpuTimer()
     ov = timer.replay_overhead_us()
     shapes = [int(s) for s in arg("shapes", ",".join(str(i) for i in range(len(prob.benches)))).split(",")]
