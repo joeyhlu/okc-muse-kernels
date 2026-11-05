@@ -1,0 +1,5 @@
+muse_decode_layer box_out/s7/k3_xrh_r2.py
+muse_decode_layer box_out/s7/k3_xrh_r3.py
+muse_decode_layer box_out/s7/k3_xrh_r4.py
+muse_decode_layer box_out/s7/k3_hyb128_on_r2.py
+muse_decode_layer box_out/s7/k3_hyb128_on_r3.py
